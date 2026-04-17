@@ -34,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Версия бота
-BOT_VERSION = "1.0"
+BOT_VERSION = "1.1"
 BOT_VERSION_DATE = "17.04.2026"
 
 # Загрузка переменных окружения
@@ -377,6 +377,16 @@ async def update_calendar_events_cache(year: int, month: int, force: bool = Fals
         events.sort(key=lambda x: x.get('start', ''))
         calendar_events_cache[cache_key] = events
         last_calendar_update[cache_key] = now
+        
+        # Очистка старых кэшей (оставляем только текущий и соседние месяцы)
+        keys_to_remove = []
+        for key in calendar_events_cache.keys():
+            if key != cache_key:
+                keys_to_remove.append(key)
+        for key in keys_to_remove:
+            if len(calendar_events_cache) > 3:  # Оставляем не более 3 месяцев в кэше
+                del calendar_events_cache[key]
+        
         logger.info(f"Обновлён кэш календаря для {year}.{month}: {len(events)} событий")
     except Exception as e:
         logger.error(f"Ошибка обновления кэша календаря: {e}")
@@ -412,13 +422,15 @@ async def get_formatted_calendar_events(year: int, month: int, force_refresh: bo
     
     future_events.sort(key=lambda x: x[0])
     text = f"📅 **Предстоящие события на {MONTHS_NAMES[month]} {year}**\n\n"
-    for start_dt, event in future_events:
+    for start_dt, event in future_events[:20]:  # Ограничиваем количество событий
         day = start_dt.day
         month_num = start_dt.month
         year_num = start_dt.year
         time_str = start_dt.strftime('%H:%M')
         summary = event['summary']
-        text += f"~~~~~~ {day:02d}.{month_num:02d}.{year_num} Время {time_str} ~~~~~~\n{summary}\n\n"
+        text += f"• {day:02d}.{month_num:02d}.{year_num} {time_str} - {summary}\n"
+    if len(future_events) > 20:
+        text += f"\n... и еще {len(future_events) - 20} событий"
     return text
 
 
@@ -446,7 +458,8 @@ async def show_calendar_events(chat_id: int, year: int = None, month: int = None
     )
     keyboard.add(
         InlineKeyboardButton("🔄 Обновить", callback_data=f"cal_refresh_{year}_{month}"),
-        InlineKeyboardButton("📥 Синхр.", callback_data=f"cal_sync_{year}_{month}")
+        InlineKeyboardButton("📥 Синхр.", callback_data=f"cal_sync_{year}_{month}"),
+        InlineKeyboardButton("✏️ Ред.", callback_data="edit_calendar")
     )
     await send_with_auto_delete(chat_id, formatted_events, reply_markup=keyboard, delay=3600)
 
@@ -513,6 +526,10 @@ def load_data():
         notifications = data.get('notifications', {})
         pending_notifications = data.get('pending_notifications', {})
     
+    # Очистка завершенных уведомлений
+    notifications = {k: v for k, v in notifications.items() if not v.get('is_completed', False)}
+    pending_notifications = {k: v for k, v in pending_notifications.items() if not v.get('is_completed', False)}
+    
     for notif_id, notif in notifications.items():
         if 'is_completed' not in notif:
             notif['is_completed'] = False
@@ -564,7 +581,7 @@ def save_data():
 
 
 async def sync_calendar_to_pending():
-    if not get_caldav_available():
+    if not get_caldav_available() or not config.get('calendar_sync_enabled', True):
         return
     
     now = get_current_time()
@@ -592,14 +609,22 @@ async def sync_calendar_to_pending():
             event_id = event['id']
             summary = event['summary']
             
+            # Проверяем, существует ли уже такое уведомление
             exists = False
             for nid, notif in pending_notifications.items():
                 if notif.get('calendar_event_id') == event_id:
                     exists = True
                     break
             
+            # Также проверяем в обычных уведомлениях
             if not exists:
-                notif_id = f"pending_{int(start_dt.timestamp())}_{len(pending_notifications)+1}"
+                for nid, notif in notifications.items():
+                    if notif.get('calendar_event_id') == event_id:
+                        exists = True
+                        break
+            
+            if not exists:
+                notif_id = f"pending_{int(start_dt.timestamp())}_{hashlib.md5(event_id.encode()).hexdigest()[:8]}"
                 
                 pending_notifications[notif_id] = {
                     'text': summary,
@@ -669,14 +694,18 @@ async def auto_delete_message(chat_id: int, message_id: int, delay: int = 3600):
     await asyncio.sleep(delay)
     try:
         await bot.delete_message(chat_id, message_id)
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"Не удалось удалить сообщение {message_id}: {e}")
 
 
 async def send_with_auto_delete(chat_id: int, text: str, parse_mode: str = 'Markdown', reply_markup=None, delay: int = 3600):
-    msg = await bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
-    asyncio.create_task(auto_delete_message(chat_id, msg.message_id, delay))
-    return msg
+    try:
+        msg = await bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+        asyncio.create_task(auto_delete_message(chat_id, msg.message_id, delay))
+        return msg
+    except Exception as e:
+        logger.error(f"Ошибка отправки сообщения: {e}")
+        return None
 
 
 async def delete_user_message(message: types.Message, delay: int = 3600):
@@ -792,7 +821,7 @@ async def check_regular_notifications():
                 elif repeat_type == 'every_day':
                     hour = notif.get('repeat_hour', 0)
                     minute = notif.get('repeat_minute', 0)
-                    today_trigger = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    today_trigger = tz.localize(datetime(now.year, now.month, now.day, hour, minute, 0))
                     last_trigger = notif.get('last_trigger')
                     
                     if last_trigger:
@@ -802,7 +831,16 @@ async def check_regular_notifications():
                     else:
                         last_trigger_time = None
                     
-                    if (last_trigger_time is None or last_trigger_time.date() < now.date()) and now >= today_trigger:
+                    # Проверяем, нужно ли отправить уведомление сегодня
+                    should_send = False
+                    if last_trigger_time is None:
+                        should_send = now >= today_trigger
+                    else:
+                        # Сравниваем только даты, игнорируя время
+                        if last_trigger_time.date() < now.date() and now >= today_trigger:
+                            should_send = True
+                    
+                    if should_send:
                         repeat_count = notif.get('repeat_count', 0)
                         await show_pending_notification_actions(ADMIN_ID, notif_id, notif['text'], repeat_count + 1)
                         notif['last_trigger'] = now.isoformat()
@@ -824,7 +862,7 @@ async def check_regular_notifications():
                         last_trigger_time = None
                     
                     if now.weekday() in weekdays_list:
-                        today_trigger = tz.localize(datetime(now.year, now.month, now.day, hour, minute))
+                        today_trigger = tz.localize(datetime(now.year, now.month, now.day, hour, minute, 0))
                         already_sent_today = last_trigger_time and last_trigger_time.date() == now.date()
                         
                         if now >= today_trigger and not already_sent_today:
@@ -860,7 +898,7 @@ async def sync_calendar_task():
             logger.info("Синхронизация календаря с неотмеченными уведомлениями выполнена")
         except Exception as e:
             logger.error(f"Ошибка синхронизации: {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(300)  # Увеличил интервал до 5 минут
 
 
 def get_main_keyboard():
@@ -927,7 +965,7 @@ async def update_notifications_list(chat_id: int):
         sorted_notifs.sort(key=lambda x: (x['is_passed'], x['sort_time'] if x['sort_time'] else datetime.now()))
         if sorted_notifs:
             local_text = "📋 **Мои напоминания:**\n\n"
-            for item in sorted_notifs:
+            for item in sorted_notifs[:50]:  # Ограничиваем количество
                 if item['is_passed']:
                     local_text += f"~~{item['num']}. {item['text']}~~ — {item['time_str']} *(просрочено)*\n"
                 else:
@@ -981,7 +1019,7 @@ async def update_pending_list(chat_id: int):
     text += "Эти напоминания просрочены и будут повторяться каждый час,\n"
     text += "пока вы не отметите их как выполненные или не измените время.\n\n"
     
-    for item in sorted_pending:
+    for item in sorted_pending[:50]:  # Ограничиваем количество
         repeat_text = f" (повторений: {item['repeat_count']})" if item['repeat_count'] > 0 else ""
         text += f"• **{item['text']}**\n  ⏰ {item['time_str']}{repeat_text}\n\n"
     
@@ -1098,7 +1136,9 @@ async def process_months(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query_handler(lambda c: c.data == "time_every_hour", state=NotificationStates.waiting_for_time_type)
 async def process_every_hour(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    next_num = len(notifications) + 1
+    # Находим следующий доступный номер
+    existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
+    next_num = max(existing_nums) + 1 if existing_nums else 1
     notif_id = str(next_num)
     now = get_current_time()
     
@@ -1156,7 +1196,9 @@ async def set_specific_date_new(message: types.Message, state: FSMContext):
         return
     
     data = await state.get_data()
-    next_num = len(notifications) + 1
+    # Находим следующий доступный номер
+    existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
+    next_num = max(existing_nums) + 1 if existing_nums else 1
     notif_id = str(next_num)
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
     if notify_time.tzinfo is None:
@@ -1195,7 +1237,9 @@ async def set_hours(message: types.Message, state: FSMContext):
         data = await state.get_data()
         notify_time = get_current_time() + timedelta(hours=hours)
         
-        next_num = len(notifications) + 1
+        # Находим следующий доступный номер
+        existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
+        next_num = max(existing_nums) + 1 if existing_nums else 1
         notif_id = str(next_num)
         tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
         if notify_time.tzinfo is None:
@@ -1236,7 +1280,9 @@ async def set_days(message: types.Message, state: FSMContext):
         data = await state.get_data()
         notify_time = get_current_time() + timedelta(days=days)
         
-        next_num = len(notifications) + 1
+        # Находим следующий доступный номер
+        existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
+        next_num = max(existing_nums) + 1 if existing_nums else 1
         notif_id = str(next_num)
         tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
         if notify_time.tzinfo is None:
@@ -1278,7 +1324,9 @@ async def set_months(message: types.Message, state: FSMContext):
         data = await state.get_data()
         notify_time = get_current_time() + timedelta(days=days)
         
-        next_num = len(notifications) + 1
+        # Находим следующий доступный номер
+        existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
+        next_num = max(existing_nums) + 1 if existing_nums else 1
         notif_id = str(next_num)
         tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
         if notify_time.tzinfo is None:
@@ -1320,11 +1368,13 @@ async def set_every_day_time(message: types.Message, state: FSMContext):
         return
     
     data = await state.get_data()
-    next_num = len(notifications) + 1
+    # Находим следующий доступный номер
+    existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
+    next_num = max(existing_nums) + 1 if existing_nums else 1
     notif_id = str(next_num)
     now = get_current_time()
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-    first_time = tz.localize(datetime(now.year, now.month, now.day, hour, minute))
+    first_time = tz.localize(datetime(now.year, now.month, now.day, hour, minute, 0))
     if first_time <= now:
         first_time += timedelta(days=1)
     
@@ -1413,7 +1463,9 @@ async def set_weekday_time(message: types.Message, state: FSMContext):
         await send_with_auto_delete(message.chat.id, "❌ **Не удалось определить дату!**", delay=3600)
         return
     
-    next_num = len(notifications) + 1
+    # Находим следующий доступный номер
+    existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
+    next_num = max(existing_nums) + 1 if existing_nums else 1
     notif_id = str(next_num)
     days_names = [WEEKDAYS_NAMES[d] for d in sorted(weekdays_list)]
     
@@ -1881,7 +1933,7 @@ async def edit_calendar_handler(callback: types.CallbackQuery, state: FSMContext
         await callback.answer("Нет событий для редактирования")
         return
     keyboard = InlineKeyboardMarkup(row_width=1)
-    for idx, (start_dt, event) in enumerate(future_events):
+    for idx, (start_dt, event) in enumerate(future_events[:20]):  # Ограничиваем количество
         day = start_dt.day
         month_num = start_dt.month
         time_str = start_dt.strftime('%H:%M')
@@ -2194,32 +2246,38 @@ async def auto_update_calendar_cache():
             logger.info("Автообновление календаря выполнено")
         except Exception as e:
             logger.error(f"Ошибка автообновления календаря: {e}")
-        await asyncio.sleep(900)
+        await asyncio.sleep(900)  # 15 минут
 
 
 async def on_startup(dp):
     init_folders()
     load_data()
     
-    # Перенумерация уведомлений
+    # Перенумерация уведомлений и очистка дубликатов
     new_notifications = {}
-    for i, (notif_id, notif) in enumerate(sorted(notifications.items(), key=lambda x: int(x[0])), 1):
-        notif['num'] = i
-        if 'is_completed' not in notif:
-            notif['is_completed'] = False
-        if 'last_repeat_time' not in notif:
-            notif['last_repeat_time'] = None
-        if 'repeat_count' not in notif:
-            notif['repeat_count'] = 0
-        if 'is_repeat' not in notif:
-            notif['is_repeat'] = False
-        if 'last_trigger' not in notif:
-            notif['last_trigger'] = None
-        if 'reminder_sent' not in notif:
-            notif['reminder_sent'] = False
-        if 'last_reminder_time' not in notif:
-            notif['last_reminder_time'] = None
-        new_notifications[str(i)] = notif
+    processed_ids = set()
+    for i, (notif_id, notif) in enumerate(sorted(notifications.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0), 1):
+        # Проверка на дубликаты по тексту и времени
+        notif_key = f"{notif['text']}_{notif.get('time', '')}"
+        if notif_key not in processed_ids:
+            notif['num'] = i
+            if 'is_completed' not in notif:
+                notif['is_completed'] = False
+            if 'last_repeat_time' not in notif:
+                notif['last_repeat_time'] = None
+            if 'repeat_count' not in notif:
+                notif['repeat_count'] = 0
+            if 'is_repeat' not in notif:
+                notif['is_repeat'] = False
+            if 'last_trigger' not in notif:
+                notif['last_trigger'] = None
+            if 'reminder_sent' not in notif:
+                notif['reminder_sent'] = False
+            if 'last_reminder_time' not in notif:
+                notif['last_reminder_time'] = None
+            new_notifications[str(i)] = notif
+            processed_ids.add(notif_key)
+    
     notifications.clear()
     notifications.update(new_notifications)
     save_data()
