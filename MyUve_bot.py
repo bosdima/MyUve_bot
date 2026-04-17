@@ -34,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Версия бота
-BOT_VERSION = "1.1"
+BOT_VERSION = "1.2"
 BOT_VERSION_DATE = "17.04.2026"
 
 # Загрузка переменных окружения
@@ -378,13 +378,10 @@ async def update_calendar_events_cache(year: int, month: int, force: bool = Fals
         calendar_events_cache[cache_key] = events
         last_calendar_update[cache_key] = now
         
-        # Очистка старых кэшей (оставляем только текущий и соседние месяцы)
-        keys_to_remove = []
-        for key in calendar_events_cache.keys():
-            if key != cache_key:
-                keys_to_remove.append(key)
+        # Очистка старых кэшей (оставляем не более 3 месяцев)
+        keys_to_remove = [k for k in calendar_events_cache.keys() if k != cache_key]
         for key in keys_to_remove:
-            if len(calendar_events_cache) > 3:  # Оставляем не более 3 месяцев в кэше
+            if len(calendar_events_cache) > 3:
                 del calendar_events_cache[key]
         
         logger.info(f"Обновлён кэш календаря для {year}.{month}: {len(events)} событий")
@@ -422,7 +419,7 @@ async def get_formatted_calendar_events(year: int, month: int, force_refresh: bo
     
     future_events.sort(key=lambda x: x[0])
     text = f"📅 **Предстоящие события на {MONTHS_NAMES[month]} {year}**\n\n"
-    for start_dt, event in future_events[:20]:  # Ограничиваем количество событий
+    for start_dt, event in future_events[:20]:
         day = start_dt.day
         month_num = start_dt.month
         year_num = start_dt.year
@@ -434,7 +431,7 @@ async def get_formatted_calendar_events(year: int, month: int, force_refresh: bo
     return text
 
 
-async def show_calendar_events(chat_id: int, year: int = None, month: int = None, force_refresh: bool = False):
+async def show_calendar_events(chat_id: int, year: int = None, month: int = None, force_refresh: bool = False, persistent: bool = False):
     if year is None or month is None:
         now = get_current_time()
         year = now.year
@@ -461,7 +458,10 @@ async def show_calendar_events(chat_id: int, year: int = None, month: int = None
         InlineKeyboardButton("📥 Синхр.", callback_data=f"cal_sync_{year}_{month}"),
         InlineKeyboardButton("✏️ Ред.", callback_data="edit_calendar")
     )
-    await send_with_auto_delete(chat_id, formatted_events, reply_markup=keyboard, delay=3600)
+    if persistent:
+        await send_persistent_message(chat_id, formatted_events, reply_markup=keyboard)
+    else:
+        await send_with_auto_delete(chat_id, formatted_events, reply_markup=keyboard, delay=3600)
 
 
 class NotificationStates(StatesGroup):
@@ -526,7 +526,7 @@ def load_data():
         notifications = data.get('notifications', {})
         pending_notifications = data.get('pending_notifications', {})
     
-    # Очистка завершенных уведомлений
+    # Очистка завершенных
     notifications = {k: v for k, v in notifications.items() if not v.get('is_completed', False)}
     pending_notifications = {k: v for k, v in pending_notifications.items() if not v.get('is_completed', False)}
     
@@ -609,14 +609,11 @@ async def sync_calendar_to_pending():
             event_id = event['id']
             summary = event['summary']
             
-            # Проверяем, существует ли уже такое уведомление
             exists = False
             for nid, notif in pending_notifications.items():
                 if notif.get('calendar_event_id') == event_id:
                     exists = True
                     break
-            
-            # Также проверяем в обычных уведомлениях
             if not exists:
                 for nid, notif in notifications.items():
                     if notif.get('calendar_event_id') == event_id:
@@ -625,7 +622,6 @@ async def sync_calendar_to_pending():
             
             if not exists:
                 notif_id = f"pending_{int(start_dt.timestamp())}_{hashlib.md5(event_id.encode()).hexdigest()[:8]}"
-                
                 pending_notifications[notif_id] = {
                     'text': summary,
                     'time': start_dt.isoformat(),
@@ -705,6 +701,15 @@ async def send_with_auto_delete(chat_id: int, text: str, parse_mode: str = 'Mark
         return msg
     except Exception as e:
         logger.error(f"Ошибка отправки сообщения: {e}")
+        return None
+
+
+async def send_persistent_message(chat_id: int, text: str, parse_mode: str = 'Markdown', reply_markup=None):
+    """Отправляет сообщение без автоудаления"""
+    try:
+        return await bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"Ошибка отправки постоянного сообщения: {e}")
         return None
 
 
@@ -831,12 +836,10 @@ async def check_regular_notifications():
                     else:
                         last_trigger_time = None
                     
-                    # Проверяем, нужно ли отправить уведомление сегодня
                     should_send = False
                     if last_trigger_time is None:
                         should_send = now >= today_trigger
                     else:
-                        # Сравниваем только даты, игнорируя время
                         if last_trigger_time.date() < now.date() and now >= today_trigger:
                             should_send = True
                     
@@ -898,7 +901,7 @@ async def sync_calendar_task():
             logger.info("Синхронизация календаря с неотмеченными уведомлениями выполнена")
         except Exception as e:
             logger.error(f"Ошибка синхронизации: {e}")
-        await asyncio.sleep(300)  # Увеличил интервал до 5 минут
+        await asyncio.sleep(300)
 
 
 def get_main_keyboard():
@@ -915,7 +918,7 @@ def get_main_keyboard():
     return keyboard
 
 
-async def update_notifications_list(chat_id: int):
+async def update_notifications_list(chat_id: int, persistent: bool = False):
     local_text = ""
     if notifications:
         now = get_current_time()
@@ -965,7 +968,7 @@ async def update_notifications_list(chat_id: int):
         sorted_notifs.sort(key=lambda x: (x['is_passed'], x['sort_time'] if x['sort_time'] else datetime.now()))
         if sorted_notifs:
             local_text = "📋 **Мои напоминания:**\n\n"
-            for item in sorted_notifs[:50]:  # Ограничиваем количество
+            for item in sorted_notifs[:50]:
                 if item['is_passed']:
                     local_text += f"~~{item['num']}. {item['text']}~~ — {item['time_str']} *(просрочено)*\n"
                 else:
@@ -973,19 +976,30 @@ async def update_notifications_list(chat_id: int):
             local_text += f"\n📊 **Всего:** {len(sorted_notifs)}\n\n"
     
     if not local_text:
-        await send_with_auto_delete(chat_id, "📭 **Нет активных напоминаний**", delay=3600)
+        msg_text = "📭 **Нет активных напоминаний**"
+        if persistent:
+            await send_persistent_message(chat_id, msg_text)
+        else:
+            await send_with_auto_delete(chat_id, msg_text, delay=3600)
     else:
         keyboard = InlineKeyboardMarkup(row_width=2)
         keyboard.add(
             InlineKeyboardButton("✏️ Ред. уведомление", callback_data="edit_local"),
             InlineKeyboardButton("🔄 Обновить", callback_data="refresh_list")
         )
-        await send_with_auto_delete(chat_id, local_text, reply_markup=keyboard, delay=3600)
+        if persistent:
+            await send_persistent_message(chat_id, local_text, reply_markup=keyboard)
+        else:
+            await send_with_auto_delete(chat_id, local_text, reply_markup=keyboard, delay=3600)
 
 
-async def update_pending_list(chat_id: int):
+async def update_pending_list(chat_id: int, persistent: bool = False):
     if not pending_notifications:
-        await send_with_auto_delete(chat_id, "✅ **Нет неотмеченных уведомлений!**\n\nВсе напоминания выполнены или перенесены.", delay=3600)
+        msg_text = "✅ **Нет неотмеченных уведомлений!**\n\nВсе напоминания выполнены или перенесены."
+        if persistent:
+            await send_persistent_message(chat_id, msg_text)
+        else:
+            await send_with_auto_delete(chat_id, msg_text, delay=3600)
         return
     
     now = get_current_time()
@@ -1019,7 +1033,7 @@ async def update_pending_list(chat_id: int):
     text += "Эти напоминания просрочены и будут повторяться каждый час,\n"
     text += "пока вы не отметите их как выполненные или не измените время.\n\n"
     
-    for item in sorted_pending[:50]:  # Ограничиваем количество
+    for item in sorted_pending[:50]:
         repeat_text = f" (повторений: {item['repeat_count']})" if item['repeat_count'] > 0 else ""
         text += f"• **{item['text']}**\n  ⏰ {item['time_str']}{repeat_text}\n\n"
     
@@ -1032,7 +1046,10 @@ async def update_pending_list(chat_id: int):
         InlineKeyboardButton("🔄 Обновить", callback_data="refresh_pending")
     )
     
-    await send_with_auto_delete(chat_id, text, reply_markup=keyboard, delay=3600)
+    if persistent:
+        await send_persistent_message(chat_id, text, reply_markup=keyboard)
+    else:
+        await send_with_auto_delete(chat_id, text, reply_markup=keyboard, delay=3600)
 
 
 # === ОСНОВНЫЕ ОБРАБОТЧИКИ ===
@@ -1062,12 +1079,24 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if not caldav_ok:
         welcome_text += f"\n\n⚠️ **Внимание! Проблема с подключением к Яндекс.Календарю!**\n\n📋 {caldav_message}\n\n🔧 Получите новый пароль приложения: https://id.yandex.ru/security/app-passwords"
     
-    await send_with_auto_delete(message.chat.id, welcome_text, delay=3600)
-    await send_with_auto_delete(message.chat.id, "👋 **Выберите действие:**", reply_markup=get_main_keyboard(), delay=3600)
-    await update_notifications_list(message.chat.id)
-    await update_pending_list(message.chat.id)
+    # Постоянные сообщения
+    await send_persistent_message(message.chat.id, welcome_text)
+    await send_persistent_message(message.chat.id, "👋 **Выберите действие:**", reply_markup=get_main_keyboard())
+    await update_notifications_list(message.chat.id, persistent=True)
+    await update_pending_list(message.chat.id, persistent=True)
     now = get_current_time()
-    await show_calendar_events(message.chat.id, now.year, now.month)
+    await show_calendar_events(message.chat.id, now.year, now.month, persistent=True)
+
+
+@dp.message_handler(commands=['menu'])
+async def show_menu_command(message: types.Message):
+    """Команда для ручного отображения главного меню"""
+    await delete_user_message(message)
+    await send_persistent_message(message.chat.id, "👋 **Главное меню:**", reply_markup=get_main_keyboard())
+    await update_notifications_list(message.chat.id, persistent=True)
+    await update_pending_list(message.chat.id, persistent=True)
+    now = get_current_time()
+    await show_calendar_events(message.chat.id, now.year, now.month, persistent=True)
 
 
 @dp.message_handler(lambda m: m.text == "➕ Добавить", state='*')
@@ -1136,7 +1165,6 @@ async def process_months(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query_handler(lambda c: c.data == "time_every_hour", state=NotificationStates.waiting_for_time_type)
 async def process_every_hour(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    # Находим следующий доступный номер
     existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
     next_num = max(existing_nums) + 1 if existing_nums else 1
     notif_id = str(next_num)
@@ -1160,7 +1188,7 @@ async def process_every_hour(callback: types.CallbackQuery, state: FSMContext):
     await sync_notification_to_calendar(notif_id, 'create')
     await send_with_auto_delete(callback.from_user.id, f"✅ **Уведомление #{next_num} создано!**\n📝 {data['text']}\n🕐 Каждый час", delay=3600)
     await state.finish()
-    await update_notifications_list(callback.from_user.id)
+    await update_notifications_list(callback.from_user.id, persistent=True)
     await callback.answer()
 
 
@@ -1196,7 +1224,6 @@ async def set_specific_date_new(message: types.Message, state: FSMContext):
         return
     
     data = await state.get_data()
-    # Находим следующий доступный номер
     existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
     next_num = max(existing_nums) + 1 if existing_nums else 1
     notif_id = str(next_num)
@@ -1222,7 +1249,7 @@ async def set_specific_date_new(message: types.Message, state: FSMContext):
     await sync_notification_to_calendar(notif_id, 'create')
     await send_with_auto_delete(message.chat.id, f"✅ **Уведомление #{next_num} создано!**\n📝 {data['text']}\n⏰ {notify_time.strftime('%d.%m.%Y в %H:%M')}", delay=3600)
     await state.finish()
-    await update_notifications_list(message.chat.id)
+    await update_notifications_list(message.chat.id, persistent=True)
 
 
 @dp.message_handler(state=NotificationStates.waiting_for_hours)
@@ -1237,7 +1264,6 @@ async def set_hours(message: types.Message, state: FSMContext):
         data = await state.get_data()
         notify_time = get_current_time() + timedelta(hours=hours)
         
-        # Находим следующий доступный номер
         existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
         next_num = max(existing_nums) + 1 if existing_nums else 1
         notif_id = str(next_num)
@@ -1263,7 +1289,7 @@ async def set_hours(message: types.Message, state: FSMContext):
         await sync_notification_to_calendar(notif_id, 'create')
         await send_with_auto_delete(message.chat.id, f"✅ **Уведомление #{next_num} создано!**\n📝 {data['text']}\n⏰ {notify_time.strftime('%d.%m.%Y в %H:%M')}", delay=3600)
         await state.finish()
-        await update_notifications_list(message.chat.id)
+        await update_notifications_list(message.chat.id, persistent=True)
     except ValueError:
         await send_with_auto_delete(message.chat.id, "❌ **Введите число!**", delay=3600)
 
@@ -1280,7 +1306,6 @@ async def set_days(message: types.Message, state: FSMContext):
         data = await state.get_data()
         notify_time = get_current_time() + timedelta(days=days)
         
-        # Находим следующий доступный номер
         existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
         next_num = max(existing_nums) + 1 if existing_nums else 1
         notif_id = str(next_num)
@@ -1306,7 +1331,7 @@ async def set_days(message: types.Message, state: FSMContext):
         await sync_notification_to_calendar(notif_id, 'create')
         await send_with_auto_delete(message.chat.id, f"✅ **Уведомление #{next_num} создано!**\n📝 {data['text']}\n⏰ {notify_time.strftime('%d.%m.%Y в %H:%M')}", delay=3600)
         await state.finish()
-        await update_notifications_list(message.chat.id)
+        await update_notifications_list(message.chat.id, persistent=True)
     except ValueError:
         await send_with_auto_delete(message.chat.id, "❌ **Введите число!**", delay=3600)
 
@@ -1324,7 +1349,6 @@ async def set_months(message: types.Message, state: FSMContext):
         data = await state.get_data()
         notify_time = get_current_time() + timedelta(days=days)
         
-        # Находим следующий доступный номер
         existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
         next_num = max(existing_nums) + 1 if existing_nums else 1
         notif_id = str(next_num)
@@ -1350,7 +1374,7 @@ async def set_months(message: types.Message, state: FSMContext):
         await sync_notification_to_calendar(notif_id, 'create')
         await send_with_auto_delete(message.chat.id, f"✅ **Уведомление #{next_num} создано!**\n📝 {data['text']}\n⏰ {notify_time.strftime('%d.%m.%Y в %H:%M')}", delay=3600)
         await state.finish()
-        await update_notifications_list(message.chat.id)
+        await update_notifications_list(message.chat.id, persistent=True)
     except ValueError:
         await send_with_auto_delete(message.chat.id, "❌ **Введите число!**", delay=3600)
 
@@ -1368,7 +1392,6 @@ async def set_every_day_time(message: types.Message, state: FSMContext):
         return
     
     data = await state.get_data()
-    # Находим следующий доступный номер
     existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
     next_num = max(existing_nums) + 1 if existing_nums else 1
     notif_id = str(next_num)
@@ -1399,7 +1422,7 @@ async def set_every_day_time(message: types.Message, state: FSMContext):
     await sync_notification_to_calendar(notif_id, 'create')
     await send_with_auto_delete(message.chat.id, f"✅ **Уведомление #{next_num} создано!**\n📝 {data['text']}\n📅 Ежедневно в {hour:02d}:{minute:02d}", delay=3600)
     await state.finish()
-    await update_notifications_list(message.chat.id)
+    await update_notifications_list(message.chat.id, persistent=True)
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith('wd_'), state=NotificationStates.waiting_for_weekdays)
@@ -1463,7 +1486,6 @@ async def set_weekday_time(message: types.Message, state: FSMContext):
         await send_with_auto_delete(message.chat.id, "❌ **Не удалось определить дату!**", delay=3600)
         return
     
-    # Находим следующий доступный номер
     existing_nums = [int(notif.get('num', 0)) for notif in notifications.values() if not notif.get('is_completed', False)]
     next_num = max(existing_nums) + 1 if existing_nums else 1
     notif_id = str(next_num)
@@ -1491,14 +1513,14 @@ async def set_weekday_time(message: types.Message, state: FSMContext):
     await sync_notification_to_calendar(notif_id, 'create')
     await send_with_auto_delete(message.chat.id, f"✅ **Уведомление #{next_num} создано!**\n📝 {data['text']}\n📆 {', '.join(days_names)} в {hour:02d}:{minute:02d}", delay=3600)
     await state.finish()
-    await update_notifications_list(message.chat.id)
+    await update_notifications_list(message.chat.id, persistent=True)
 
 
 # === ОБРАБОТЧИКИ ДЛЯ НЕОТМЕЧЕННЫХ ===
 
 @dp.callback_query_handler(lambda c: c.data == "refresh_pending", state='*')
 async def refresh_pending(callback: types.CallbackQuery):
-    await update_pending_list(callback.from_user.id)
+    await update_pending_list(callback.from_user.id, persistent=True)
     await callback.answer("Список обновлён")
 
 
@@ -1513,7 +1535,7 @@ async def pending_complete_all(callback: types.CallbackQuery):
             del pending_notifications[notif_id]
     save_data()
     await callback.message.edit_text("✅ **Все неотмеченные уведомления выполнены и удалены!**")
-    await update_pending_list(callback.from_user.id)
+    await update_pending_list(callback.from_user.id, persistent=True)
     await callback.answer()
 
 
@@ -1546,7 +1568,7 @@ async def pending_done(callback: types.CallbackQuery):
         del pending_notifications[notif_id]
         save_data()
         await callback.message.edit_text(f"✅ **Уведомление выполнено и удалено из неотмеченных!**")
-        await update_pending_list(callback.from_user.id)
+        await update_pending_list(callback.from_user.id, persistent=True)
     else:
         await callback.answer("Уведомление не найдено или уже обработано")
     await callback.answer()
@@ -1642,7 +1664,7 @@ async def process_pending_snooze(callback: types.CallbackQuery, notif_id: str, v
     
     save_data()
     await callback.message.edit_text(f"⏰ **Уведомление отложено на {value} {unit}**\n🕐 Новое время: {new_time.strftime('%d.%m.%Y в %H:%M')}", parse_mode='Markdown')
-    await update_pending_list(callback.from_user.id)
+    await update_pending_list(callback.from_user.id, persistent=True)
     await callback.answer()
 
 
@@ -1705,9 +1727,9 @@ async def save_edited_text(message: types.Message, state: FSMContext):
     await send_with_auto_delete(message.chat.id, f"✅ **Текст изменен!**\n\nСтарый: {old_text}\nНовый: {message.text}", delay=3600)
     
     if is_pending:
-        await update_pending_list(message.chat.id)
+        await update_pending_list(message.chat.id, persistent=True)
     else:
-        await update_notifications_list(message.chat.id)
+        await update_notifications_list(message.chat.id, persistent=True)
     
     await state.finish()
 
@@ -1747,9 +1769,9 @@ async def snooze_set_specific_date(message: types.Message, state: FSMContext):
     await send_with_auto_delete(message.chat.id, f"⏰ **Уведомление отложено!**\n🕐 Новое время: {notify_time.strftime('%d.%m.%Y в %H:%M')}", delay=3600)
     
     if is_pending:
-        await update_pending_list(message.chat.id)
+        await update_pending_list(message.chat.id, persistent=True)
     else:
-        await update_notifications_list(message.chat.id)
+        await update_notifications_list(message.chat.id, persistent=True)
     
     await state.finish()
 
@@ -1758,7 +1780,7 @@ async def snooze_set_specific_date(message: types.Message, state: FSMContext):
 async def list_notifications_universal(message: types.Message, state: FSMContext):
     await delete_user_message(message)
     await state.finish()
-    await update_notifications_list(message.chat.id)
+    await update_notifications_list(message.chat.id, persistent=True)
 
 
 @dp.message_handler(lambda m: m.text == "📅 События", state='*')
@@ -1766,14 +1788,14 @@ async def view_events_universal(message: types.Message, state: FSMContext):
     await delete_user_message(message)
     await state.finish()
     now = get_current_time()
-    await show_calendar_events(message.chat.id, now.year, now.month)
+    await show_calendar_events(message.chat.id, now.year, now.month, persistent=True)
 
 
 @dp.message_handler(lambda m: m.text == "⚠️ Неотмеченные", state='*')
 async def pending_list_universal(message: types.Message, state: FSMContext):
     await delete_user_message(message)
     await state.finish()
-    await update_pending_list(message.chat.id)
+    await update_pending_list(message.chat.id, persistent=True)
 
 
 @dp.message_handler(lambda m: m.text == "⚙️ Настройки", state='*')
@@ -1785,7 +1807,7 @@ async def settings_universal(message: types.Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data == "refresh_list", state='*')
 async def refresh_list(callback: types.CallbackQuery):
-    await update_notifications_list(callback.from_user.id)
+    await update_notifications_list(callback.from_user.id, persistent=True)
     await callback.answer("Список обновлён")
 
 
@@ -1847,7 +1869,7 @@ async def change_notification_time(callback: types.CallbackQuery, state: FSMCont
 @dp.callback_query_handler(lambda c: c.data == "cancel_edit", state='*')
 async def cancel_edit_handler(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
-    await update_notifications_list(callback.from_user.id)
+    await update_notifications_list(callback.from_user.id, persistent=True)
     await callback.answer()
 
 
@@ -1865,7 +1887,7 @@ async def calendar_prev_month(callback: types.CallbackQuery):
     parts = callback.data.replace("cal_prev_", "").split("_")
     year = int(parts[0])
     month = int(parts[1])
-    await show_calendar_events(callback.from_user.id, year, month)
+    await show_calendar_events(callback.from_user.id, year, month, persistent=True)
     await callback.answer()
 
 
@@ -1874,7 +1896,7 @@ async def calendar_next_month(callback: types.CallbackQuery):
     parts = callback.data.replace("cal_next_", "").split("_")
     year = int(parts[0])
     month = int(parts[1])
-    await show_calendar_events(callback.from_user.id, year, month)
+    await show_calendar_events(callback.from_user.id, year, month, persistent=True)
     await callback.answer()
 
 
@@ -1883,7 +1905,7 @@ async def calendar_refresh(callback: types.CallbackQuery):
     parts = callback.data.replace("cal_refresh_", "").split("_")
     year = int(parts[0])
     month = int(parts[1])
-    await show_calendar_events(callback.from_user.id, year, month, force_refresh=True)
+    await show_calendar_events(callback.from_user.id, year, month, force_refresh=True, persistent=True)
     await callback.answer("✅ Календарь обновлён")
 
 
@@ -1899,11 +1921,11 @@ async def calendar_sync(callback: types.CallbackQuery):
         cache_key = f"{year}_{month}"
         calendar_events_cache[cache_key] = events
         last_calendar_update[cache_key] = get_current_time()
-        await show_calendar_events(callback.from_user.id, year, month, force_refresh=True)
+        await show_calendar_events(callback.from_user.id, year, month, force_refresh=True, persistent=True)
         await callback.answer("✅ Синхронизация завершена")
     else:
         await callback.answer("❌ CalDAV не настроен")
-        await show_calendar_events(callback.from_user.id, year, month)
+        await show_calendar_events(callback.from_user.id, year, month, persistent=True)
 
 
 @dp.callback_query_handler(lambda c: c.data == "edit_calendar", state='*')
@@ -1933,7 +1955,7 @@ async def edit_calendar_handler(callback: types.CallbackQuery, state: FSMContext
         await callback.answer("Нет событий для редактирования")
         return
     keyboard = InlineKeyboardMarkup(row_width=1)
-    for idx, (start_dt, event) in enumerate(future_events[:20]):  # Ограничиваем количество
+    for idx, (start_dt, event) in enumerate(future_events[:20]):
         day = start_dt.day
         month_num = start_dt.month
         time_str = start_dt.strftime('%H:%M')
@@ -2018,7 +2040,7 @@ async def save_edited_event_text(message: types.Message, state: FSMContext):
     else:
         await send_with_auto_delete(message.chat.id, "❌ Ошибка при обновлении события", delay=3600)
     await state.finish()
-    await update_notifications_list(message.chat.id)
+    await update_notifications_list(message.chat.id, persistent=True)
 
 
 @dp.message_handler(state=EditCalendarEventStates.waiting_for_new_datetime)
@@ -2065,7 +2087,7 @@ async def save_edited_event_datetime(message: types.Message, state: FSMContext):
     else:
         await send_with_auto_delete(message.chat.id, "❌ Ошибка при обновлении события", delay=3600)
     await state.finish()
-    await update_notifications_list(message.chat.id)
+    await update_notifications_list(message.chat.id, persistent=True)
 
 
 # === НАСТРОЙКИ ===
@@ -2246,7 +2268,7 @@ async def auto_update_calendar_cache():
             logger.info("Автообновление календаря выполнено")
         except Exception as e:
             logger.error(f"Ошибка автообновления календаря: {e}")
-        await asyncio.sleep(900)  # 15 минут
+        await asyncio.sleep(900)
 
 
 async def on_startup(dp):
@@ -2257,7 +2279,6 @@ async def on_startup(dp):
     new_notifications = {}
     processed_ids = set()
     for i, (notif_id, notif) in enumerate(sorted(notifications.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0), 1):
-        # Проверка на дубликаты по тексту и времени
         notif_key = f"{notif['text']}_{notif.get('time', '')}"
         if notif_key not in processed_ids:
             notif['num'] = i
