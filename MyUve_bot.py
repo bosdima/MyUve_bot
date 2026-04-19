@@ -34,7 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Версия бота
-BOT_VERSION = "1.3"
+BOT_VERSION = "1.4"
 BOT_VERSION_DATE = "19.04.2026"
 
 # Загрузка переменных окружения
@@ -309,7 +309,7 @@ END:VCALENDAR"""
             from_utc = from_date.astimezone(pytz.UTC)
             to_utc = to_date.astimezone(pytz.UTC)
             
-            # Используем search вместо date_search (устаревший метод)
+            # Используем search вместо date_search
             events = calendar.search(start=from_utc, end=to_utc, expand=True)
             
             result = []
@@ -403,7 +403,9 @@ async def get_formatted_calendar_events(year: int, month: int, force_refresh: bo
     events = calendar_events_cache.get(cache_key, [])
     now = get_current_time()
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # Показываем все будущие события (включая завтра, послезавтра и т.д.)
+    # Не ограничиваем только сегодняшними
     future_events = []
     
     for event in events:
@@ -413,9 +415,15 @@ async def get_formatted_calendar_events(year: int, month: int, force_refresh: bo
                 start_dt = tz.localize(start_dt)
             else:
                 start_dt = start_dt.astimezone(tz)
-            if start_dt >= today:
+            
+            # Показываем события, которые еще не начались
+            if start_dt >= now:
                 future_events.append((start_dt, event))
-        except:
+            # Также показываем события, которые начались сегодня, но еще не прошли
+            elif start_dt.date() == now.date() and start_dt >= now.replace(hour=0, minute=0, second=0):
+                future_events.append((start_dt, event))
+        except Exception as e:
+            logger.error(f"Ошибка обработки события: {e}")
             continue
     
     if not future_events:
@@ -423,17 +431,29 @@ async def get_formatted_calendar_events(year: int, month: int, force_refresh: bo
     else:
         future_events.sort(key=lambda x: x[0])
         text = f"📅 **СОБЫТИЯ КАЛЕНДАРЯ**\n📆 {MONTHS_NAMES[month]} {year}\n\n"
-        for start_dt, event in future_events[:20]:
+        
+        for start_dt, event in future_events[:30]:  # Показываем до 30 событий
             day = start_dt.day
             month_num = start_dt.month
             year_num = start_dt.year
             time_str = start_dt.strftime('%H:%M')
             summary = event['summary']
-            # Новый формат: 19 апреля, суббота, 07:00 — Выпить таблетку
             weekday_name = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"][start_dt.weekday()]
-            text += f"🗓 {day:02d}.{month_num:02d}.{year_num} ({weekday_name}) в {time_str} — **{summary}**\n"
-        if len(future_events) > 20:
-            text += f"\n... и еще {len(future_events) - 20} событий"
+            
+            # Определяем, сегодня это или нет
+            if start_dt.date() == now.date():
+                prefix = "🔴 СЕГОДНЯ"
+            elif start_dt.date() == now.date() + timedelta(days=1):
+                prefix = "🟠 ЗАВТРА"
+            elif start_dt.date() == now.date() + timedelta(days=2):
+                prefix = "🟡 ПОСЛЕЗАВТРА"
+            else:
+                prefix = "📌"
+            
+            text += f"{prefix} {day:02d}.{month_num:02d}.{year_num} ({weekday_name}) в {time_str} — **{summary}**\n"
+        
+        if len(future_events) > 30:
+            text += f"\n... и еще {len(future_events) - 30} событий"
     
     # Добавляем информацию о последней синхронизации
     if last_sync_time:
@@ -605,7 +625,8 @@ async def sync_calendar_to_pending():
     cache_key = f"{year}_{month}"
     events = calendar_events_cache.get(cache_key, [])
     
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Показываем все будущие события, а не только с сегодняшнего дня
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     
     for event in events:
         try:
@@ -615,38 +636,37 @@ async def sync_calendar_to_pending():
             else:
                 start_dt = start_dt.astimezone(tz)
             
-            if start_dt < today:
-                continue
-            
-            event_id = event['id']
-            summary = event['summary']
-            
-            exists = False
-            for nid, notif in pending_notifications.items():
-                if notif.get('calendar_event_id') == event_id:
-                    exists = True
-                    break
-            if not exists:
-                for nid, notif in notifications.items():
+            # Добавляем события, которые еще не начались или начались сегодня
+            if start_dt >= today_start:
+                event_id = event['id']
+                summary = event['summary']
+                
+                exists = False
+                for nid, notif in pending_notifications.items():
                     if notif.get('calendar_event_id') == event_id:
                         exists = True
                         break
-            
-            if not exists:
-                notif_id = f"pending_{int(start_dt.timestamp())}_{hashlib.md5(event_id.encode()).hexdigest()[:8]}"
-                pending_notifications[notif_id] = {
-                    'text': summary,
-                    'time': start_dt.isoformat(),
-                    'created': get_current_time().isoformat(),
-                    'calendar_event_id': event_id,
-                    'is_completed': False,
-                    'reminder_sent': False,
-                    'repeat_count': 0,
-                    'last_reminder_time': None,
-                    'is_pending': True
-                }
-                save_data()
-                logger.info(f"Событие {summary} добавлено в неотмеченные уведомления")
+                if not exists:
+                    for nid, notif in notifications.items():
+                        if notif.get('calendar_event_id') == event_id:
+                            exists = True
+                            break
+                
+                if not exists:
+                    notif_id = f"pending_{int(start_dt.timestamp())}_{hashlib.md5(event_id.encode()).hexdigest()[:8]}"
+                    pending_notifications[notif_id] = {
+                        'text': summary,
+                        'time': start_dt.isoformat(),
+                        'created': get_current_time().isoformat(),
+                        'calendar_event_id': event_id,
+                        'is_completed': False,
+                        'reminder_sent': False,
+                        'repeat_count': 0,
+                        'last_reminder_time': None,
+                        'is_pending': True
+                    }
+                    save_data()
+                    logger.info(f"Событие {summary} добавлено в неотмеченные уведомления")
         except Exception as e:
             logger.error(f"Ошибка синхронизации события: {e}")
 
@@ -784,8 +804,7 @@ async def check_pending_notifications():
                     save_data()
                     logger.info(f"Отправлено первое уведомление для неотмеченного #{notif_id}")
                 
-                # Повторные уведомления - ВАЖНО: сбрасываем reminder_sent после отправки повтора?
-                # Нет, оставляем True, но проверяем по времени
+                # Повторные уведомления каждый час
                 elif notif.get('reminder_sent', False) and not notif.get('is_completed', False):
                     if last_reminder_time is None:
                         last_reminder_time = notify_time
@@ -796,7 +815,6 @@ async def check_pending_notifications():
                         await show_pending_notification_actions(ADMIN_ID, notif_id, notif['text'], repeat_count)
                         notif['last_reminder_time'] = now.isoformat()
                         notif['repeat_count'] = repeat_count
-                        # Не сбрасываем reminder_sent, чтобы продолжать отслеживать повторы
                         save_data()
                         logger.info(f"Отправлено повторное уведомление #{repeat_count} для неотмеченного #{notif_id}")
         
@@ -1638,7 +1656,7 @@ async def pending_edit(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_snooze_') and 'pend_snooze_' in c.data and not c.data.startswith('pend_snooze_1h_') and not c.data.startswith('pend_snooze_3h_') and not c.data.startswith('pend_snooze_1d_') and not c.data.startswith('pend_snooze_7d_') and not c.data.startswith('pend_snooze_custom_'), state='*')
+@dp.callback_query_handler(lambda c: c.data.startswith('pend_snooze_') and not c.data.startswith('pend_snooze_1h_') and not c.data.startswith('pend_snooze_3h_') and not c.data.startswith('pend_snooze_1d_') and not c.data.startswith('pend_snooze_7d_') and not c.data.startswith('pend_snooze_custom_'), state='*')
 async def pending_snooze(callback: types.CallbackQuery, state: FSMContext):
     notif_id = callback.data.replace('pend_snooze_', '')
     if notif_id not in pending_notifications:
