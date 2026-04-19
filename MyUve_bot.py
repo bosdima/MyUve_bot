@@ -34,8 +34,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Версия бота
-BOT_VERSION = "1.2"
-BOT_VERSION_DATE = "17.04.2026"
+BOT_VERSION = "1.3"
+BOT_VERSION_DATE = "19.04.2026"
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -67,6 +67,7 @@ notifications_enabled = True
 calendar_events_cache: Dict[str, List[Dict]] = {}
 last_calendar_update = {}
 event_id_map: Dict[str, str] = {}
+last_sync_time: Optional[datetime] = None  # Время последней синхронизации
 
 TIMEZONES = {
     'Москва (UTC+3)': 'Europe/Moscow',
@@ -211,7 +212,7 @@ class CalDAVCalendarAPI:
                 return True, f"CalDAV подключен, найдено {len(calendars)} календарей"
             return False, "Календари не найдены. Создайте календарь на calendar.yandex.ru"
         except caldav.lib.error.AuthorizationError:
-            return False, "Ошибка авторизации! Возможно, истёк срок действия пароля приложения. Получите новый пароль на https://id.yandex.ru/security/app-passwords"
+            return False, "Ошибка авторизации! Получите новый пароль приложения на https://id.yandex.ru/security/app-passwords"
         except Exception as e:
             error_msg = str(e)
             if "401" in error_msg or "Unauthorized" in error_msg:
@@ -308,7 +309,8 @@ END:VCALENDAR"""
             from_utc = from_date.astimezone(pytz.UTC)
             to_utc = to_date.astimezone(pytz.UTC)
             
-            events = calendar.date_search(start=from_utc, end=to_utc, expand=True)
+            # Используем search вместо date_search (устаревший метод)
+            events = calendar.search(start=from_utc, end=to_utc, expand=True)
             
             result = []
             for event in events:
@@ -359,7 +361,7 @@ async def check_caldav_connection() -> tuple[bool, str]:
 
 
 async def update_calendar_events_cache(year: int, month: int, force: bool = False):
-    global calendar_events_cache, last_calendar_update
+    global calendar_events_cache, last_calendar_update, last_sync_time
     cache_key = f"{year}_{month}"
     now = get_current_time()
     
@@ -377,8 +379,9 @@ async def update_calendar_events_cache(year: int, month: int, force: bool = Fals
         events.sort(key=lambda x: x.get('start', ''))
         calendar_events_cache[cache_key] = events
         last_calendar_update[cache_key] = now
+        last_sync_time = now  # Обновляем время последней синхронизации
         
-        # Очистка старых кэшей (оставляем не более 3 месяцев)
+        # Очистка старых кэшей
         keys_to_remove = [k for k in calendar_events_cache.keys() if k != cache_key]
         for key in keys_to_remove:
             if len(calendar_events_cache) > 3:
@@ -390,6 +393,7 @@ async def update_calendar_events_cache(year: int, month: int, force: bool = Fals
 
 
 async def get_formatted_calendar_events(year: int, month: int, force_refresh: bool = False) -> str:
+    global last_sync_time
     if force_refresh:
         await update_calendar_events_cache(year, month, force=True)
     else:
@@ -415,19 +419,27 @@ async def get_formatted_calendar_events(year: int, month: int, force_refresh: bo
             continue
     
     if not future_events:
-        return f"📅 **Нет предстоящих событий на {MONTHS_NAMES[month]} {year}**"
+        text = f"📅 **Нет предстоящих событий на {MONTHS_NAMES[month]} {year}**"
+    else:
+        future_events.sort(key=lambda x: x[0])
+        text = f"📅 **СОБЫТИЯ КАЛЕНДАРЯ**\n📆 {MONTHS_NAMES[month]} {year}\n\n"
+        for start_dt, event in future_events[:20]:
+            day = start_dt.day
+            month_num = start_dt.month
+            year_num = start_dt.year
+            time_str = start_dt.strftime('%H:%M')
+            summary = event['summary']
+            # Новый формат: 19 апреля, суббота, 07:00 — Выпить таблетку
+            weekday_name = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"][start_dt.weekday()]
+            text += f"🗓 {day:02d}.{month_num:02d}.{year_num} ({weekday_name}) в {time_str} — **{summary}**\n"
+        if len(future_events) > 20:
+            text += f"\n... и еще {len(future_events) - 20} событий"
     
-    future_events.sort(key=lambda x: x[0])
-    text = f"📅 **Предстоящие события на {MONTHS_NAMES[month]} {year}**\n\n"
-    for start_dt, event in future_events[:20]:
-        day = start_dt.day
-        month_num = start_dt.month
-        year_num = start_dt.year
-        time_str = start_dt.strftime('%H:%M')
-        summary = event['summary']
-        text += f"• {day:02d}.{month_num:02d}.{year_num} {time_str} - {summary}\n"
-    if len(future_events) > 20:
-        text += f"\n... и еще {len(future_events) - 20} событий"
+    # Добавляем информацию о последней синхронизации
+    if last_sync_time:
+        sync_str = last_sync_time.strftime('%d.%m.%Y %H:%M:%S')
+        text += f"\n\n🔄 *Последняя синхронизация:* {sync_str}"
+    
     return text
 
 
@@ -731,7 +743,8 @@ async def show_pending_notification_actions(chat_id: int, notif_id: str, notif_t
         chat_id,
         f"🔔 **НЕОТМЕЧЕННОЕ НАПОМИНАНИЕ!**{repeat_text}\n\n"
         f"📝 {notif_text}\n\n"
-        f"⏰ Время истекло! Пожалуйста, отметьте выполнение или измените время.",
+        f"⏰ Время истекло! Пожалуйста, отметьте выполнение или измените время.\n\n"
+        f"⚠️ Напоминание будет повторяться каждый час, пока вы не отметите его как выполненное.",
         reply_markup=keyboard,
         parse_mode='Markdown'
     )
@@ -762,6 +775,7 @@ async def check_pending_notifications():
                 else:
                     last_reminder_time = None
                 
+                # Первое уведомление
                 if not notif.get('reminder_sent', False) and now >= notify_time:
                     await show_pending_notification_actions(ADMIN_ID, notif_id, notif['text'])
                     notif['reminder_sent'] = True
@@ -770,16 +784,19 @@ async def check_pending_notifications():
                     save_data()
                     logger.info(f"Отправлено первое уведомление для неотмеченного #{notif_id}")
                 
+                # Повторные уведомления - ВАЖНО: сбрасываем reminder_sent после отправки повтора?
+                # Нет, оставляем True, но проверяем по времени
                 elif notif.get('reminder_sent', False) and not notif.get('is_completed', False):
                     if last_reminder_time is None:
                         last_reminder_time = notify_time
                     
                     time_since_last = (now - last_reminder_time).total_seconds()
-                    if time_since_last >= 3600:
+                    if time_since_last >= 3600:  # Каждый час
                         repeat_count = notif.get('repeat_count', 0) + 1
                         await show_pending_notification_actions(ADMIN_ID, notif_id, notif['text'], repeat_count)
                         notif['last_reminder_time'] = now.isoformat()
                         notif['repeat_count'] = repeat_count
+                        # Не сбрасываем reminder_sent, чтобы продолжать отслеживать повторы
                         save_data()
                         logger.info(f"Отправлено повторное уведомление #{repeat_count} для неотмеченного #{notif_id}")
         
@@ -821,7 +838,13 @@ async def check_regular_notifications():
                         notif['last_trigger'] = now.isoformat()
                         notif['repeat_count'] = repeat_count + 1
                         notif['is_repeat'] = True
+                        # Переносим в pending_notifications
+                        pending_notifications[notif_id] = notif.copy()
+                        pending_notifications[notif_id]['reminder_sent'] = True
+                        pending_notifications[notif_id]['last_reminder_time'] = now.isoformat()
+                        del notifications[notif_id]
                         save_data()
+                        logger.info(f"Уведомление #{notif_id} перенесено в неотмеченные (каждый час)")
                 
                 elif repeat_type == 'every_day':
                     hour = notif.get('repeat_hour', 0)
@@ -849,7 +872,13 @@ async def check_regular_notifications():
                         notif['last_trigger'] = now.isoformat()
                         notif['repeat_count'] = repeat_count + 1
                         notif['is_repeat'] = True
+                        # Переносим в pending_notifications
+                        pending_notifications[notif_id] = notif.copy()
+                        pending_notifications[notif_id]['reminder_sent'] = True
+                        pending_notifications[notif_id]['last_reminder_time'] = now.isoformat()
+                        del notifications[notif_id]
                         save_data()
+                        logger.info(f"Уведомление #{notif_id} перенесено в неотмеченные (ежедневно)")
                 
                 elif repeat_type == 'weekdays':
                     hour = notif.get('repeat_hour', 0)
@@ -874,7 +903,13 @@ async def check_regular_notifications():
                             notif['last_trigger'] = now.isoformat()
                             notif['repeat_count'] = repeat_count + 1
                             notif['is_repeat'] = True
+                            # Переносим в pending_notifications
+                            pending_notifications[notif_id] = notif.copy()
+                            pending_notifications[notif_id]['reminder_sent'] = True
+                            pending_notifications[notif_id]['last_reminder_time'] = now.isoformat()
+                            del notifications[notif_id]
                             save_data()
+                            logger.info(f"Уведомление #{notif_id} перенесено в неотмеченные (по дням недели)")
                 
                 elif repeat_type == 'no' and notif.get('time') and not notif.get('reminder_sent', False):
                     notify_time = datetime.fromisoformat(notif['time'])
@@ -888,8 +923,13 @@ async def check_regular_notifications():
                         notif['reminder_sent'] = True
                         notif['last_reminder_time'] = now.isoformat()
                         notif['repeat_count'] = 1
+                        # Переносим в pending_notifications
+                        pending_notifications[notif_id] = notif.copy()
+                        pending_notifications[notif_id]['reminder_sent'] = True
+                        pending_notifications[notif_id]['last_reminder_time'] = now.isoformat()
+                        del notifications[notif_id]
                         save_data()
-                        logger.info(f"Отправлено первое уведомление для #{notif_id}")
+                        logger.info(f"Уведомление #{notif_id} перенесено в неотмеченные (одноразовое)")
         
         await asyncio.sleep(30)
 
@@ -1134,6 +1174,8 @@ async def get_notification_text(message: types.Message, state: FSMContext):
     await NotificationStates.waiting_for_time_type.set()
 
 
+# === ОБРАБОТЧИКИ ВРЕМЕНИ (callback'и) ===
+
 @dp.callback_query_handler(lambda c: c.data == "time_specific", state=NotificationStates.waiting_for_time_type)
 async def process_specific_time(callback: types.CallbackQuery, state: FSMContext):
     await send_with_auto_delete(callback.from_user.id, "🗓️ **Введите дату и время**\n📝 Форматы:\n• `17.04 21:00`\n• `31.12.2025 23:59`\n• `20.04` (только дата)\n\n💡 Для отмены /cancel", delay=3600)
@@ -1210,6 +1252,8 @@ async def process_weekdays(callback: types.CallbackQuery, state: FSMContext):
     await NotificationStates.waiting_for_weekdays.set()
     await callback.answer()
 
+
+# === ОБРАБОТЧИКИ ВВОДА ДАТЫ/ВРЕМЕНИ ===
 
 @dp.message_handler(state=NotificationStates.waiting_for_specific_date)
 async def set_specific_date_new(message: types.Message, state: FSMContext):
@@ -1425,7 +1469,9 @@ async def set_every_day_time(message: types.Message, state: FSMContext):
     await update_notifications_list(message.chat.id, persistent=True)
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith('wd_'), state=NotificationStates.waiting_for_weekdays)
+# === ОБРАБОТЧИКИ ДНЕЙ НЕДЕЛИ ===
+
+@dp.callback_query_handler(lambda c: c.data.startswith('wd_') and c.data != 'wd_done', state=NotificationStates.waiting_for_weekdays)
 async def select_weekday(callback: types.CallbackQuery, state: FSMContext):
     day = int(callback.data.replace('wd_', ''))
     data = await state.get_data()
@@ -1592,7 +1638,7 @@ async def pending_edit(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_snooze_'), state='*')
+@dp.callback_query_handler(lambda c: c.data.startswith('pend_snooze_') and 'pend_snooze_' in c.data and not c.data.startswith('pend_snooze_1h_') and not c.data.startswith('pend_snooze_3h_') and not c.data.startswith('pend_snooze_1d_') and not c.data.startswith('pend_snooze_7d_') and not c.data.startswith('pend_snooze_custom_'), state='*')
 async def pending_snooze(callback: types.CallbackQuery, state: FSMContext):
     notif_id = callback.data.replace('pend_snooze_', '')
     if notif_id not in pending_notifications:
@@ -1926,6 +1972,13 @@ async def calendar_sync(callback: types.CallbackQuery):
     else:
         await callback.answer("❌ CalDAV не настроен")
         await show_calendar_events(callback.from_user.id, year, month, persistent=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == "curr_month", state='*')
+async def calendar_current_month(callback: types.CallbackQuery):
+    now = get_current_time()
+    await show_calendar_events(callback.from_user.id, now.year, now.month, persistent=True)
+    await callback.answer()
 
 
 @dp.callback_query_handler(lambda c: c.data == "edit_calendar", state='*')
