@@ -29,7 +29,7 @@ YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "1.6"
+BOT_VERSION = "1.7"
 BOT_VERSION_DATE = "19.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -406,13 +406,14 @@ def save_data():
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 async def sync_calendar_to_pending():
+    """Синхронизация - добавляем ТОЛЬКО просроченные события (время которых уже наступило)"""
     if not get_caldav_available() or not config.get('calendar_sync_enabled', True):
         return
     now = get_current_time()
     await update_calendar_events_cache(now.year, now.month)
     events = calendar_events_cache.get(f"{now.year}_{now.month}", [])
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+    
     for ev in events:
         try:
             dt = datetime.fromisoformat(ev['start'])
@@ -420,7 +421,9 @@ async def sync_calendar_to_pending():
                 dt = tz.localize(dt)
             else:
                 dt = dt.astimezone(tz)
-            if dt >= today_start:
+            
+            # ВАЖНО: Добавляем ТОЛЬКО просроченные события (время наступило)
+            if dt <= now:
                 exists = False
                 for n in pending_notifications.values():
                     if n.get('calendar_event_id') == ev['id']:
@@ -444,7 +447,7 @@ async def sync_calendar_to_pending():
                         'last_reminder_time': None
                     }
                     save_data()
-                    logger.info(f"Событие '{ev['summary']}' добавлено в неотмеченные")
+                    logger.info(f"Просроченное событие '{ev['summary']}' добавлено в неотмеченные")
         except Exception as e:
             logger.error(f"sync_calendar error: {e}")
 
@@ -652,6 +655,7 @@ def get_main_keyboard():
     return kb
 
 async def update_pending_list(chat_id, persistent=False):
+    """Показываем список неотмеченных уведомлений с возможностью выбора"""
     if not pending_notifications:
         msg = "✅ **Нет неотмеченных уведомлений!**\n\nВсе напоминания выполнены."
         if persistent:
@@ -659,9 +663,12 @@ async def update_pending_list(chat_id, persistent=False):
         else:
             await send_with_auto_delete(chat_id, msg, delay=3600)
         return
+    
     now = get_current_time()
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
     lines = []
+    pending_list = []
+    
     for nid, n in pending_notifications.items():
         if n.get('is_completed', False):
             continue
@@ -671,18 +678,39 @@ async def update_pending_list(chat_id, persistent=False):
         else:
             dt = dt.astimezone(tz)
         cnt = n.get('repeat_count', 0)
-        lines.append(f"• **{n['text']}**\n  ⏰ {dt.strftime('%d.%m.%Y %H:%M')}" + (f" (повторений: {cnt})" if cnt > 0 else ""))
-    msg = "⚠️ **НЕОТМЕЧЕННЫЕ УВЕДОМЛЕНИЯ**\n\nЭти напоминания просрочены и будут повторяться каждый час.\n\n" + "\n".join(lines) + f"\n\n📊 **Всего:** {len(lines)}"
+        pending_list.append((nid, n['text'], dt, cnt))
+    
+    if not pending_list:
+        msg = "✅ **Нет неотмеченных уведомлений!**"
+        if persistent:
+            await send_persistent_message(chat_id, msg)
+        else:
+            await send_with_auto_delete(chat_id, msg, delay=3600)
+        return
+    
+    # Сортируем по времени
+    pending_list.sort(key=lambda x: x[2])
+    
+    text = "⚠️ **НЕОТМЕЧЕННЫЕ УВЕДОМЛЕНИЯ**\n\n"
+    text += "Эти напоминания просрочены и будут повторяться каждый час.\n"
+    text += "Выберите уведомление для отметки выполнения или редактирования.\n\n"
+    
+    for idx, (nid, txt, dt, cnt) in enumerate(pending_list, 1):
+        repeat_text = f" (повторений: {cnt})" if cnt > 0 else ""
+        text += f"{idx}. **{txt}**\n   ⏰ {dt.strftime('%d.%m.%Y %H:%M')}{repeat_text}\n\n"
+    
+    text += f"📊 **Всего:** {len(pending_list)}"
+    
+    # Клавиатура с кнопками для каждого уведомления
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("✅ Выполнить все", callback_data="pend_complete_all"),
-        InlineKeyboardButton("✏️ Редактировать", callback_data="pend_edit_list"),
-        InlineKeyboardButton("🔄 Обновить", callback_data="refresh_pending")
-    )
+    for idx, (nid, txt, dt, cnt) in enumerate(pending_list, 1):
+        kb.add(InlineKeyboardButton(f"{idx}. {txt[:30]}...", callback_data=f"pend_select_{nid}"))
+    kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="refresh_pending"))
+    
     if persistent:
-        await send_persistent_message(chat_id, msg, reply_markup=kb)
+        await send_persistent_message(chat_id, text, reply_markup=kb)
     else:
-        await send_with_auto_delete(chat_id, msg, reply_markup=kb, delay=3600)
+        await send_with_auto_delete(chat_id, text, reply_markup=kb, delay=3600)
 
 # ---------- ОСНОВНЫЕ ОБРАБОТЧИКИ ----------
 @dp.message_handler(commands=['start'])
@@ -692,7 +720,7 @@ async def cmd_start(msg, state):
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
         return await msg.reply("❌ Нет доступа")
     ok, _ = await check_caldav_connection()
-    welcome = f"👋 **Добро пожаловать!**\n🤖 Версия v{BOT_VERSION}\n📧 CalDAV: {'✅ Доступен' if ok else '❌ Ошибка'}\n🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}\n\n⚠️ **Неотмеченные уведомления** — это напоминания, время которых истекло. Они будут повторяться каждый час, пока вы не отметите их как выполненные."
+    welcome = f"👋 **Добро пожаловать!**\n🤖 Версия v{BOT_VERSION}\n📧 CalDAV: {'✅ Доступен' if ok else '❌ Ошибка'}\n🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}\n\n⚠️ **Неотмеченные уведомления** — это напоминания, время которых уже истекло. Они будут повторяться каждый час, пока вы не отметите их как выполненные."
     if not ok and get_caldav_available():
         welcome += "\n\n⚠️ Проблема с CalDAV. Проверьте пароль приложения."
     await send_persistent_message(msg.chat.id, welcome)
@@ -974,28 +1002,34 @@ async def refresh_pending(cb):
     await update_pending_list(cb.from_user.id, persistent=True)
     await cb.answer("Обновлено")
 
-@dp.callback_query_handler(lambda c: c.data == "pend_complete_all", state='*')
-async def pend_complete_all(cb):
-    for nid in list(pending_notifications.keys()):
-        if 'calendar_event_id' in pending_notifications[nid]:
-            await sync_notification_to_calendar(nid, 'delete')
-        del pending_notifications[nid]
-    save_data()
-    await cb.message.edit_text("✅ **Все неотмеченные уведомления выполнены!**")
-    await update_pending_list(cb.from_user.id, persistent=True)
-    await cb.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "pend_edit_list", state='*')
-async def pend_edit_list(cb, state):
-    if not pending_notifications:
-        return await cb.answer("Нет неотмеченных уведомлений")
-    kb = InlineKeyboardMarkup(row_width=1)
-    for nid, n in pending_notifications.items():
-        if n.get('is_completed', False):
-            continue
-        kb.add(InlineKeyboardButton(f"{n['text'][:40]}...", callback_data=f"pend_edit_{nid}"))
-    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_edit"))
-    await cb.message.edit_text("✏️ **Выберите уведомление для редактирования:**", reply_markup=kb)
+@dp.callback_query_handler(lambda c: c.data.startswith('pend_select_'), state='*')
+async def pend_select(cb, state):
+    """Выбор конкретного уведомления из списка"""
+    nid = cb.data.replace('pend_select_', '')
+    if nid not in pending_notifications:
+        return await cb.answer("Уведомление не найдено")
+    n = pending_notifications[nid]
+    
+    # Показываем действия для выбранного уведомления
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Выполнено", callback_data=f"pend_done_{nid}"),
+        InlineKeyboardButton("✏️ Изменить текст", callback_data=f"pend_edit_text_{nid}"),
+        InlineKeyboardButton("⏰ Изменить время", callback_data=f"pend_edit_time_{nid}"),
+        InlineKeyboardButton("📅 Отложить", callback_data=f"pend_snooze_{nid}"),
+        InlineKeyboardButton("❌ Отложить на час", callback_data=f"pend_hour_{nid}"),
+        InlineKeyboardButton("◀️ Назад", callback_data="refresh_pending")
+    )
+    
+    dt = datetime.fromisoformat(n['time'])
+    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+    if dt.tzinfo is None:
+        dt = tz.localize(dt)
+    else:
+        dt = dt.astimezone(tz)
+    
+    text = f"📝 **Уведомление:**\n{n['text']}\n\n⏰ **Время:** {dt.strftime('%d.%m.%Y %H:%M')}\n🔄 **Повторов:** {n.get('repeat_count', 0)}\n\nВыберите действие:"
+    await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
 
 @dp.callback_query_handler(lambda c: c.data.startswith('pend_done_'), state='*')
@@ -1006,25 +1040,30 @@ async def pend_done(cb):
             await sync_notification_to_calendar(nid, 'delete')
         del pending_notifications[nid]
         save_data()
-        await cb.message.edit_text("✅ **Уведомление выполнено!**")
+        await cb.answer("✅ Уведомление выполнено и удалено!")
         await update_pending_list(cb.from_user.id, persistent=True)
     else:
         await cb.answer("Уведомление не найдено")
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_edit_'), state='*')
-async def pend_edit(cb, state):
-    nid = cb.data.replace('pend_edit_', '')
+@dp.callback_query_handler(lambda c: c.data.startswith('pend_edit_text_'), state='*')
+async def pend_edit_text(cb, state):
+    nid = cb.data.replace('pend_edit_text_', '')
     if nid not in pending_notifications:
         return await cb.answer("Уведомление не найдено")
     await state.update_data(edit_id=nid, is_pending=True)
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("✏️ Изменить текст", callback_data=f"pend_chtext_{nid}"),
-        InlineKeyboardButton("⏰ Изменить время", callback_data=f"pend_chtime_{nid}"),
-        InlineKeyboardButton("❌ Отмена", callback_data="cancel_edit")
-    )
-    await cb.message.edit_text(f"✏️ **Что изменить?**\n\n📝 {pending_notifications[nid]['text']}", reply_markup=kb)
+    await send_with_auto_delete(cb.from_user.id, f"✏️ **Введите новый текст:**\n\n📝 Старый: {pending_notifications[nid]['text']}\n\n💡 Для отмены /cancel", delay=3600)
+    await NotificationStates.waiting_for_edit_text.set()
+    await cb.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith('pend_edit_time_'), state='*')
+async def pend_edit_time(cb, state):
+    nid = cb.data.replace('pend_edit_time_', '')
+    if nid not in pending_notifications:
+        return await cb.answer("Уведомление не найдено")
+    await state.update_data(edit_id=nid, is_pending=True)
+    await send_with_auto_delete(cb.from_user.id, "🗓️ **Введите новую дату и время**\n📝 Форматы:\n• `17.04 21:00`\n• `31.12.2025 23:59`", delay=3600)
+    await NotificationStates.waiting_for_edit_time.set()
     await cb.answer()
 
 @dp.callback_query_handler(lambda c: c.data.startswith('pend_snooze_') and not c.data.startswith(('pend_snooze_1h_','pend_snooze_3h_','pend_snooze_1d_','pend_snooze_7d_','pend_snooze_custom_')), state='*')
@@ -1040,7 +1079,7 @@ async def pend_snooze(cb, state):
         InlineKeyboardButton("📅 1 день", callback_data=f"pend_snooze_1d_{nid}"),
         InlineKeyboardButton("📅 7 дней", callback_data=f"pend_snooze_7d_{nid}"),
         InlineKeyboardButton("🎯 Свой вариант", callback_data=f"pend_snooze_custom_{nid}"),
-        InlineKeyboardButton("❌ Отмена", callback_data="cancel_snooze")
+        InlineKeyboardButton("◀️ Назад", callback_data=f"pend_select_{nid}")
     )
     await cb.message.edit_text(f"⏰ **Отложить уведомление?**\n\n📝 {pending_notifications[nid]['text']}", reply_markup=kb)
     await cb.answer()
@@ -1097,26 +1136,6 @@ async def snooze_custom(cb, state):
     await SnoozeStates.waiting_for_specific_date.set()
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_chtext_'), state='*')
-async def pend_chtext(cb, state):
-    nid = cb.data.replace('pend_chtext_', '')
-    if nid not in pending_notifications:
-        return await cb.answer("Уведомление не найдено")
-    await state.update_data(edit_id=nid, is_pending=True)
-    await send_with_auto_delete(cb.from_user.id, f"✏️ **Введите новый текст:**\n\n📝 Старый: {pending_notifications[nid]['text']}\n\n💡 Для отмены /cancel", delay=3600)
-    await NotificationStates.waiting_for_edit_text.set()
-    await cb.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_chtime_'), state='*')
-async def pend_chtime(cb, state):
-    nid = cb.data.replace('pend_chtime_', '')
-    if nid not in pending_notifications:
-        return await cb.answer("Уведомление не найдено")
-    await state.update_data(edit_id=nid, is_pending=True)
-    await send_with_auto_delete(cb.from_user.id, "🗓️ **Введите новую дату и время**\n📝 Форматы:\n• `17.04 21:00`\n• `31.12.2025 23:59`", delay=3600)
-    await NotificationStates.waiting_for_edit_time.set()
-    await cb.answer()
-
 @dp.message_handler(state=NotificationStates.waiting_for_edit_text)
 async def save_edit_text(msg, state):
     await delete_user_message(msg)
@@ -1134,10 +1153,7 @@ async def save_edit_text(msg, state):
     save_data()
     await sync_notification_to_calendar(nid, 'create')
     await send_with_auto_delete(msg.chat.id, f"✅ **Текст изменён!**\n\nСтарый: {old}\nНовый: {msg.text}", delay=3600)
-    if is_pending:
-        await update_pending_list(msg.chat.id, persistent=True)
-    else:
-        await update_pending_list(msg.chat.id, persistent=True)
+    await update_pending_list(msg.chat.id, persistent=True)
     await state.finish()
 
 @dp.message_handler(state=NotificationStates.waiting_for_edit_time)
@@ -1162,10 +1178,7 @@ async def save_edit_time(msg, state):
     save_data()
     await sync_notification_to_calendar(nid, 'create')
     await send_with_auto_delete(msg.chat.id, f"✅ **Время изменено!**\n🕐 Новое время: {dt.strftime('%d.%m.%Y %H:%M')}", delay=3600)
-    if is_pending:
-        await update_pending_list(msg.chat.id, persistent=True)
-    else:
-        await update_pending_list(msg.chat.id, persistent=True)
+    await update_pending_list(msg.chat.id, persistent=True)
     await state.finish()
 
 @dp.message_handler(state=SnoozeStates.waiting_for_specific_date)
@@ -1200,7 +1213,7 @@ async def cancel_edit(cb, state):
 @dp.callback_query_handler(lambda c: c.data == "cancel_snooze", state='*')
 async def cancel_snooze(cb, state):
     await state.finish()
-    await cb.message.edit_text("✅ **Откладывание отменено**")
+    await update_pending_list(cb.from_user.id, persistent=True)
     await cb.answer()
 
 # ---------- ОБРАБОТЧИКИ КАЛЕНДАРЯ ----------
