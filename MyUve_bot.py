@@ -2,17 +2,16 @@ import asyncio
 import json
 import os
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import pytz
-import re
 import caldav
 import hashlib
 from uuid import uuid4
 
 try:
     from dateutil.rrule import rrulestr
-    from dateutil.parser import parse as parse_date
     DATEUTIL_AVAILABLE = True
 except ImportError:
     DATEUTIL_AVAILABLE = False
@@ -38,7 +37,7 @@ YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.5"
+BOT_VERSION = "2.6"
 BOT_VERSION_DATE = "20.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -129,48 +128,58 @@ def get_next_weekday(target_weekdays, hour, minute, from_date=None):
     return None
 
 def expand_recurring_event(start_dt, rrule_str, until_date=None, max_count=150):
-    """Разворачивает повторяющееся событие в список дат с правильной обработкой часовых поясов"""
+    """Разворачивает повторяющееся событие в список дат с правильной обработкой UTC"""
     if not DATEUTIL_AVAILABLE or not rrule_str:
-        logger.warning(f"Не удалось развернуть: DATEUTIL={DATEUTIL_AVAILABLE}, rrule={rrule_str}")
         return [start_dt]
     
     try:
-        rrule_str = rrule_str.strip()
         tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
         
-        # Приводим start_dt к UTC для корректной работы с UNTIL в UTC
+        # Приводим start_dt к UTC (без часового пояса для rrulestr)
         if start_dt.tzinfo is None:
             start_dt = tz.localize(start_dt)
         
+        # Конвертируем в UTC и убираем часовой пояс для совместимости с rrulestr
         start_dt_utc = start_dt.astimezone(pytz.UTC)
+        start_dt_naive = start_dt_utc.replace(tzinfo=None)
         
-        # Создаём строку DTSTART в UTC
-        dtstart_str = start_dt_utc.strftime('%Y%m%dT%H%M%S')
+        # Обрабатываем UNTIL в RRULE
+        rrule_clean = rrule_str.strip()
         
-        logger.info(f"Раскрытие RRULE: {rrule_str}")
-        logger.info(f"  DTSTART (UTC): {dtstart_str}")
+        # Если есть UNTIL, конвертируем его в UTC naive
+        until_match = re.search(r'UNTIL=(\d{8}T\d{6}Z)', rrule_clean)
+        if until_match:
+            until_val = until_match.group(1).replace('Z', '')
+            rrule_clean = re.sub(r'UNTIL=\d{8}T\d{6}Z', f'UNTIL={until_val}', rrule_clean)
         
-        # Парсим правило с DTSTART в UTC
-        rule = rrulestr(f"DTSTART:{dtstart_str}\nRRULE:{rrule_str}", dtstart=start_dt_utc)
+        logger.info(f"Раскрытие RRULE: {rrule_clean}")
+        logger.info(f"  DTSTART (UTC naive): {start_dt_naive.strftime('%Y%m%dT%H%M%S')}")
         
-        # Определяем конечную дату (в UTC)
+        # Создаём правило с naive datetime
+        rule = rrulestr(f"DTSTART:{start_dt_naive.strftime('%Y%m%dT%H%M%S')}\nRRULE:{rrule_clean}", dtstart=start_dt_naive)
+        
+        # Определяем конечную дату (в UTC naive)
         now_utc = get_current_time().astimezone(pytz.UTC)
+        now_naive = now_utc.replace(tzinfo=None)
+        
         if until_date:
             if until_date.tzinfo is None:
                 until_date = tz.localize(until_date)
-            end_date = until_date.astimezone(pytz.UTC)
+            until_utc = until_date.astimezone(pytz.UTC)
+            end_date = until_utc.replace(tzinfo=None)
         else:
-            end_date = now_utc + timedelta(days=120)
+            end_date = now_naive + timedelta(days=120)
         
-        occurrences_utc = list(rule.between(start_dt_utc, end_date, inc=True))
+        # Получаем вхождения
+        occurrences_naive = list(rule.between(start_dt_naive, end_date, inc=True))
         
-        # Ограничиваем количество
-        if len(occurrences_utc) > max_count:
-            occurrences_utc = occurrences_utc[:max_count]
+        if len(occurrences_naive) > max_count:
+            occurrences_naive = occurrences_naive[:max_count]
         
         # Конвертируем обратно в локальный часовой пояс
         occurrences = []
-        for occ_utc in occurrences_utc:
+        for occ_naive in occurrences_naive:
+            occ_utc = pytz.UTC.localize(occ_naive)
             occ_local = occ_utc.astimezone(tz)
             occurrences.append(occ_local)
         
@@ -335,7 +344,6 @@ DESCRIPTION:{description[:500]}"""
             else:
                 start_dt = start_dt.astimezone(tz)
             if ev.get('is_recurring') and ev.get('rrule') and DATEUTIL_AVAILABLE:
-                # Расширяем период до 120 дней вперёд от текущей даты
                 end_date = get_current_time() + timedelta(days=120)
                 occurrences = expand_recurring_event(start_dt, ev['rrule'], end_date, max_count=150)
                 for occ_dt in occurrences:
@@ -357,7 +365,7 @@ DESCRIPTION:{description[:500]}"""
                         'is_recurring': False,
                         'rrule': None
                     })
-        # Удаляем дубликаты (по id + дате)
+        # Удаляем дубликаты
         seen = set()
         unique_expanded = []
         for ev in expanded:
