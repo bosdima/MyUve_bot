@@ -38,7 +38,7 @@ YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.3"
+BOT_VERSION = "2.4"
 BOT_VERSION_DATE = "20.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -128,33 +128,35 @@ def get_next_weekday(target_weekdays, hour, minute, from_date=None):
             return tz.localize(datetime(nxt.year, nxt.month, nxt.day, hour, minute))
     return None
 
-def expand_recurring_event(start_dt, rrule_str, until_date=None, max_count=90):
+def expand_recurring_event(start_dt, rrule_str, until_date=None, max_count=150):
     """Разворачивает повторяющееся событие в список дат"""
     if not DATEUTIL_AVAILABLE or not rrule_str:
-        logger.warning(f"DATEUTIL_AVAILABLE={DATEUTIL_AVAILABLE}, rrule_str={rrule_str}")
+        logger.warning(f"Не удалось развернуть: DATEUTIL={DATEUTIL_AVAILABLE}, rrule={rrule_str}")
         return [start_dt]
     
     try:
         rrule_str = rrule_str.strip()
-        logger.info(f"Раскрытие RRULE: {rrule_str} для даты {start_dt}")
+        logger.info(f"Раскрытие RRULE: {rrule_str} для {start_dt}")
         
-        # Парсим правило
+        # Принудительно устанавливаем часовой пояс для start_dt
+        tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+        if start_dt.tzinfo is None:
+            start_dt = tz.localize(start_dt)
+        
+        # Создаём правило
         rule = rrulestr(f"DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}\nRRULE:{rrule_str}", dtstart=start_dt)
         
-        # Определяем конечную дату
-        if until_date:
-            end_date = until_date
-        else:
-            end_date = start_dt + timedelta(days=90)  # 90 дней вперёд
+        # Определяем конечную дату (120 дней вперёд от сегодня, а не от start_dt)
+        now = get_current_time()
+        end_date = until_date if until_date else (now + timedelta(days=120))
         
         occurrences = list(rule.between(start_dt, end_date, inc=True))
         
-        # Ограничиваем количество
         if len(occurrences) > max_count:
             occurrences = occurrences[:max_count]
         
-        logger.info(f"Раскрыто {len(occurrences)} вхождений")
-        for occ in occurrences[:5]:
+        logger.info(f"Раскрыто {len(occurrences)} вхождений для {rrule_str}")
+        for occ in occurrences[:10]:
             logger.info(f"  - {occ.strftime('%Y-%m-%d %H:%M')}")
         
         return occurrences if occurrences else [start_dt]
@@ -283,7 +285,7 @@ DESCRIPTION:{description[:500]}"""
                     rrule = None
                     if hasattr(vevent, 'rrule') and vevent.rrule.value:
                         rrule = str(vevent.rrule.value)
-                        logger.info(f"Найдено повторяющееся событие: {ev['summary'] if 'summary' in ev else 'unknown'} - RRULE: {rrule}")
+                        logger.info(f"Найдено повторяющееся событие: {vevent.summary.value if hasattr(vevent, 'summary') else '?'} - RRULE: {rrule}")
                     result.append({
                         'id': str(ev.url),
                         'summary': str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия',
@@ -314,8 +316,9 @@ DESCRIPTION:{description[:500]}"""
             else:
                 start_dt = start_dt.astimezone(tz)
             if ev.get('is_recurring') and ev.get('rrule') and DATEUTIL_AVAILABLE:
-                end_date = to_date + timedelta(days=60)
-                occurrences = expand_recurring_event(start_dt, ev['rrule'], end_date, max_count=90)
+                # Расширяем период до 120 дней вперёд от текущей даты
+                end_date = get_current_time() + timedelta(days=120)
+                occurrences = expand_recurring_event(start_dt, ev['rrule'], end_date, max_count=150)
                 for occ_dt in occurrences:
                     if occ_dt >= from_date - timedelta(days=1):
                         expanded.append({
@@ -407,7 +410,7 @@ async def get_formatted_calendar_events(year, month, force_refresh=False):
         return f"📅 **Нет событий на {MONTHS_NAMES[month]} {year}**"
     future.sort(key=lambda x: x[0])
     text = f"📅 **СОБЫТИЯ КАЛЕНДАРЯ**\n📆 {MONTHS_NAMES[month]} {year}\n\n"
-    for dt, ev in future[:60]:
+    for dt, ev in future[:100]:
         weekday = ["пн","вт","ср","чт","пт","сб","вс"][dt.weekday()]
         if dt.date() == now.date():
             prefix = "🔴 СЕГОДНЯ"
@@ -419,8 +422,8 @@ async def get_formatted_calendar_events(year, month, force_refresh=False):
             prefix = "📌"
         recurring_mark = " 🔁" if ev.get('is_recurring', False) else ""
         text += f"{prefix} {dt.day:02d}.{dt.month:02d}.{dt.year} ({weekday}) в {dt.strftime('%H:%M')} — **{ev['summary']}**{recurring_mark}\n"
-    if len(future) > 60:
-        text += f"\n... и еще {len(future)-60} событий"
+    if len(future) > 100:
+        text += f"\n... и еще {len(future)-100} событий"
     if last_sync_time:
         text += f"\n\n🔄 *Последняя синхронизация:* {last_sync_time.strftime('%d.%m.%Y %H:%M:%S')}"
     return text
