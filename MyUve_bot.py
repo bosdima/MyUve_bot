@@ -37,7 +37,7 @@ YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.6"
+BOT_VERSION = "2.7"
 BOT_VERSION_DATE = "20.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -135,30 +135,22 @@ def expand_recurring_event(start_dt, rrule_str, until_date=None, max_count=150):
     try:
         tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
         
-        # Приводим start_dt к UTC (без часового пояса для rrulestr)
         if start_dt.tzinfo is None:
             start_dt = tz.localize(start_dt)
         
-        # Конвертируем в UTC и убираем часовой пояс для совместимости с rrulestr
         start_dt_utc = start_dt.astimezone(pytz.UTC)
         start_dt_naive = start_dt_utc.replace(tzinfo=None)
         
-        # Обрабатываем UNTIL в RRULE
         rrule_clean = rrule_str.strip()
-        
-        # Если есть UNTIL, конвертируем его в UTC naive
         until_match = re.search(r'UNTIL=(\d{8}T\d{6}Z)', rrule_clean)
         if until_match:
             until_val = until_match.group(1).replace('Z', '')
             rrule_clean = re.sub(r'UNTIL=\d{8}T\d{6}Z', f'UNTIL={until_val}', rrule_clean)
         
         logger.info(f"Раскрытие RRULE: {rrule_clean}")
-        logger.info(f"  DTSTART (UTC naive): {start_dt_naive.strftime('%Y%m%dT%H%M%S')}")
         
-        # Создаём правило с naive datetime
         rule = rrulestr(f"DTSTART:{start_dt_naive.strftime('%Y%m%dT%H%M%S')}\nRRULE:{rrule_clean}", dtstart=start_dt_naive)
         
-        # Определяем конечную дату (в UTC naive)
         now_utc = get_current_time().astimezone(pytz.UTC)
         now_naive = now_utc.replace(tzinfo=None)
         
@@ -170,13 +162,11 @@ def expand_recurring_event(start_dt, rrule_str, until_date=None, max_count=150):
         else:
             end_date = now_naive + timedelta(days=120)
         
-        # Получаем вхождения
         occurrences_naive = list(rule.between(start_dt_naive, end_date, inc=True))
         
         if len(occurrences_naive) > max_count:
             occurrences_naive = occurrences_naive[:max_count]
         
-        # Конвертируем обратно в локальный часовой пояс
         occurrences = []
         for occ_naive in occurrences_naive:
             occ_utc = pytz.UTC.localize(occ_naive)
@@ -184,7 +174,7 @@ def expand_recurring_event(start_dt, rrule_str, until_date=None, max_count=150):
             occurrences.append(occ_local)
         
         logger.info(f"Раскрыто {len(occurrences)} вхождений")
-        for occ in occurrences[:10]:
+        for occ in occurrences[:5]:
             logger.info(f"  - {occ.strftime('%Y-%m-%d %H:%M')}")
         
         return occurrences if occurrences else [start_dt]
@@ -365,7 +355,6 @@ DESCRIPTION:{description[:500]}"""
                         'is_recurring': False,
                         'rrule': None
                     })
-        # Удаляем дубликаты
         seen = set()
         unique_expanded = []
         for ev in expanded:
@@ -436,8 +425,16 @@ async def get_formatted_calendar_events(year, month, force_refresh=False):
             occ_key = f"{ev['id']}_{dt.strftime('%Y%m%d')}"
             if occ_key in completed_occurrences:
                 continue
-            if dt.date() >= now.date() - timedelta(days=1):
-                future.append((dt, ev))
+            
+            # ВАЖНО: Для повторяющихся событий показываем только сегодня и завтра
+            if ev.get('is_recurring', False):
+                # Показываем только если дата равна сегодня или завтра
+                if dt.date() <= now.date() + timedelta(days=1):
+                    future.append((dt, ev))
+            else:
+                # Обычные события показываем все (от вчера и далее)
+                if dt.date() >= now.date() - timedelta(days=1):
+                    future.append((dt, ev))
         except Exception as e:
             logger.error(f"format event error: {e}")
             continue
@@ -850,7 +847,7 @@ async def cmd_start(msg, state):
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
         return await msg.reply("❌ Нет доступа")
     ok, _ = await check_caldav_connection()
-    welcome = f"👋 **Добро пожаловать!**\n🤖 Версия v{BOT_VERSION}\n📧 CalDAV: {'✅ Доступен' if ok else '❌ Ошибка'}\n🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}\n\n⚠️ **Неотмеченные уведомления** — это напоминания, время которых уже истекло. Они будут повторяться каждый час, пока вы не отметите их как выполненные.\n\n🔄 **Для повторяющихся событий:** при отметке \"Выполнено\" удаляется только сегодняшнее вхождение, следующее остаётся в календаре."
+    welcome = f"👋 **Добро пожаловать!**\n🤖 Версия v{BOT_VERSION}\n📧 CalDAV: {'✅ Доступен' if ok else '❌ Ошибка'}\n🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}\n\n⚠️ **Неотмеченные уведомления** — это напоминания, время которых уже истекло. Они будут повторяться каждый час, пока вы не отметите их как выполненные.\n\n🔄 **Для повторяющихся событий:** при отметке \"Выполнено\" удаляется только сегодняшнее вхождение, следующее остаётся в календаре.\n\n📅 **В календаре повторяющиеся события показываются только на сегодня и завтра.**"
     if not ok and get_caldav_available():
         welcome += "\n\n⚠️ Проблема с CalDAV. Проверьте пароль приложения."
     if not DATEUTIL_AVAILABLE:
