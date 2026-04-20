@@ -38,7 +38,7 @@ YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.4"
+BOT_VERSION = "2.5"
 BOT_VERSION_DATE = "20.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -129,33 +129,52 @@ def get_next_weekday(target_weekdays, hour, minute, from_date=None):
     return None
 
 def expand_recurring_event(start_dt, rrule_str, until_date=None, max_count=150):
-    """Разворачивает повторяющееся событие в список дат"""
+    """Разворачивает повторяющееся событие в список дат с правильной обработкой часовых поясов"""
     if not DATEUTIL_AVAILABLE or not rrule_str:
         logger.warning(f"Не удалось развернуть: DATEUTIL={DATEUTIL_AVAILABLE}, rrule={rrule_str}")
         return [start_dt]
     
     try:
         rrule_str = rrule_str.strip()
-        logger.info(f"Раскрытие RRULE: {rrule_str} для {start_dt}")
-        
-        # Принудительно устанавливаем часовой пояс для start_dt
         tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+        
+        # Приводим start_dt к UTC для корректной работы с UNTIL в UTC
         if start_dt.tzinfo is None:
             start_dt = tz.localize(start_dt)
         
-        # Создаём правило
-        rule = rrulestr(f"DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}\nRRULE:{rrule_str}", dtstart=start_dt)
+        start_dt_utc = start_dt.astimezone(pytz.UTC)
         
-        # Определяем конечную дату (120 дней вперёд от сегодня, а не от start_dt)
-        now = get_current_time()
-        end_date = until_date if until_date else (now + timedelta(days=120))
+        # Создаём строку DTSTART в UTC
+        dtstart_str = start_dt_utc.strftime('%Y%m%dT%H%M%S')
         
-        occurrences = list(rule.between(start_dt, end_date, inc=True))
+        logger.info(f"Раскрытие RRULE: {rrule_str}")
+        logger.info(f"  DTSTART (UTC): {dtstart_str}")
         
-        if len(occurrences) > max_count:
-            occurrences = occurrences[:max_count]
+        # Парсим правило с DTSTART в UTC
+        rule = rrulestr(f"DTSTART:{dtstart_str}\nRRULE:{rrule_str}", dtstart=start_dt_utc)
         
-        logger.info(f"Раскрыто {len(occurrences)} вхождений для {rrule_str}")
+        # Определяем конечную дату (в UTC)
+        now_utc = get_current_time().astimezone(pytz.UTC)
+        if until_date:
+            if until_date.tzinfo is None:
+                until_date = tz.localize(until_date)
+            end_date = until_date.astimezone(pytz.UTC)
+        else:
+            end_date = now_utc + timedelta(days=120)
+        
+        occurrences_utc = list(rule.between(start_dt_utc, end_date, inc=True))
+        
+        # Ограничиваем количество
+        if len(occurrences_utc) > max_count:
+            occurrences_utc = occurrences_utc[:max_count]
+        
+        # Конвертируем обратно в локальный часовой пояс
+        occurrences = []
+        for occ_utc in occurrences_utc:
+            occ_local = occ_utc.astimezone(tz)
+            occurrences.append(occ_local)
+        
+        logger.info(f"Раскрыто {len(occurrences)} вхождений")
         for occ in occurrences[:10]:
             logger.info(f"  - {occ.strftime('%Y-%m-%d %H:%M')}")
         
@@ -338,8 +357,16 @@ DESCRIPTION:{description[:500]}"""
                         'is_recurring': False,
                         'rrule': None
                     })
-        expanded.sort(key=lambda x: x['start'])
-        return expanded
+        # Удаляем дубликаты (по id + дате)
+        seen = set()
+        unique_expanded = []
+        for ev in expanded:
+            key = f"{ev['id']}_{ev['start']}"
+            if key not in seen:
+                seen.add(key)
+                unique_expanded.append(ev)
+        unique_expanded.sort(key=lambda x: x['start'])
+        return unique_expanded
 
     async def get_month_events(self, year, month):
         tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
@@ -376,7 +403,7 @@ async def update_calendar_events_cache(year, month, force=False):
         last_calendar_update[key] = now
         last_sync_time = now
         logger.info(f"Обновлён кэш календаря {year}.{month}: {len(events)} событий")
-        for ev in events[:20]:
+        for ev in events[:30]:
             recurring = " 🔁" if ev.get('is_recurring') else ""
             logger.info(f"  - {ev['start']}: {ev['summary']}{recurring}")
     except Exception as e:
