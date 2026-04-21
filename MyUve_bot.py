@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.5"
+BOT_VERSION = "4.6"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -72,7 +72,7 @@ config: Dict = {}
 notifications_enabled = True
 calendar_events_cache: Dict[str, List[Dict]] = {}
 last_sync_time: Optional[datetime] = None
-event_id_map: Dict[str, str] = {}
+event_id_map: Dict[str, str] = {}  # short_id -> real_url
 
 TIMEZONES = {
     'Москва (UTC+3)': 'Europe/Moscow',
@@ -364,11 +364,13 @@ END:VCALENDAR"""
                     
                     exdates = parse_exdates(ev.data)
                     
-                    short_id = hashlib.md5(str(ev.url).encode()).hexdigest()[:12]
-                    event_id_map[short_id] = str(ev.url)
+                    real_url = str(ev.url)
+                    short_id = hashlib.md5(real_url.encode()).hexdigest()[:12]
+                    # Сохраняем соответствие в глобальном словаре
+                    event_id_map[short_id] = real_url
                     
                     result.append({
-                        'id': str(ev.url),
+                        'id': real_url,
                         'short_id': short_id,
                         'summary': str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия',
                         'start': dt.isoformat(),
@@ -746,10 +748,7 @@ async def show_pending_list(chat_id, persistent=False):
     
     if not pending:
         msg = "✅ **Нет просроченных уведомлений!**\n\nВсе напоминания выполнены."
-        if persistent:
-            await send_persistent_message(chat_id, msg)
-        else:
-            await send_with_auto_delete(chat_id, msg, delay=3600)
+        await send_persistent_message(chat_id, msg)
         return
     
     # Отправляем каждое уведомление отдельным сообщением
@@ -867,16 +866,18 @@ async def handle_done(cb):
         # Удаляем сообщение с кнопками
         try:
             await cb.message.delete()
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Ошибка удаления сообщения: {e}")
+        
         await cb.answer("✅ Событие отмечено как выполненное и удалено из календаря!")
+        
         # Обновляем списки
         now = get_current_time()
         await update_calendar_cache(now.year, now.month, force=True)
         await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
-        await cb.answer("❌ Ошибка при удалении события!", show_alert=True)
+        await cb.answer("❌ Ошибка при удалении события! Попробуйте позже.", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
 async def handle_snooze(cb):
@@ -1109,7 +1110,7 @@ async def on_startup(dp):
         logger.info("Удалён старый файл notifications.json")
     
     calendar_events_cache.clear()
-    event_id_map.clear()
+    # НЕ ОЧИЩАЕМ event_id_map, так как он должен накапливаться
     
     logger.info(f"\n{'='*50}\n🤖 БОТ v{BOT_VERSION} ЗАПУЩЕН\n{'='*50}")
     if get_caldav_available():
