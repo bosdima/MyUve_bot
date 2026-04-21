@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.1"
+BOT_VERSION = "4.2"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -491,7 +491,6 @@ async def update_calendar_cache(year, month, force=False):
 async def get_pending_notifications():
     """Получает просроченные уведомления из календаря"""
     now = get_current_time()
-    today = now.date()
     await update_calendar_cache(now.year, now.month)
     events = calendar_events_cache.get(f"{now.year}_{now.month}", [])
     
@@ -653,13 +652,14 @@ async def delete_user_message(msg, delay=3600):
     asyncio.create_task(auto_delete_message(msg.chat.id, msg.message_id, delay))
 
 async def show_pending_actions(chat_id, event_id, text, event_time, is_recurring=False):
+    """Показывает кнопки действий для просроченного уведомления"""
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{event_id}"),
         InlineKeyboardButton("📅 Отложить", callback_data=f"snooze_{event_id}"),
         InlineKeyboardButton("❌ Отложить на час", callback_data=f"hour_{event_id}")
     )
-    recurring_text = " (повторяющееся)" if is_recurring else ""
+    recurring_text = " 🔁" if is_recurring else ""
     await bot.send_message(
         chat_id,
         f"🔔 **НЕОТМЕЧЕННОЕ НАПОМИНАНИЕ!**{recurring_text}\n\n📝 {text}\n⏰ {event_time.strftime('%d.%m.%Y %H:%M')}\n\n⚠️ Время истекло!",
@@ -668,8 +668,8 @@ async def show_pending_actions(chat_id, event_id, text, event_time, is_recurring
     )
 
 async def check_pending():
+    """Проверяет просроченные уведомления и отправляет их с кнопками"""
     global notifications_enabled
-    # Множество для отслеживания уже отправленных уведомлений в текущем цикле
     sent_notifications = set()
     
     while True:
@@ -744,15 +744,15 @@ END:VCALENDAR"""
         return False
 
 async def mark_done(event_id, is_recurring=False, event_time=None):
-    """Отмечает событие как выполненное"""
+    """Отмечает событие как выполненное и удаляет его из календаря"""
     try:
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
         if is_recurring and event_time:
-            # Для повторяющихся - добавляем исключение
+            # Для повторяющихся - добавляем исключение (удаляем только текущее вхождение)
             return await api.add_exception_to_recurring(event_id, event_time)
         else:
-            # Для обычных - удаляем
+            # Для обычных - полностью удаляем событие
             return await api.delete_event(event_id)
     except Exception as e:
         logger.error(f"mark_done error: {e}")
@@ -769,6 +769,7 @@ def get_main_keyboard():
     return kb
 
 async def show_pending_list(chat_id, persistent=False):
+    """Показывает список просроченных уведомлений с кнопками для каждого"""
     pending = await get_pending_notifications()
     
     if not pending:
@@ -779,13 +780,23 @@ async def show_pending_list(chat_id, persistent=False):
             await send_with_auto_delete(chat_id, msg, delay=3600)
         return
     
-    text = "⚠️ **ПРОСРОЧЕННЫЕ УВЕДОМЛЕНИЯ**\n\n"
+    # Показываем список с кнопками для каждого уведомления
     for idx, p in enumerate(pending, 1):
         recurring_mark = " 🔁" if p['is_recurring'] else ""
-        text += f"{idx}. **{p['text']}**{recurring_mark}\n   ⏰ {p['time'].strftime('%d.%m.%Y %H:%M')}\n\n"
-    text += f"📊 **Всего:** {len(pending)}"
-    
-    await send_persistent_message(chat_id, text)
+        
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{p['id']}"),
+            InlineKeyboardButton("📅 Отложить", callback_data=f"snooze_{p['id']}"),
+            InlineKeyboardButton("❌ Отложить на час", callback_data=f"hour_{p['id']}")
+        )
+        
+        text = f"⚠️ **{idx}. {p['text']}**{recurring_mark}\n⏰ {p['time'].strftime('%d.%m.%Y %H:%M')}\n\nВыберите действие:"
+        
+        if persistent:
+            await send_persistent_message(chat_id, text, reply_markup=kb)
+        else:
+            await send_with_auto_delete(chat_id, text, reply_markup=kb, delay=3600)
 
 # ---------- ОСНОВНЫЕ ОБРАБОТЧИКИ ----------
 @dp.message_handler(commands=['start'])
@@ -886,7 +897,7 @@ async def handle_done(cb):
     success = await mark_done(event_id, is_recurring, event_time)
     
     if success:
-        await cb.answer("✅ Событие отмечено как выполненное!")
+        await cb.answer("✅ Событие отмечено как выполненное и удалено из календаря!")
         # Обновляем кэш
         now = get_current_time()
         await update_calendar_cache(now.year, now.month, force=True)
@@ -898,16 +909,16 @@ async def handle_done(cb):
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
 async def handle_snooze(cb):
     event_id = cb.data.replace('snooze_', '')
-    await cb.message.edit_text("⏰ **На сколько отложить?**")
     
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("1 час", callback_data=f"snooze_1h_{event_id}"),
         InlineKeyboardButton("3 часа", callback_data=f"snooze_3h_{event_id}"),
         InlineKeyboardButton("1 день", callback_data=f"snooze_1d_{event_id}"),
-        InlineKeyboardButton("7 дней", callback_data=f"snooze_7d_{event_id}")
+        InlineKeyboardButton("7 дней", callback_data=f"snooze_7d_{event_id}"),
+        InlineKeyboardButton("◀️ Назад", callback_data="back_to_pending")
     )
-    await cb.message.edit_reply_markup(reply_markup=kb)
+    await cb.message.edit_text("⏰ **На сколько отложить?**", reply_markup=kb)
     await cb.answer()
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_1h_'), state='*')
@@ -929,6 +940,11 @@ async def snooze_1d(cb):
 async def snooze_7d(cb):
     event_id = cb.data.replace('snooze_7d_', '')
     await process_snooze(cb, event_id, 168)
+
+@dp.callback_query_handler(lambda c: c.data == "back_to_pending", state='*')
+async def back_to_pending(cb):
+    await show_pending_list(cb.from_user.id, persistent=True)
+    await cb.answer()
 
 async def process_snooze(cb, event_id, hours):
     success = await snooze_event(event_id, hours)
