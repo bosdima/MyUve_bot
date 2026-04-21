@@ -5,7 +5,7 @@ import logging
 import logging.handlers
 import re
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 import pytz
 import caldav
 import hashlib
@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.9"
+BOT_VERSION = "5.0"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -72,8 +72,8 @@ config: Dict = {}
 notifications_enabled = True
 calendar_events_cache: Dict[str, List[Dict]] = {}
 last_sync_time: Optional[datetime] = None
-# Словарь для хранения соответствия хеша и реального URL события
-event_hash_map: Dict[str, str] = {}
+# Словарь для хранения соответствия хеша и информации о событии
+event_info_map: Dict[str, Dict] = {}
 
 TIMEZONES = {
     'Москва (UTC+3)': 'Europe/Moscow',
@@ -192,7 +192,7 @@ def expand_recurring_event_with_exdates(start_dt, rrule_str, exdates: Set[str], 
             if not is_excluded:
                 occurrences.append(occ_local)
         
-        return occurrences if occurrences else [start_dt]
+        return occurrences
     except Exception as e:
         logger.error(f"expand_recurring_event_with_exdates error: {e}")
         return [start_dt]
@@ -291,9 +291,11 @@ END:VCALENDAR"""
                     break
             
             if not target_event:
+                logger.error(f"Событие не найдено: {event_url}")
                 return False
             
             ical_data = target_event.data
+            logger.info(f"Исходные iCalendar данные (первые 500 символов): {ical_data[:500]}")
             
             tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
             if exception_date.tzinfo is None:
@@ -301,7 +303,9 @@ END:VCALENDAR"""
             exception_utc = exception_date.astimezone(pytz.UTC)
             exdate_str = exception_utc.strftime('%Y%m%dT%H%M%SZ')
             
+            # Проверяем, есть ли уже EXDATE
             if 'EXDATE' in ical_data:
+                # Обновляем существующий EXDATE
                 lines = ical_data.split('\n')
                 new_lines = []
                 for line in lines:
@@ -314,6 +318,7 @@ END:VCALENDAR"""
                         new_lines.append(line)
                 ical_data = '\n'.join(new_lines)
             else:
+                # Добавляем новый EXDATE после RRULE или перед END:VEVENT
                 lines = ical_data.split('\n')
                 new_lines = []
                 added = False
@@ -327,13 +332,47 @@ END:VCALENDAR"""
                         added = True
                 ical_data = '\n'.join(new_lines)
             
+            logger.info(f"Обновленные iCalendar данные (первые 500 символов): {ical_data[:500]}")
+            
             target_event.data = ical_data
             target_event.save()
             logger.info(f"Добавлено исключение для {event_url} на {exdate_str}")
             return True
         except Exception as e:
             logger.error(f"add_exception_to_recurring error: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+
+    async def get_event_info(self, event_url):
+        """Получает информацию о событии: является ли оно повторяющимся, RRULE и т.д."""
+        try:
+            cal = self.get_default_calendar()
+            if not cal:
+                return None
+            
+            for event in cal.events():
+                if str(event.url) == event_url:
+                    vevent = event.vobject_instance.vevent
+                    rrule = None
+                    if hasattr(vevent, 'rrule') and vevent.rrule.value:
+                        rrule = str(vevent.rrule.value)
+                    
+                    # Извлекаем UID
+                    uid_match = re.search(r'UID:([^\r\n]+)', event.data)
+                    uid = uid_match.group(1).strip() if uid_match else None
+                    
+                    return {
+                        'url': str(event.url),
+                        'uid': uid,
+                        'rrule': rrule,
+                        'is_recurring': rrule is not None,
+                        'summary': str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия'
+                    }
+            return None
+        except Exception as e:
+            logger.error(f"get_event_info error: {e}")
+            return None
 
     async def get_all_events_raw(self, from_date, to_date):
         try:
@@ -371,7 +410,15 @@ END:VCALENDAR"""
                     
                     # Генерируем стабильный хеш на основе UID
                     event_hash = hashlib.md5(uid.encode()).hexdigest()[:16]
-                    event_hash_map[event_hash] = str(ev.url)
+                    
+                    # Сохраняем полную информацию о событии
+                    event_info_map[event_hash] = {
+                        'url': str(ev.url),
+                        'uid': uid,
+                        'rrule': rrule,
+                        'is_recurring': rrule is not None,
+                        'summary': str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия'
+                    }
                     
                     result.append({
                         'id': str(ev.url),
@@ -430,6 +477,7 @@ END:VCALENDAR"""
                         'is_recurring': False
                     })
         
+        # Убираем дубликаты
         seen = set()
         unique_expanded = []
         for ev in expanded:
@@ -673,10 +721,12 @@ async def check_pending():
 
 async def snooze_event(event_hash, hours=1):
     try:
-        real_id = event_hash_map.get(event_hash)
-        if not real_id:
-            logger.error(f"Event URL not found for hash: {event_hash}")
+        event_info = event_info_map.get(event_hash)
+        if not event_info:
+            logger.error(f"Event info not found for hash: {event_hash}")
             return False
+        
+        real_id = event_info['url']
         
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         cal = api.get_default_calendar()
@@ -721,21 +771,39 @@ END:VCALENDAR"""
         logger.error(f"snooze_event error: {e}")
         return False
 
-async def mark_done(event_hash, is_recurring=False, event_time=None):
+async def mark_done(event_hash, is_recurring_from_pending=False, event_time=None):
+    """
+    Отмечает событие как выполненное.
+    Для повторяющихся событий добавляет EXDATE (удаляет только конкретное вхождение).
+    Для обычных событий удаляет всё событие целиком.
+    """
     try:
-        real_id = event_hash_map.get(event_hash)
-        if not real_id:
-            logger.error(f"Event URL not found for hash: {event_hash}")
+        # Получаем информацию о событии из словаря
+        event_info = event_info_map.get(event_hash)
+        if not event_info:
+            logger.error(f"Event info not found for hash: {event_hash}")
             return False
+        
+        real_id = event_info['url']
+        is_recurring = event_info.get('is_recurring', False)
+        rrule = event_info.get('rrule')
+        
+        logger.info(f"Обработка события: hash={event_hash}, is_recurring={is_recurring}, rrule={rrule}")
         
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
         if is_recurring and event_time:
+            # Для повторяющихся - добавляем исключение (удаляем только текущее вхождение)
+            logger.info(f"Добавление исключения для повторяющегося события {real_id} на {event_time}")
             return await api.add_exception_to_recurring(real_id, event_time)
         else:
+            # Для обычных - полностью удаляем событие
+            logger.info(f"Полное удаление события {real_id}")
             return await api.delete_event(real_id)
     except Exception as e:
         logger.error(f"mark_done error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def get_main_keyboard():
@@ -856,17 +924,15 @@ async def handle_done(cb):
     event_hash = cb.data.replace('done_', '')
     logger.info(f"Обработка done для hash: {event_hash}")
     
-    # Находим информацию о событии
-    is_recurring = False
+    # Находим время события из pending
     event_time = None
     pending = await get_pending_notifications()
     for p in pending:
         if p['hash'] == event_hash:
-            is_recurring = p['is_recurring']
             event_time = p['time']
             break
     
-    success = await mark_done(event_hash, is_recurring, event_time)
+    success = await mark_done(event_hash, False, event_time)
     
     if success:
         # Удаляем сообщение с кнопками
@@ -1116,7 +1182,7 @@ async def on_startup(dp):
         logger.info("Удалён старый файл notifications.json")
     
     calendar_events_cache.clear()
-    event_hash_map.clear()
+    event_info_map.clear()
     
     logger.info(f"\n{'='*50}\n🤖 БОТ v{BOT_VERSION} ЗАПУЩЕН\n{'='*50}")
     if get_caldav_available():
