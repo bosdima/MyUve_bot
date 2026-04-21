@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.0"
+BOT_VERSION = "3.1"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -404,6 +404,7 @@ async def check_caldav_connection():
     return await api.test_connection()
 
 def cleanup_old_completed_occurrences():
+    """Удаляет записи о выполненных вхождениях старше 30 дней"""
     global completed_occurrences
     now = get_current_time()
     thirty_days_ago = now - timedelta(days=30)
@@ -426,6 +427,21 @@ def cleanup_old_completed_occurrences():
     if old_count != len(completed_occurrences):
         logger.info(f"Очистка completed_occurrences: удалено {old_count - len(completed_occurrences)} записей старше 30 дней")
         save_data()
+
+def clear_pending_for_completed():
+    """Удаляет из pending_notifications те уведомления, которые уже отмечены как выполненные"""
+    global pending_notifications
+    to_delete = []
+    for nid, n in pending_notifications.items():
+        occ_key = n.get('calendar_event_key')
+        if occ_key and occ_key in completed_occurrences:
+            to_delete.append(nid)
+            logger.info(f"Удаление из pending уже отмеченного события: {occ_key}")
+    for nid in to_delete:
+        del pending_notifications[nid]
+    if to_delete:
+        save_data()
+        logger.info(f"Удалено {len(to_delete)} уведомлений из pending (уже отмечены как выполненные)")
 
 async def update_calendar_events_cache(year, month, force=False):
     global calendar_events_cache, last_calendar_update, last_sync_time
@@ -601,6 +617,10 @@ def load_data():
         config = json.load(f)
         notifications_enabled = config.get('notifications_enabled', True)
         completed_occurrences = set(config.get('completed_occurrences', []))
+    
+    # Очищаем pending от уже отмеченных событий
+    clear_pending_for_completed()
+    
     logger.info(f"Загружено: {len(notifications)} уведомлений, {len(pending_notifications)} неотмеченных, обработанных вхождений: {len(completed_occurrences)}")
     cleanup_old_completed_occurrences()
 
@@ -633,10 +653,13 @@ async def sync_calendar_to_pending():
             
             occ_key = f"{ev['id']}_{dt.strftime('%Y%m%d')}"
             
+            # Пропускаем уже отмеченные вхождения
             if occ_key in completed_occurrences:
                 continue
             
+            # Добавляем только просроченные события (время уже прошло)
             if dt <= now:
+                # Проверяем, нет ли уже такого в pending
                 exists = False
                 for n in pending_notifications.values():
                     if n.get('calendar_event_key') == occ_key:
@@ -1230,7 +1253,6 @@ async def pend_select(cb, state):
     recurring_info = "\n🔄 **Это повторяющееся событие** — при отметке \"Выполнено\" удалится только сегодняшнее вхождение." if n.get('is_recurring', False) else ""
     text = f"📝 **Уведомление:**\n{n['text']}{recurring_mark}\n\n⏰ **Время:** {dt.strftime('%d.%m.%Y %H:%M')}\n🔄 **Повторов:** {n.get('repeat_count', 0)}{recurring_info}\n\nВыберите действие:"
     
-    # Используем edit_text для обновления сообщения
     try:
         await cb.message.edit_text(text, reply_markup=kb)
     except Exception as e:
@@ -1255,6 +1277,10 @@ async def pend_done(cb):
             save_data()
             logger.info(f"Добавлено обработанное вхождение: {occ_key}")
             cleanup_old_completed_occurrences()
+    else:
+        # Для обычных событий удаляем из календаря
+        if 'calendar_event_id' in notif:
+            await sync_notification_to_calendar(nid, 'delete')
     
     # Удаляем из pending
     del pending_notifications[nid]
