@@ -5,7 +5,7 @@ import logging
 import logging.handlers
 import re
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 import pytz
 import caldav
 import hashlib
@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.0"
+BOT_VERSION = "4.1"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -127,7 +127,22 @@ def parse_datetime(date_str: str):
                 return None
     return None
 
-def expand_recurring_event(start_dt, rrule_str, until_date=None, max_count=150):
+def parse_exdates(ical_data: str) -> Set[str]:
+    """Извлекает все EXDATE из iCalendar данных"""
+    exdates = set()
+    # Ищем все строки EXDATE
+    exdate_pattern = r'EXDATE[^:]*:([^\r\n]+)'
+    for match in re.finditer(exdate_pattern, ical_data):
+        exdate_value = match.group(1).strip()
+        # Разделяем по запятым (могут быть несколько дат)
+        for part in exdate_value.split(','):
+            part = part.strip()
+            if part:
+                exdates.add(part)
+    return exdates
+
+def expand_recurring_event_with_exdates(start_dt, rrule_str, exdates: Set[str], until_date=None, max_count=150):
+    """Разворачивает повторяющееся событие с учетом EXDATE"""
     if not DATEUTIL_AVAILABLE or not rrule_str:
         return [start_dt]
     
@@ -146,7 +161,7 @@ def expand_recurring_event(start_dt, rrule_str, until_date=None, max_count=150):
             until_val = until_match.group(1).replace('Z', '')
             rrule_clean = re.sub(r'UNTIL=\d{8}T\d{6}Z', f'UNTIL={until_val}', rrule_clean)
         
-        logger.info(f"Раскрытие RRULE: {rrule_clean}")
+        logger.info(f"Раскрытие RRULE: {rrule_clean}, EXDATE: {exdates}")
         
         rule = rrulestr(f"DTSTART:{start_dt_naive.strftime('%Y%m%dT%H%M%S')}\nRRULE:{rrule_clean}", dtstart=start_dt_naive)
         
@@ -170,12 +185,26 @@ def expand_recurring_event(start_dt, rrule_str, until_date=None, max_count=150):
         for occ_naive in occurrences_naive:
             occ_utc = pytz.UTC.localize(occ_naive)
             occ_local = occ_utc.astimezone(tz)
-            occurrences.append(occ_local)
+            
+            # Проверяем, не исключена ли эта дата
+            occ_utc_str = occ_utc.strftime('%Y%m%dT%H%M%SZ')
+            occ_date_only = occ_utc.strftime('%Y%m%d')
+            
+            # Проверяем совпадение с EXDATE (полное совпадение времени или только даты)
+            is_excluded = False
+            for exd in exdates:
+                if exd == occ_utc_str or exd.startswith(occ_date_only):
+                    is_excluded = True
+                    logger.info(f"Исключено вхождение: {occ_local.strftime('%Y-%m-%d %H:%M')} (EXDATE: {exd})")
+                    break
+            
+            if not is_excluded:
+                occurrences.append(occ_local)
         
-        logger.info(f"Раскрыто {len(occurrences)} вхождений")
+        logger.info(f"Раскрыто {len(occurrences)} вхождений (исключено {len(occurrences_naive) - len(occurrences)})")
         return occurrences if occurrences else [start_dt]
     except Exception as e:
-        logger.error(f"expand_recurring_event error: {e}")
+        logger.error(f"expand_recurring_event_with_exdates error: {e}")
         return [start_dt]
 
 class CalDAVCalendarAPI:
@@ -284,7 +313,7 @@ END:VCALENDAR"""
             exception_utc = exception_date.astimezone(pytz.UTC)
             exdate_str = exception_utc.strftime('%Y%m%dT%H%M%SZ')
             
-            # Проверяем и добавляем EXDATE
+            # Проверяем, есть ли уже EXDATE
             if 'EXDATE' in ical_data:
                 # Обновляем существующий EXDATE
                 lines = ical_data.split('\n')
@@ -348,12 +377,18 @@ END:VCALENDAR"""
                     rrule = None
                     if hasattr(vevent, 'rrule') and vevent.rrule.value:
                         rrule = str(vevent.rrule.value)
+                    
+                    # Извлекаем EXDATE
+                    exdates = parse_exdates(ev.data)
+                    
                     result.append({
                         'id': str(ev.url),
                         'summary': str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия',
                         'start': dt.isoformat(),
                         'rrule': rrule,
-                        'is_recurring': rrule is not None
+                        'is_recurring': rrule is not None,
+                        'exdates': exdates,
+                        'raw_data': ev.data
                     })
                 except Exception as e:
                     logger.error(f"parse event error: {e}")
@@ -371,15 +406,20 @@ END:VCALENDAR"""
         if to_date.tzinfo is None:
             to_date = tz.localize(to_date)
         expanded = []
+        
         for ev in raw_events:
             start_dt = datetime.fromisoformat(ev['start'])
             if start_dt.tzinfo is None:
                 start_dt = tz.localize(start_dt)
             else:
                 start_dt = start_dt.astimezone(tz)
+            
             if ev.get('is_recurring') and ev.get('rrule') and DATEUTIL_AVAILABLE:
+                # Используем расширение с учетом EXDATE
                 end_date = get_current_time() + timedelta(days=120)
-                occurrences = expand_recurring_event(start_dt, ev['rrule'], end_date, max_count=150)
+                occurrences = expand_recurring_event_with_exdates(
+                    start_dt, ev['rrule'], ev.get('exdates', set()), end_date, max_count=150
+                )
                 for occ_dt in occurrences:
                     if occ_dt >= from_date - timedelta(days=1):
                         expanded.append({
@@ -398,6 +438,7 @@ END:VCALENDAR"""
                         'is_recurring': False,
                         'rrule': None
                     })
+        
         # Убираем дубликаты
         seen = set()
         unique_expanded = []
@@ -442,6 +483,8 @@ async def update_calendar_cache(year, month, force=False):
         calendar_events_cache[key] = events
         last_sync_time = now
         logger.info(f"Обновлён кэш календаря {year}.{month}: {len(events)} событий")
+        for ev in events[:20]:
+            logger.info(f"  - {ev['start']}: {ev['summary']}")
     except Exception as e:
         logger.error(f"update_cache error: {e}")
 
@@ -495,6 +538,7 @@ async def get_upcoming_events(year, month):
             else:
                 dt = dt.astimezone(tz)
             
+            # Показываем только события от сегодня и вперед
             if dt.date() < today:
                 continue
             
@@ -625,21 +669,34 @@ async def show_pending_actions(chat_id, event_id, text, event_time, is_recurring
 
 async def check_pending():
     global notifications_enabled
+    # Множество для отслеживания уже отправленных уведомлений в текущем цикле
+    sent_notifications = set()
+    
     while True:
         if notifications_enabled:
             pending = await get_pending_notifications()
             for p in pending:
-                if p['time'] <= get_current_time():
-                    await show_pending_actions(ADMIN_ID, p['id'], p['text'], p['time'], p['is_recurring'])
-                    # Ждем 5 минут перед следующим уведомлением о том же событии
-                    await asyncio.sleep(300)
+                # Создаем уникальный ключ для события
+                event_key = f"{p['id']}_{p['time'].strftime('%Y%m%d%H%M')}"
+                
+                # Отправляем уведомление только если не отправляли в последние 5 минут
+                if event_key not in sent_notifications:
+                    if p['time'] <= get_current_time():
+                        await show_pending_actions(ADMIN_ID, p['id'], p['text'], p['time'], p['is_recurring'])
+                        sent_notifications.add(event_key)
+                        
+                        # Планируем удаление из множества через 5 минут
+                        async def remove_from_sent(key):
+                            await asyncio.sleep(300)
+                            sent_notifications.discard(key)
+                        asyncio.create_task(remove_from_sent(event_key))
+        
         await asyncio.sleep(60)
 
 async def snooze_event(event_id, hours=1):
     """Откладывает событие на указанное количество часов"""
     try:
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
-        # Получаем событие
         cal = api.get_default_calendar()
         if not cal:
             return False
@@ -757,8 +814,10 @@ async def cmd_start(msg, state):
     await send_persistent_message(msg.chat.id, welcome)
     await send_persistent_message(msg.chat.id, "👋 **Выберите действие:**", reply_markup=get_main_keyboard())
     
+    # Принудительно очищаем кэш и обновляем
     now = get_current_time()
-    await show_calendar_events(msg.chat.id, now.year, now.month, persistent=True)
+    await update_calendar_cache(now.year, now.month, force=True)
+    await show_calendar_events(msg.chat.id, now.year, now.month, force_refresh=True, persistent=True)
     await show_pending_list(msg.chat.id, persistent=True)
 
 @dp.message_handler(commands=['menu'])
@@ -766,7 +825,8 @@ async def show_menu(msg):
     await delete_user_message(msg)
     await send_persistent_message(msg.chat.id, "👋 **Главное меню:**", reply_markup=get_main_keyboard())
     now = get_current_time()
-    await show_calendar_events(msg.chat.id, now.year, now.month, persistent=True)
+    await update_calendar_cache(now.year, now.month, force=True)
+    await show_calendar_events(msg.chat.id, now.year, now.month, force_refresh=True, persistent=True)
     await show_pending_list(msg.chat.id, persistent=True)
 
 @dp.message_handler(lambda m: m.text == "➕ Добавить", state='*')
@@ -801,12 +861,12 @@ async def set_specific_date(msg, state):
         # Обновляем кэш
         now = get_current_time()
         await update_calendar_cache(now.year, now.month, force=True)
+        await show_calendar_events(msg.chat.id, now.year, now.month, force_refresh=True, persistent=True)
+        await show_pending_list(msg.chat.id, persistent=True)
     else:
         await send_with_auto_delete(msg.chat.id, "❌ **Ошибка при создании уведомления!**", delay=3600)
     
     await state.finish()
-    await show_calendar_events(msg.chat.id, persistent=True)
-    await show_pending_list(msg.chat.id, persistent=True)
 
 # ---------- ОБРАБОТЧИКИ ДЛЯ ПРОСРОЧЕННЫХ ----------
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('done_'), state='*')
@@ -835,7 +895,7 @@ async def handle_done(cb):
     else:
         await cb.answer("❌ Ошибка при удалении события!")
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_'), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
 async def handle_snooze(cb):
     event_id = cb.data.replace('snooze_', '')
     await cb.message.edit_text("⏰ **На сколько отложить?**")
@@ -898,18 +958,18 @@ async def view_calendar(msg, state):
     await delete_user_message(msg)
     await state.finish()
     now = get_current_time()
-    await show_calendar_events(msg.chat.id, now.year, now.month, persistent=True)
+    await show_calendar_events(msg.chat.id, now.year, now.month, force_refresh=True, persistent=True)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("cal_prev_"), state='*')
 async def cal_prev(cb):
     parts = cb.data.replace("cal_prev_", "").split("_")
-    await show_calendar_events(cb.from_user.id, int(parts[0]), int(parts[1]), persistent=True)
+    await show_calendar_events(cb.from_user.id, int(parts[0]), int(parts[1]), force_refresh=True, persistent=True)
     await cb.answer()
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("cal_next_"), state='*')
 async def cal_next(cb):
     parts = cb.data.replace("cal_next_", "").split("_")
-    await show_calendar_events(cb.from_user.id, int(parts[0]), int(parts[1]), persistent=True)
+    await show_calendar_events(cb.from_user.id, int(parts[0]), int(parts[1]), force_refresh=True, persistent=True)
     await cb.answer()
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("cal_refresh_"), state='*')
@@ -930,7 +990,7 @@ async def cal_sync(cb):
 @dp.callback_query_handler(lambda c: c.data == "curr_month", state='*')
 async def curr_month(cb):
     now = get_current_time()
-    await show_calendar_events(cb.from_user.id, now.year, now.month, persistent=True)
+    await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
     await cb.answer()
 
 # ---------- НАСТРОЙКИ ----------
@@ -968,6 +1028,7 @@ async def check_cal(cb):
         await cb.message.edit_text(f"✅ **{msg}**")
         now = get_current_time()
         await update_calendar_cache(now.year, now.month, force=True)
+        await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
     else:
         await cb.message.edit_text(f"❌ **{msg}**\n\n🔧 Получите новый пароль приложения: https://id.yandex.ru/security/app-passwords")
     await cb.answer()
@@ -1055,6 +1116,9 @@ async def on_startup(dp):
     if os.path.exists(old_data_file):
         os.remove(old_data_file)
         logger.info("Удалён старый файл notifications.json")
+    
+    # Очищаем кэш
+    calendar_events_cache.clear()
     
     logger.info(f"\n{'='*50}\n🤖 БОТ v{BOT_VERSION} ЗАПУЩЕН\n{'='*50}")
     if get_caldav_available():
