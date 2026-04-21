@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.2"
+BOT_VERSION = "4.3"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -72,6 +72,8 @@ config: Dict = {}
 notifications_enabled = True
 calendar_events_cache: Dict[str, List[Dict]] = {}
 last_sync_time: Optional[datetime] = None
+# Словарь для хранения соответствия коротких ID и реальных URL событий
+event_id_map: Dict[str, str] = {}
 
 TIMEZONES = {
     'Москва (UTC+3)': 'Europe/Moscow',
@@ -82,8 +84,6 @@ TIMEZONES = {
     'Камчатка (UTC+12)': 'Asia/Kamchatka'
 }
 
-WEEKDAYS_BUTTONS = [("Пн",0),("Вт",1),("Ср",2),("Чт",3),("Пт",4),("Сб",5),("Вс",6)]
-WEEKDAYS_NAMES = {0:"Понедельник",1:"Вторник",2:"Среда",3:"Четверг",4:"Пятница",5:"Суббота",6:"Воскресенье"}
 MONTHS_NAMES = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
 
 def get_current_time():
@@ -130,11 +130,9 @@ def parse_datetime(date_str: str):
 def parse_exdates(ical_data: str) -> Set[str]:
     """Извлекает все EXDATE из iCalendar данных"""
     exdates = set()
-    # Ищем все строки EXDATE
     exdate_pattern = r'EXDATE[^:]*:([^\r\n]+)'
     for match in re.finditer(exdate_pattern, ical_data):
         exdate_value = match.group(1).strip()
-        # Разделяем по запятым (могут быть несколько дат)
         for part in exdate_value.split(','):
             part = part.strip()
             if part:
@@ -142,7 +140,6 @@ def parse_exdates(ical_data: str) -> Set[str]:
     return exdates
 
 def expand_recurring_event_with_exdates(start_dt, rrule_str, exdates: Set[str], until_date=None, max_count=150):
-    """Разворачивает повторяющееся событие с учетом EXDATE"""
     if not DATEUTIL_AVAILABLE or not rrule_str:
         return [start_dt]
     
@@ -160,8 +157,6 @@ def expand_recurring_event_with_exdates(start_dt, rrule_str, exdates: Set[str], 
         if until_match:
             until_val = until_match.group(1).replace('Z', '')
             rrule_clean = re.sub(r'UNTIL=\d{8}T\d{6}Z', f'UNTIL={until_val}', rrule_clean)
-        
-        logger.info(f"Раскрытие RRULE: {rrule_clean}, EXDATE: {exdates}")
         
         rule = rrulestr(f"DTSTART:{start_dt_naive.strftime('%Y%m%dT%H%M%S')}\nRRULE:{rrule_clean}", dtstart=start_dt_naive)
         
@@ -186,22 +181,18 @@ def expand_recurring_event_with_exdates(start_dt, rrule_str, exdates: Set[str], 
             occ_utc = pytz.UTC.localize(occ_naive)
             occ_local = occ_utc.astimezone(tz)
             
-            # Проверяем, не исключена ли эта дата
             occ_utc_str = occ_utc.strftime('%Y%m%dT%H%M%SZ')
             occ_date_only = occ_utc.strftime('%Y%m%d')
             
-            # Проверяем совпадение с EXDATE (полное совпадение времени или только даты)
             is_excluded = False
             for exd in exdates:
                 if exd == occ_utc_str or exd.startswith(occ_date_only):
                     is_excluded = True
-                    logger.info(f"Исключено вхождение: {occ_local.strftime('%Y-%m-%d %H:%M')} (EXDATE: {exd})")
                     break
             
             if not is_excluded:
                 occurrences.append(occ_local)
         
-        logger.info(f"Раскрыто {len(occurrences)} вхождений (исключено {len(occurrences_naive) - len(occurrences)})")
         return occurrences if occurrences else [start_dt]
     except Exception as e:
         logger.error(f"expand_recurring_event_with_exdates error: {e}")
@@ -289,7 +280,6 @@ END:VCALENDAR"""
             return False
 
     async def add_exception_to_recurring(self, event_url, exception_date):
-        """Добавляет EXDATE к повторяющемуся событию"""
         try:
             cal = self.get_default_calendar()
             if not cal:
@@ -306,16 +296,13 @@ END:VCALENDAR"""
             
             ical_data = target_event.data
             
-            # Преобразуем дату в UTC для EXDATE
             tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
             if exception_date.tzinfo is None:
                 exception_date = tz.localize(exception_date)
             exception_utc = exception_date.astimezone(pytz.UTC)
             exdate_str = exception_utc.strftime('%Y%m%dT%H%M%SZ')
             
-            # Проверяем, есть ли уже EXDATE
             if 'EXDATE' in ical_data:
-                # Обновляем существующий EXDATE
                 lines = ical_data.split('\n')
                 new_lines = []
                 for line in lines:
@@ -328,7 +315,6 @@ END:VCALENDAR"""
                         new_lines.append(line)
                 ical_data = '\n'.join(new_lines)
             else:
-                # Добавляем новый EXDATE после RRULE или перед END:VEVENT
                 lines = ical_data.split('\n')
                 new_lines = []
                 added = False
@@ -378,17 +364,20 @@ END:VCALENDAR"""
                     if hasattr(vevent, 'rrule') and vevent.rrule.value:
                         rrule = str(vevent.rrule.value)
                     
-                    # Извлекаем EXDATE
                     exdates = parse_exdates(ev.data)
+                    
+                    # Генерируем короткий ID для callback_data
+                    short_id = hashlib.md5(str(ev.url).encode()).hexdigest()[:12]
+                    event_id_map[short_id] = str(ev.url)
                     
                     result.append({
                         'id': str(ev.url),
+                        'short_id': short_id,
                         'summary': str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия',
                         'start': dt.isoformat(),
                         'rrule': rrule,
                         'is_recurring': rrule is not None,
-                        'exdates': exdates,
-                        'raw_data': ev.data
+                        'exdates': exdates
                     })
                 except Exception as e:
                     logger.error(f"parse event error: {e}")
@@ -415,7 +404,6 @@ END:VCALENDAR"""
                 start_dt = start_dt.astimezone(tz)
             
             if ev.get('is_recurring') and ev.get('rrule') and DATEUTIL_AVAILABLE:
-                # Используем расширение с учетом EXDATE
                 end_date = get_current_time() + timedelta(days=120)
                 occurrences = expand_recurring_event_with_exdates(
                     start_dt, ev['rrule'], ev.get('exdates', set()), end_date, max_count=150
@@ -424,22 +412,21 @@ END:VCALENDAR"""
                     if occ_dt >= from_date - timedelta(days=1):
                         expanded.append({
                             'id': ev['id'],
+                            'short_id': ev['short_id'],
                             'summary': ev['summary'],
                             'start': occ_dt.isoformat(),
-                            'is_recurring': True,
-                            'rrule': ev['rrule']
+                            'is_recurring': True
                         })
             else:
                 if start_dt >= from_date - timedelta(days=1):
                     expanded.append({
                         'id': ev['id'],
+                        'short_id': ev['short_id'],
                         'summary': ev['summary'],
                         'start': ev['start'],
-                        'is_recurring': False,
-                        'rrule': None
+                        'is_recurring': False
                     })
         
-        # Убираем дубликаты
         seen = set()
         unique_expanded = []
         for ev in expanded:
@@ -483,13 +470,10 @@ async def update_calendar_cache(year, month, force=False):
         calendar_events_cache[key] = events
         last_sync_time = now
         logger.info(f"Обновлён кэш календаря {year}.{month}: {len(events)} событий")
-        for ev in events[:20]:
-            logger.info(f"  - {ev['start']}: {ev['summary']}")
     except Exception as e:
         logger.error(f"update_cache error: {e}")
 
 async def get_pending_notifications():
-    """Получает просроченные уведомления из календаря"""
     now = get_current_time()
     await update_calendar_cache(now.year, now.month)
     events = calendar_events_cache.get(f"{now.year}_{now.month}", [])
@@ -504,14 +488,12 @@ async def get_pending_notifications():
             else:
                 dt = dt.astimezone(tz)
             
-            # Показываем только просроченные (время уже прошло)
             if dt <= now:
                 pending.append({
-                    'id': ev['id'],
+                    'short_id': ev['short_id'],
                     'text': ev['summary'],
                     'time': dt,
-                    'is_recurring': ev.get('is_recurring', False),
-                    'rrule': ev.get('rrule')
+                    'is_recurring': ev.get('is_recurring', False)
                 })
         except Exception as e:
             logger.error(f"get_pending error: {e}")
@@ -521,7 +503,6 @@ async def get_pending_notifications():
     return pending
 
 async def get_upcoming_events(year, month):
-    """Получает предстоящие события для отображения в календаре"""
     await update_calendar_cache(year, month)
     events = calendar_events_cache.get(f"{year}_{month}", [])
     now = get_current_time()
@@ -537,11 +518,9 @@ async def get_upcoming_events(year, month):
             else:
                 dt = dt.astimezone(tz)
             
-            # Показываем только события от сегодня и вперед
             if dt.date() < today:
                 continue
             
-            # Для повторяющихся показываем только сегодня и завтра
             if ev.get('is_recurring', False):
                 if dt.date() <= today + timedelta(days=1):
                     future.append((dt, ev))
@@ -651,13 +630,13 @@ async def send_persistent_message(chat_id, text, parse_mode='Markdown', reply_ma
 async def delete_user_message(msg, delay=3600):
     asyncio.create_task(auto_delete_message(msg.chat.id, msg.message_id, delay))
 
-async def show_pending_actions(chat_id, event_id, text, event_time, is_recurring=False):
+async def show_pending_actions(chat_id, short_id, text, event_time, is_recurring=False):
     """Показывает кнопки действий для просроченного уведомления"""
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{event_id}"),
-        InlineKeyboardButton("📅 Отложить", callback_data=f"snooze_{event_id}"),
-        InlineKeyboardButton("❌ Отложить на час", callback_data=f"hour_{event_id}")
+        InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{short_id}"),
+        InlineKeyboardButton("📅 Отложить", callback_data=f"snooze_{short_id}"),
+        InlineKeyboardButton("❌ Отложить на час", callback_data=f"hour_{short_id}")
     )
     recurring_text = " 🔁" if is_recurring else ""
     await bot.send_message(
@@ -668,7 +647,6 @@ async def show_pending_actions(chat_id, event_id, text, event_time, is_recurring
     )
 
 async def check_pending():
-    """Проверяет просроченные уведомления и отправляет их с кнопками"""
     global notifications_enabled
     sent_notifications = set()
     
@@ -676,16 +654,13 @@ async def check_pending():
         if notifications_enabled:
             pending = await get_pending_notifications()
             for p in pending:
-                # Создаем уникальный ключ для события
-                event_key = f"{p['id']}_{p['time'].strftime('%Y%m%d%H%M')}"
+                event_key = f"{p['short_id']}_{p['time'].strftime('%Y%m%d%H%M')}"
                 
-                # Отправляем уведомление только если не отправляли в последние 5 минут
                 if event_key not in sent_notifications:
                     if p['time'] <= get_current_time():
-                        await show_pending_actions(ADMIN_ID, p['id'], p['text'], p['time'], p['is_recurring'])
+                        await show_pending_actions(ADMIN_ID, p['short_id'], p['text'], p['time'], p['is_recurring'])
                         sent_notifications.add(event_key)
                         
-                        # Планируем удаление из множества через 5 минут
                         async def remove_from_sent(key):
                             await asyncio.sleep(300)
                             sent_notifications.discard(key)
@@ -693,17 +668,19 @@ async def check_pending():
         
         await asyncio.sleep(60)
 
-async def snooze_event(event_id, hours=1):
-    """Откладывает событие на указанное количество часов"""
+async def snooze_event(short_id, hours=1):
     try:
+        real_id = event_id_map.get(short_id)
+        if not real_id:
+            return False
+        
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         cal = api.get_default_calendar()
         if not cal:
             return False
         
         for event in cal.events():
-            if str(event.url) == event_id:
-                # Парсим текущее время
+            if str(event.url) == real_id:
                 vevent = event.vobject_instance.vevent
                 old_start = vevent.dtstart.value
                 if hasattr(old_start, 'dt'):
@@ -713,11 +690,9 @@ async def snooze_event(event_id, hours=1):
                 if old_start.tzinfo is None:
                     old_start = tz.localize(old_start)
                 
-                # Вычисляем новое время
                 new_start = old_start + timedelta(hours=hours)
                 new_end = new_start + timedelta(hours=1)
                 
-                # Создаем новое событие
                 tzid = config.get('timezone', 'Europe/Moscow')
                 uid = f"{uuid4()}@myuved.bot"
                 summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия'
@@ -733,27 +708,27 @@ SUMMARY:{summary[:255]}
 END:VEVENT
 END:VCALENDAR"""
                 
-                # Удаляем старое и создаем новое
                 event.delete()
                 cal.save_event(ical)
-                logger.info(f"Событие {event_id} отложено на {hours} час(ов)")
+                logger.info(f"Событие {short_id} отложено на {hours} час(ов)")
                 return True
         return False
     except Exception as e:
         logger.error(f"snooze_event error: {e}")
         return False
 
-async def mark_done(event_id, is_recurring=False, event_time=None):
-    """Отмечает событие как выполненное и удаляет его из календаря"""
+async def mark_done(short_id, is_recurring=False, event_time=None):
     try:
+        real_id = event_id_map.get(short_id)
+        if not real_id:
+            return False
+        
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
         if is_recurring and event_time:
-            # Для повторяющихся - добавляем исключение (удаляем только текущее вхождение)
-            return await api.add_exception_to_recurring(event_id, event_time)
+            return await api.add_exception_to_recurring(real_id, event_time)
         else:
-            # Для обычных - полностью удаляем событие
-            return await api.delete_event(event_id)
+            return await api.delete_event(real_id)
     except Exception as e:
         logger.error(f"mark_done error: {e}")
         return False
@@ -786,9 +761,9 @@ async def show_pending_list(chat_id, persistent=False):
         
         kb = InlineKeyboardMarkup(row_width=2)
         kb.add(
-            InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{p['id']}"),
-            InlineKeyboardButton("📅 Отложить", callback_data=f"snooze_{p['id']}"),
-            InlineKeyboardButton("❌ Отложить на час", callback_data=f"hour_{p['id']}")
+            InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{p['short_id']}"),
+            InlineKeyboardButton("📅 Отложить", callback_data=f"snooze_{p['short_id']}"),
+            InlineKeyboardButton("❌ Отложить на час", callback_data=f"hour_{p['short_id']}")
         )
         
         text = f"⚠️ **{idx}. {p['text']}**{recurring_mark}\n⏰ {p['time'].strftime('%d.%m.%Y %H:%M')}\n\nВыберите действие:"
@@ -825,7 +800,6 @@ async def cmd_start(msg, state):
     await send_persistent_message(msg.chat.id, welcome)
     await send_persistent_message(msg.chat.id, "👋 **Выберите действие:**", reply_markup=get_main_keyboard())
     
-    # Принудительно очищаем кэш и обновляем
     now = get_current_time()
     await update_calendar_cache(now.year, now.month, force=True)
     await show_calendar_events(msg.chat.id, now.year, now.month, force_refresh=True, persistent=True)
@@ -869,7 +843,6 @@ async def set_specific_date(msg, state):
     
     if ev_id:
         await send_with_auto_delete(msg.chat.id, f"✅ **Уведомление создано!**\n📝 {data['text']}\n⏰ {dt.strftime('%d.%m.%Y %H:%M')}", delay=3600)
-        # Обновляем кэш
         now = get_current_time()
         await update_calendar_cache(now.year, now.month, force=True)
         await show_calendar_events(msg.chat.id, now.year, now.month, force_refresh=True, persistent=True)
@@ -882,23 +855,21 @@ async def set_specific_date(msg, state):
 # ---------- ОБРАБОТЧИКИ ДЛЯ ПРОСРОЧЕННЫХ ----------
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('done_'), state='*')
 async def handle_done(cb):
-    event_id = cb.data.replace('done_', '')
+    short_id = cb.data.replace('done_', '')
     
-    # Определяем, повторяющееся ли событие и получаем время
     is_recurring = False
     event_time = None
     pending = await get_pending_notifications()
     for p in pending:
-        if p['id'] == event_id:
+        if p['short_id'] == short_id:
             is_recurring = p['is_recurring']
             event_time = p['time']
             break
     
-    success = await mark_done(event_id, is_recurring, event_time)
+    success = await mark_done(short_id, is_recurring, event_time)
     
     if success:
         await cb.answer("✅ Событие отмечено как выполненное и удалено из календаря!")
-        # Обновляем кэш
         now = get_current_time()
         await update_calendar_cache(now.year, now.month, force=True)
         await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
@@ -908,14 +879,14 @@ async def handle_done(cb):
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
 async def handle_snooze(cb):
-    event_id = cb.data.replace('snooze_', '')
+    short_id = cb.data.replace('snooze_', '')
     
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("1 час", callback_data=f"snooze_1h_{event_id}"),
-        InlineKeyboardButton("3 часа", callback_data=f"snooze_3h_{event_id}"),
-        InlineKeyboardButton("1 день", callback_data=f"snooze_1d_{event_id}"),
-        InlineKeyboardButton("7 дней", callback_data=f"snooze_7d_{event_id}"),
+        InlineKeyboardButton("1 час", callback_data=f"snooze_1h_{short_id}"),
+        InlineKeyboardButton("3 часа", callback_data=f"snooze_3h_{short_id}"),
+        InlineKeyboardButton("1 день", callback_data=f"snooze_1d_{short_id}"),
+        InlineKeyboardButton("7 дней", callback_data=f"snooze_7d_{short_id}"),
         InlineKeyboardButton("◀️ Назад", callback_data="back_to_pending")
     )
     await cb.message.edit_text("⏰ **На сколько отложить?**", reply_markup=kb)
@@ -923,31 +894,31 @@ async def handle_snooze(cb):
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_1h_'), state='*')
 async def snooze_1h(cb):
-    event_id = cb.data.replace('snooze_1h_', '')
-    await process_snooze(cb, event_id, 1)
+    short_id = cb.data.replace('snooze_1h_', '')
+    await process_snooze(cb, short_id, 1)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_3h_'), state='*')
 async def snooze_3h(cb):
-    event_id = cb.data.replace('snooze_3h_', '')
-    await process_snooze(cb, event_id, 3)
+    short_id = cb.data.replace('snooze_3h_', '')
+    await process_snooze(cb, short_id, 3)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_1d_'), state='*')
 async def snooze_1d(cb):
-    event_id = cb.data.replace('snooze_1d_', '')
-    await process_snooze(cb, event_id, 24)
+    short_id = cb.data.replace('snooze_1d_', '')
+    await process_snooze(cb, short_id, 24)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_7d_'), state='*')
 async def snooze_7d(cb):
-    event_id = cb.data.replace('snooze_7d_', '')
-    await process_snooze(cb, event_id, 168)
+    short_id = cb.data.replace('snooze_7d_', '')
+    await process_snooze(cb, short_id, 168)
 
 @dp.callback_query_handler(lambda c: c.data == "back_to_pending", state='*')
 async def back_to_pending(cb):
     await show_pending_list(cb.from_user.id, persistent=True)
     await cb.answer()
 
-async def process_snooze(cb, event_id, hours):
-    success = await snooze_event(event_id, hours)
+async def process_snooze(cb, short_id, hours):
+    success = await snooze_event(short_id, hours)
     if success:
         await cb.answer(f"✅ Событие отложено на {hours} час(ов)!")
         now = get_current_time()
@@ -959,8 +930,8 @@ async def process_snooze(cb, event_id, hours):
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('hour_'), state='*')
 async def handle_hour(cb):
-    event_id = cb.data.replace('hour_', '')
-    await process_snooze(cb, event_id, 1)
+    short_id = cb.data.replace('hour_', '')
+    await process_snooze(cb, short_id, 1)
 
 @dp.message_handler(lambda m: m.text == "⚠️ Просроченные", state='*')
 async def view_pending(msg, state):
@@ -1127,14 +1098,13 @@ async def on_startup(dp):
     init_config()
     load_config()
     
-    # Очищаем старые файлы с уведомлениями, если они есть
     old_data_file = 'notifications.json'
     if os.path.exists(old_data_file):
         os.remove(old_data_file)
         logger.info("Удалён старый файл notifications.json")
     
-    # Очищаем кэш
     calendar_events_cache.clear()
+    event_id_map.clear()
     
     logger.info(f"\n{'='*50}\n🤖 БОТ v{BOT_VERSION} ЗАПУЩЕН\n{'='*50}")
     if get_caldav_available():
