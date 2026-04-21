@@ -5,7 +5,7 @@ import logging
 import logging.handlers
 import re
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Set
 import pytz
 import caldav
 import hashlib
@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.3"
+BOT_VERSION = "4.4"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -128,7 +128,6 @@ def parse_datetime(date_str: str):
     return None
 
 def parse_exdates(ical_data: str) -> Set[str]:
-    """Извлекает все EXDATE из iCalendar данных"""
     exdates = set()
     exdate_pattern = r'EXDATE[^:]*:([^\r\n]+)'
     for match in re.finditer(exdate_pattern, ical_data):
@@ -631,7 +630,6 @@ async def delete_user_message(msg, delay=3600):
     asyncio.create_task(auto_delete_message(msg.chat.id, msg.message_id, delay))
 
 async def show_pending_actions(chat_id, short_id, text, event_time, is_recurring=False):
-    """Показывает кнопки действий для просроченного уведомления"""
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{short_id}"),
@@ -672,6 +670,7 @@ async def snooze_event(short_id, hours=1):
     try:
         real_id = event_id_map.get(short_id)
         if not real_id:
+            logger.error(f"Event ID not found for short_id: {short_id}")
             return False
         
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
@@ -721,6 +720,7 @@ async def mark_done(short_id, is_recurring=False, event_time=None):
     try:
         real_id = event_id_map.get(short_id)
         if not real_id:
+            logger.error(f"Event ID not found for short_id: {short_id}")
             return False
         
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
@@ -744,7 +744,6 @@ def get_main_keyboard():
     return kb
 
 async def show_pending_list(chat_id, persistent=False):
-    """Показывает список просроченных уведомлений с кнопками для каждого"""
     pending = await get_pending_notifications()
     
     if not pending:
@@ -755,7 +754,6 @@ async def show_pending_list(chat_id, persistent=False):
             await send_with_auto_delete(chat_id, msg, delay=3600)
         return
     
-    # Показываем список с кнопками для каждого уведомления
     for idx, p in enumerate(pending, 1):
         recurring_mark = " 🔁" if p['is_recurring'] else ""
         
@@ -856,6 +854,7 @@ async def set_specific_date(msg, state):
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('done_'), state='*')
 async def handle_done(cb):
     short_id = cb.data.replace('done_', '')
+    logger.info(f"Обработка done для short_id: {short_id}")
     
     is_recurring = False
     event_time = None
@@ -870,12 +869,13 @@ async def handle_done(cb):
     
     if success:
         await cb.answer("✅ Событие отмечено как выполненное и удалено из календаря!")
+        await cb.message.delete()  # Удаляем сообщение с кнопками
         now = get_current_time()
         await update_calendar_cache(now.year, now.month, force=True)
         await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
-        await cb.answer("❌ Ошибка при удалении события!")
+        await cb.answer("❌ Ошибка при удалении события!", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
 async def handle_snooze(cb):
@@ -921,12 +921,13 @@ async def process_snooze(cb, short_id, hours):
     success = await snooze_event(short_id, hours)
     if success:
         await cb.answer(f"✅ Событие отложено на {hours} час(ов)!")
+        await cb.message.delete()
         now = get_current_time()
         await update_calendar_cache(now.year, now.month, force=True)
         await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
-        await cb.answer("❌ Ошибка при откладывании события!")
+        await cb.answer("❌ Ошибка при откладывании события!", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('hour_'), state='*')
 async def handle_hour(cb):
