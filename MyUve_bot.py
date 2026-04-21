@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.8"
+BOT_VERSION = "4.9"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -365,13 +365,16 @@ END:VCALENDAR"""
                     
                     exdates = parse_exdates(ev.data)
                     
-                    # Генерируем короткий хеш для callback_data
-                    event_url = str(ev.url)
-                    event_hash = hashlib.md5(event_url.encode()).hexdigest()[:16]
-                    event_hash_map[event_hash] = event_url
+                    # Извлекаем UID для стабильного хеша
+                    uid_match = re.search(r'UID:([^\r\n]+)', ev.data)
+                    uid = uid_match.group(1).strip() if uid_match else str(ev.url)
+                    
+                    # Генерируем стабильный хеш на основе UID
+                    event_hash = hashlib.md5(uid.encode()).hexdigest()[:16]
+                    event_hash_map[event_hash] = str(ev.url)
                     
                     result.append({
-                        'id': event_url,
+                        'id': str(ev.url),
                         'hash': event_hash,
                         'summary': str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия',
                         'start': dt.isoformat(),
@@ -672,7 +675,7 @@ async def snooze_event(event_hash, hours=1):
     try:
         real_id = event_hash_map.get(event_hash)
         if not real_id:
-            logger.error(f"Event ID not found for hash: {event_hash}")
+            logger.error(f"Event URL not found for hash: {event_hash}")
             return False
         
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
@@ -711,7 +714,7 @@ END:VCALENDAR"""
                 
                 event.delete()
                 cal.save_event(ical)
-                logger.info(f"Событие отложено на {hours} час(ов)")
+                logger.info(f"Событие {event_hash} отложено на {hours} час(ов)")
                 return True
         return False
     except Exception as e:
@@ -722,7 +725,7 @@ async def mark_done(event_hash, is_recurring=False, event_time=None):
     try:
         real_id = event_hash_map.get(event_hash)
         if not real_id:
-            logger.error(f"Event ID not found for hash: {event_hash}")
+            logger.error(f"Event URL not found for hash: {event_hash}")
             return False
         
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
