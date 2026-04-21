@@ -37,8 +37,8 @@ YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-BOT_VERSION = "2.7"
-BOT_VERSION_DATE = "20.04.2026"
+BOT_VERSION = "2.8"
+BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -413,7 +413,9 @@ async def get_formatted_calendar_events(year, month, force_refresh=False):
         await update_calendar_events_cache(year, month)
     events = calendar_events_cache.get(f"{year}_{month}", [])
     now = get_current_time()
+    today = now.date()
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+    
     future = []
     for ev in events:
         try:
@@ -422,38 +424,48 @@ async def get_formatted_calendar_events(year, month, force_refresh=False):
                 dt = tz.localize(dt)
             else:
                 dt = dt.astimezone(tz)
+            
             occ_key = f"{ev['id']}_{dt.strftime('%Y%m%d')}"
+            
+            # ИСПРАВЛЕНИЕ 1: Проверяем, не отмечено ли это вхождение как выполненное
             if occ_key in completed_occurrences:
                 continue
             
-            # ВАЖНО: Для повторяющихся событий показываем только сегодня и завтра
+            # ИСПРАВЛЕНИЕ 2: Показываем только события от сегодня и вперед (исключаем прошедшие)
+            if dt.date() < today:
+                continue
+            
+            # ИСПРАВЛЕНИЕ 3: Для повторяющихся событий показываем только ближайшие 7 дней
             if ev.get('is_recurring', False):
-                # Показываем только если дата равна сегодня или завтра
-                if dt.date() <= now.date() + timedelta(days=1):
+                # Показываем только если дата в пределах следующих 7 дней
+                if dt.date() <= today + timedelta(days=7):
                     future.append((dt, ev))
             else:
-                # Обычные события показываем все (от вчера и далее)
-                if dt.date() >= now.date() - timedelta(days=1):
-                    future.append((dt, ev))
+                # Обычные события показываем все будущие
+                future.append((dt, ev))
         except Exception as e:
             logger.error(f"format event error: {e}")
             continue
+    
     if not future:
-        return f"📅 **Нет событий на {MONTHS_NAMES[month]} {year}**"
+        return f"📅 **Нет предстоящих событий на {MONTHS_NAMES[month]} {year}**"
+    
     future.sort(key=lambda x: x[0])
     text = f"📅 **СОБЫТИЯ КАЛЕНДАРЯ**\n📆 {MONTHS_NAMES[month]} {year}\n\n"
+    
     for dt, ev in future[:100]:
         weekday = ["пн","вт","ср","чт","пт","сб","вс"][dt.weekday()]
-        if dt.date() == now.date():
+        if dt.date() == today:
             prefix = "🔴 СЕГОДНЯ"
-        elif dt.date() == now.date() + timedelta(days=1):
+        elif dt.date() == today + timedelta(days=1):
             prefix = "🟠 ЗАВТРА"
-        elif dt.date() == now.date() + timedelta(days=2):
+        elif dt.date() == today + timedelta(days=2):
             prefix = "🟡 ПОСЛЕЗАВТРА"
         else:
             prefix = "📌"
         recurring_mark = " 🔁" if ev.get('is_recurring', False) else ""
         text += f"{prefix} {dt.day:02d}.{dt.month:02d}.{dt.year} ({weekday}) в {dt.strftime('%H:%M')} — **{ev['summary']}**{recurring_mark}\n"
+    
     if len(future) > 100:
         text += f"\n... и еще {len(future)-100} событий"
     if last_sync_time:
@@ -549,13 +561,16 @@ def save_data():
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 async def sync_calendar_to_pending():
+    """Синхронизация календаря с неотмеченными уведомлениями - ИСПРАВЛЕНО"""
     if not get_caldav_available() or not config.get('calendar_sync_enabled', True):
         return
     now = get_current_time()
+    today = now.date()
     await update_calendar_events_cache(now.year, now.month)
     events = calendar_events_cache.get(f"{now.year}_{now.month}", [])
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
     added_count = 0
+    
     for ev in events:
         try:
             dt = datetime.fromisoformat(ev['start'])
@@ -563,15 +578,22 @@ async def sync_calendar_to_pending():
                 dt = tz.localize(dt)
             else:
                 dt = dt.astimezone(tz)
+            
             occ_key = f"{ev['id']}_{dt.strftime('%Y%m%d')}"
+            
+            # ИСПРАВЛЕНИЕ 4: Пропускаем уже отмеченные вхождения
             if occ_key in completed_occurrences:
                 continue
+            
+            # ИСПРАВЛЕНИЕ 5: Добавляем только просроченные события (время уже прошло)
             if dt <= now:
+                # Проверяем, нет ли уже такого в pending
                 exists = False
                 for n in pending_notifications.values():
                     if n.get('calendar_event_key') == occ_key:
                         exists = True
                         break
+                
                 if not exists:
                     nid = f"pending_{int(dt.timestamp())}_{hashlib.md5(occ_key.encode()).hexdigest()[:8]}"
                     pending_notifications[nid] = {
@@ -591,8 +613,10 @@ async def sync_calendar_to_pending():
                     logger.info(f"Добавлено просроченное событие: {ev['summary']} на {dt.strftime('%d.%m.%Y %H:%M')}")
         except Exception as e:
             logger.error(f"sync_calendar error: {e}")
+    
     if added_count > 0:
         save_data()
+        logger.info(f"Добавлено {added_count} просроченных событий в pending")
 
 async def sync_notification_to_calendar(notif_id, action='create'):
     if not config.get('calendar_sync_enabled', True) or not get_caldav_available():
@@ -847,7 +871,7 @@ async def cmd_start(msg, state):
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
         return await msg.reply("❌ Нет доступа")
     ok, _ = await check_caldav_connection()
-    welcome = f"👋 **Добро пожаловать!**\n🤖 Версия v{BOT_VERSION}\n📧 CalDAV: {'✅ Доступен' if ok else '❌ Ошибка'}\n🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}\n\n⚠️ **Неотмеченные уведомления** — это напоминания, время которых уже истекло. Они будут повторяться каждый час, пока вы не отметите их как выполненные.\n\n🔄 **Для повторяющихся событий:** при отметке \"Выполнено\" удаляется только сегодняшнее вхождение, следующее остаётся в календаре.\n\n📅 **В календаре повторяющиеся события показываются только на сегодня и завтра.**"
+    welcome = f"👋 **Добро пожаловать!**\n🤖 Версия v{BOT_VERSION}\n📧 CalDAV: {'✅ Доступен' if ok else '❌ Ошибка'}\n🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}\n\n⚠️ **Неотмеченные уведомления** — это напоминания, время которых уже истекло. Они будут повторяться каждый час, пока вы не отметите их как выполненные.\n\n🔄 **Для повторяющихся событий:** при отметке \"Выполнено\" удаляется только сегодняшнее вхождение, следующее остаётся в календаре.\n\n📅 **В календаре показываются только предстоящие события (от сегодня и вперед).**"
     if not ok and get_caldav_available():
         welcome += "\n\n⚠️ Проблема с CalDAV. Проверьте пароль приложения."
     if not DATEUTIL_AVAILABLE:
@@ -1164,20 +1188,26 @@ async def pend_done(cb):
     if nid not in pending_notifications:
         return await cb.answer("Уведомление не найдено")
     notif = pending_notifications[nid]
+    
+    # ИСПРАВЛЕНИЕ 6: Для повторяющихся событий сохраняем отметку о выполнении
     if notif.get('is_recurring', False):
         occ_key = notif.get('calendar_event_key')
         if occ_key:
             completed_occurrences.add(occ_key)
+            save_data()  # Сохраняем сразу
             logger.info(f"Добавлено обработанное вхождение: {occ_key}")
     else:
         if 'calendar_event_id' in notif:
             await sync_notification_to_calendar(nid, 'delete')
+    
     del pending_notifications[nid]
     save_data()
+    
     if notif.get('is_recurring', False):
         await cb.answer("✅ Текущее вхождение повторяющегося события отмечено как выполненное!")
     else:
         await cb.answer("✅ Уведомление выполнено и удалено!")
+    
     await update_pending_list(cb.from_user.id, persistent=True)
     now = get_current_time()
     await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
@@ -1654,7 +1684,8 @@ async def info(cb):
 🕐 **Текущее время:** `{get_current_time().strftime('%d.%m.%Y %H:%M:%S')}`
 🔔 **Уведомления:** `{'Вкл' if notifications_enabled else 'Выкл'}`
 📅 **Синхр. с календарём:** `{'Вкл' if config.get('calendar_sync_enabled', True) else 'Выкл'}`
-📧 **CalDAV:** `{caldav_status}`"""
+📧 **CalDAV:** `{caldav_status}`
+✅ **Отмеченных вхождений:** `{len(completed_occurrences)}`"""
     await cb.message.edit_text(info_text)
     await cb.answer()
 
@@ -1702,6 +1733,7 @@ async def on_startup(dp):
     logger.info(f"Неотмеченных: {len(pending_notifications)}")
     logger.info(f"Часовой пояс: {config.get('timezone', 'Europe/Moscow')}")
     logger.info(f"Текущее время: {get_current_time().strftime('%d.%m.%Y %H:%M:%S')}")
+    logger.info(f"Отмеченных вхождений: {len(completed_occurrences)}")
     logger.info(f"{'='*50}\n")
     asyncio.create_task(check_regular_notifications())
     asyncio.create_task(check_pending_notifications())
