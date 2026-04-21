@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.4"
+BOT_VERSION = "3.5"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -288,7 +288,7 @@ DESCRIPTION:{description[:500]}"""
         """
         Удаляет конкретное вхождение повторяющегося события,
         добавляя EXDATE в iCalendar данные.
-        Полностью пересоздает событие с добавленным EXDATE.
+        Сохраняет все оригинальные поля события.
         """
         try:
             cal = self.get_default_calendar()
@@ -306,24 +306,56 @@ DESCRIPTION:{description[:500]}"""
                 logger.error(f"Событие не найдено: {event_url}")
                 return False
             
-            # Получаем текущие iCalendar данные
+            # Получаем iCalendar данные
             ical_data = target_event.data
-            logger.info(f"Исходные iCalendar данные (первые 1000 символов):\n{ical_data[:1000]}")
+            logger.info(f"Исходные iCalendar данные:\n{ical_data}")
             
-            # Парсим существующие данные для извлечения UID, SUMMARY, RRULE, DTSTART и т.д.
-            uid_match = re.search(r'UID:(.+?)(?:\r?\n|$)', ical_data)
-            summary_match = re.search(r'SUMMARY:(.+?)(?:\r?\n|$)', ical_data)
-            dtstart_match = re.search(r'DTSTART.*?:(.+?)(?:\r?\n|$)', ical_data)
-            rrule_match = re.search(r'RRULE:(.+?)(?:\r?\n|$)', ical_data)
-            
-            if not uid_match or not summary_match or not dtstart_match:
-                logger.error("Не удалось извлечь необходимые данные из события")
+            # Извлекаем компонент VEVENT
+            vevent_match = re.search(r'(BEGIN:VEVENT.*?END:VEVENT)', ical_data, re.DOTALL)
+            if not vevent_match:
+                logger.error("Не найден блок VEVENT")
                 return False
             
+            vevent_data = vevent_match.group(1)
+            
+            # Извлекаем UID
+            uid_match = re.search(r'UID:(.+?)(?:\r?\n|$)', vevent_data)
+            if not uid_match:
+                logger.error("UID не найден")
+                return False
             uid = uid_match.group(1).strip()
-            summary = summary_match.group(1).strip()
-            dtstart_str = dtstart_match.group(1).strip()
+            
+            # Извлекаем SUMMARY
+            summary_match = re.search(r'SUMMARY:(.+?)(?:\r?\n|$)', vevent_data)
+            summary = summary_match.group(1).strip() if summary_match else "Без названия"
+            
+            # Извлекаем DTSTART (сохраняем оригинальный формат)
+            dtstart_match = re.search(r'(DTSTART[^:]*):(.+?)(?:\r?\n|$)', vevent_data)
+            if not dtstart_match:
+                logger.error("DTSTART не найден")
+                return False
+            dtstart_prop = dtstart_match.group(1)
+            dtstart_value = dtstart_match.group(2).strip()
+            
+            # Извлекаем RRULE
+            rrule_match = re.search(r'RRULE:(.+?)(?:\r?\n|$)', vevent_data)
             rrule = rrule_match.group(1).strip() if rrule_match else None
+            
+            # Извлекаем существующие EXDATE
+            existing_exdates = []
+            exdate_pattern = r'EXDATE[^:]*:(.+?)(?:\r?\n|$)'
+            for match in re.finditer(exdate_pattern, vevent_data):
+                exdate_value = match.group(1).strip()
+                existing_exdates.extend(exdate_value.split(','))
+            
+            # Извлекаем DTEND если есть
+            dtend_match = re.search(r'(DTEND[^:]*):(.+?)(?:\r?\n|$)', vevent_data)
+            dtend_prop = dtend_match.group(1) if dtend_match else None
+            dtend_value = dtend_match.group(2).strip() if dtend_match else None
+            
+            # Извлекаем DESCRIPTION если есть
+            desc_match = re.search(r'DESCRIPTION:(.+?)(?:\r?\n|$)', vevent_data)
+            description = desc_match.group(1).strip() if desc_match else ""
             
             # Преобразуем дату исключения в UTC для EXDATE
             tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
@@ -332,47 +364,56 @@ DESCRIPTION:{description[:500]}"""
             exception_utc = exception_date.astimezone(pytz.UTC)
             exdate_str = exception_utc.strftime('%Y%m%dT%H%M%SZ')
             
-            # Получаем существующие EXDATE, если есть
-            existing_exdates = []
-            exdate_pattern = r'EXDATE[;:]([^:]+?)(?:\r?\n|$)'
-            for match in re.finditer(exdate_pattern, ical_data):
-                exdate_value = match.group(1).strip()
-                existing_exdates.extend(exdate_value.split(','))
-            
             # Добавляем новую дату, если её еще нет
             if exdate_str not in existing_exdates:
                 existing_exdates.append(exdate_str)
             
-            # Сортируем и убираем дубликаты
+            # Сортируем
             existing_exdates = sorted(list(set(existing_exdates)))
             
-            # Создаем новое iCalendar представление
-            new_ical = [
-                "BEGIN:VCALENDAR",
-                "VERSION:2.0",
-                "PRODID:-//MyUve Bot//Calendar//EN",
-                "CALSCALE:GREGORIAN",
+            # Формируем новый VEVENT
+            new_vevent_lines = [
                 "BEGIN:VEVENT",
                 f"UID:{uid}",
                 f"DTSTAMP:{datetime.now().strftime('%Y%m%dT%H%M%SZ')}",
-                f"DTSTART;TZID={config.get('timezone', 'Europe/Moscow')}:{dtstart_str}",
-                f"SUMMARY:{summary}",
+                f"{dtstart_prop}:{dtstart_value}",
             ]
             
+            if dtend_prop and dtend_value:
+                new_vevent_lines.append(f"{dtend_prop}:{dtend_value}")
+            
+            new_vevent_lines.append(f"SUMMARY:{summary}")
+            
+            if description:
+                new_vevent_lines.append(f"DESCRIPTION:{description}")
+            
             if rrule:
-                new_ical.append(f"RRULE:{rrule}")
+                new_vevent_lines.append(f"RRULE:{rrule}")
             
-            # Добавляем EXDATE
             if existing_exdates:
-                exdate_line = f"EXDATE:{','.join(existing_exdates)}"
-                new_ical.append(exdate_line)
+                new_vevent_lines.append(f"EXDATE:{','.join(existing_exdates)}")
             
-            new_ical.extend([
-                "END:VEVENT",
-                "END:VCALENDAR"
-            ])
+            new_vevent_lines.append("END:VEVENT")
             
-            updated_ical = '\n'.join(new_ical)
+            # Формируем полный iCalendar
+            # Сохраняем оригинальные VTIMEZONE если есть
+            vtimezone_match = re.search(r'(BEGIN:VTIMEZONE.*?END:VTIMEZONE)', ical_data, re.DOTALL)
+            
+            new_ical_lines = [
+                "BEGIN:VCALENDAR",
+                "VERSION:2.0",
+                "PRODID:-//Yandex LLC//Yandex Calendar//EN",
+                "CALSCALE:GREGORIAN",
+                "METHOD:PUBLISH",
+            ]
+            
+            if vtimezone_match:
+                new_ical_lines.append(vtimezone_match.group(1))
+            
+            new_ical_lines.extend(new_vevent_lines)
+            new_ical_lines.append("END:VCALENDAR")
+            
+            updated_ical = '\n'.join(new_ical_lines)
             logger.info(f"Обновленные iCalendar данные:\n{updated_ical}")
             
             # Сохраняем обновленное событие
