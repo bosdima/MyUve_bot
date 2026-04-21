@@ -10,6 +10,7 @@ import pytz
 import caldav
 import hashlib
 from uuid import uuid4
+import base64
 
 try:
     from dateutil.rrule import rrulestr
@@ -57,7 +58,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.6"
+BOT_VERSION = "4.7"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -72,7 +73,6 @@ config: Dict = {}
 notifications_enabled = True
 calendar_events_cache: Dict[str, List[Dict]] = {}
 last_sync_time: Optional[datetime] = None
-event_id_map: Dict[str, str] = {}  # short_id -> real_url
 
 TIMEZONES = {
     'Москва (UTC+3)': 'Europe/Moscow',
@@ -364,14 +364,8 @@ END:VCALENDAR"""
                     
                     exdates = parse_exdates(ev.data)
                     
-                    real_url = str(ev.url)
-                    short_id = hashlib.md5(real_url.encode()).hexdigest()[:12]
-                    # Сохраняем соответствие в глобальном словаре
-                    event_id_map[short_id] = real_url
-                    
                     result.append({
-                        'id': real_url,
-                        'short_id': short_id,
+                        'id': str(ev.url),
                         'summary': str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия',
                         'start': dt.isoformat(),
                         'rrule': rrule,
@@ -411,7 +405,6 @@ END:VCALENDAR"""
                     if occ_dt >= from_date - timedelta(days=1):
                         expanded.append({
                             'id': ev['id'],
-                            'short_id': ev['short_id'],
                             'summary': ev['summary'],
                             'start': occ_dt.isoformat(),
                             'is_recurring': True
@@ -420,7 +413,6 @@ END:VCALENDAR"""
                 if start_dt >= from_date - timedelta(days=1):
                     expanded.append({
                         'id': ev['id'],
-                        'short_id': ev['short_id'],
                         'summary': ev['summary'],
                         'start': ev['start'],
                         'is_recurring': False
@@ -488,8 +480,11 @@ async def get_pending_notifications():
                 dt = dt.astimezone(tz)
             
             if dt <= now:
+                # Кодируем ID события для безопасной передачи в callback_data
+                encoded_id = base64.urlsafe_b64encode(ev['id'].encode()).decode()[:50]
                 pending.append({
-                    'short_id': ev['short_id'],
+                    'id': ev['id'],
+                    'encoded_id': encoded_id,
                     'text': ev['summary'],
                     'time': dt,
                     'is_recurring': ev.get('is_recurring', False)
@@ -629,12 +624,12 @@ async def send_persistent_message(chat_id, text, parse_mode='Markdown', reply_ma
 async def delete_user_message(msg, delay=3600):
     asyncio.create_task(auto_delete_message(msg.chat.id, msg.message_id, delay))
 
-async def show_pending_actions(chat_id, short_id, text, event_time, is_recurring=False):
+async def show_pending_actions(chat_id, event_id, encoded_id, text, event_time, is_recurring=False):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{short_id}"),
-        InlineKeyboardButton("📅 Отложить", callback_data=f"snooze_{short_id}"),
-        InlineKeyboardButton("❌ Отложить на час", callback_data=f"hour_{short_id}")
+        InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{encoded_id}"),
+        InlineKeyboardButton("📅 Отложить", callback_data=f"snooze_{encoded_id}"),
+        InlineKeyboardButton("❌ Отложить на час", callback_data=f"hour_{encoded_id}")
     )
     recurring_text = " 🔁" if is_recurring else ""
     await bot.send_message(
@@ -652,11 +647,11 @@ async def check_pending():
         if notifications_enabled:
             pending = await get_pending_notifications()
             for p in pending:
-                event_key = f"{p['short_id']}_{p['time'].strftime('%Y%m%d%H%M')}"
+                event_key = f"{p['id']}_{p['time'].strftime('%Y%m%d%H%M')}"
                 
                 if event_key not in sent_notifications:
                     if p['time'] <= get_current_time():
-                        await show_pending_actions(ADMIN_ID, p['short_id'], p['text'], p['time'], p['is_recurring'])
+                        await show_pending_actions(ADMIN_ID, p['id'], p['encoded_id'], p['text'], p['time'], p['is_recurring'])
                         sent_notifications.add(event_key)
                         
                         async def remove_from_sent(key):
@@ -666,20 +661,15 @@ async def check_pending():
         
         await asyncio.sleep(60)
 
-async def snooze_event(short_id, hours=1):
+async def snooze_event(event_id, hours=1):
     try:
-        real_id = event_id_map.get(short_id)
-        if not real_id:
-            logger.error(f"Event ID not found for short_id: {short_id}")
-            return False
-        
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         cal = api.get_default_calendar()
         if not cal:
             return False
         
         for event in cal.events():
-            if str(event.url) == real_id:
+            if str(event.url) == event_id:
                 vevent = event.vobject_instance.vevent
                 old_start = vevent.dtstart.value
                 if hasattr(old_start, 'dt'):
@@ -709,26 +699,21 @@ END:VCALENDAR"""
                 
                 event.delete()
                 cal.save_event(ical)
-                logger.info(f"Событие {short_id} отложено на {hours} час(ов)")
+                logger.info(f"Событие отложено на {hours} час(ов)")
                 return True
         return False
     except Exception as e:
         logger.error(f"snooze_event error: {e}")
         return False
 
-async def mark_done(short_id, is_recurring=False, event_time=None):
+async def mark_done(event_id, is_recurring=False, event_time=None):
     try:
-        real_id = event_id_map.get(short_id)
-        if not real_id:
-            logger.error(f"Event ID not found for short_id: {short_id}")
-            return False
-        
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
         if is_recurring and event_time:
-            return await api.add_exception_to_recurring(real_id, event_time)
+            return await api.add_exception_to_recurring(event_id, event_time)
         else:
-            return await api.delete_event(real_id)
+            return await api.delete_event(event_id)
     except Exception as e:
         logger.error(f"mark_done error: {e}")
         return False
@@ -757,9 +742,9 @@ async def show_pending_list(chat_id, persistent=False):
         
         kb = InlineKeyboardMarkup(row_width=2)
         kb.add(
-            InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{p['short_id']}"),
-            InlineKeyboardButton("📅 Отложить", callback_data=f"snooze_{p['short_id']}"),
-            InlineKeyboardButton("❌ Отложить на час", callback_data=f"hour_{p['short_id']}")
+            InlineKeyboardButton("✅ Выполнено", callback_data=f"done_{p['encoded_id']}"),
+            InlineKeyboardButton("📅 Отложить", callback_data=f"snooze_{p['encoded_id']}"),
+            InlineKeyboardButton("❌ Отложить на час", callback_data=f"hour_{p['encoded_id']}")
         )
         
         text = f"⚠️ **{idx}. {p['text']}**{recurring_mark}\n⏰ {p['time'].strftime('%d.%m.%Y %H:%M')}\n\nВыберите действие:"
@@ -848,19 +833,28 @@ async def set_specific_date(msg, state):
 # ---------- ОБРАБОТЧИКИ ДЛЯ ПРОСРОЧЕННЫХ ----------
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('done_'), state='*')
 async def handle_done(cb):
-    short_id = cb.data.replace('done_', '')
-    logger.info(f"Обработка done для short_id: {short_id}")
+    encoded_id = cb.data.replace('done_', '')
+    logger.info(f"Обработка done для encoded_id: {encoded_id[:20]}...")
     
+    # Декодируем ID
+    try:
+        event_id = base64.urlsafe_b64decode(encoded_id.encode()).decode()
+    except:
+        logger.error(f"Не удалось декодировать ID: {encoded_id}")
+        await cb.answer("❌ Ошибка: неверный идентификатор события", show_alert=True)
+        return
+    
+    # Находим информацию о событии
     is_recurring = False
     event_time = None
     pending = await get_pending_notifications()
     for p in pending:
-        if p['short_id'] == short_id:
+        if p['id'] == event_id:
             is_recurring = p['is_recurring']
             event_time = p['time']
             break
     
-    success = await mark_done(short_id, is_recurring, event_time)
+    success = await mark_done(event_id, is_recurring, event_time)
     
     if success:
         # Удаляем сообщение с кнопками
@@ -881,14 +875,14 @@ async def handle_done(cb):
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
 async def handle_snooze(cb):
-    short_id = cb.data.replace('snooze_', '')
+    encoded_id = cb.data.replace('snooze_', '')
     
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("1 час", callback_data=f"snooze_1h_{short_id}"),
-        InlineKeyboardButton("3 часа", callback_data=f"snooze_3h_{short_id}"),
-        InlineKeyboardButton("1 день", callback_data=f"snooze_1d_{short_id}"),
-        InlineKeyboardButton("7 дней", callback_data=f"snooze_7d_{short_id}"),
+        InlineKeyboardButton("1 час", callback_data=f"snooze_1h_{encoded_id}"),
+        InlineKeyboardButton("3 часа", callback_data=f"snooze_3h_{encoded_id}"),
+        InlineKeyboardButton("1 день", callback_data=f"snooze_1d_{encoded_id}"),
+        InlineKeyboardButton("7 дней", callback_data=f"snooze_7d_{encoded_id}"),
         InlineKeyboardButton("◀️ Назад", callback_data="back_to_pending")
     )
     await cb.message.edit_text("⏰ **На сколько отложить?**", reply_markup=kb)
@@ -896,31 +890,39 @@ async def handle_snooze(cb):
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_1h_'), state='*')
 async def snooze_1h(cb):
-    short_id = cb.data.replace('snooze_1h_', '')
-    await process_snooze(cb, short_id, 1)
+    encoded_id = cb.data.replace('snooze_1h_', '')
+    await process_snooze(cb, encoded_id, 1)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_3h_'), state='*')
 async def snooze_3h(cb):
-    short_id = cb.data.replace('snooze_3h_', '')
-    await process_snooze(cb, short_id, 3)
+    encoded_id = cb.data.replace('snooze_3h_', '')
+    await process_snooze(cb, encoded_id, 3)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_1d_'), state='*')
 async def snooze_1d(cb):
-    short_id = cb.data.replace('snooze_1d_', '')
-    await process_snooze(cb, short_id, 24)
+    encoded_id = cb.data.replace('snooze_1d_', '')
+    await process_snooze(cb, encoded_id, 24)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_7d_'), state='*')
 async def snooze_7d(cb):
-    short_id = cb.data.replace('snooze_7d_', '')
-    await process_snooze(cb, short_id, 168)
+    encoded_id = cb.data.replace('snooze_7d_', '')
+    await process_snooze(cb, encoded_id, 168)
 
 @dp.callback_query_handler(lambda c: c.data == "back_to_pending", state='*')
 async def back_to_pending(cb):
     await show_pending_list(cb.from_user.id, persistent=True)
     await cb.answer()
 
-async def process_snooze(cb, short_id, hours):
-    success = await snooze_event(short_id, hours)
+async def process_snooze(cb, encoded_id, hours):
+    # Декодируем ID
+    try:
+        event_id = base64.urlsafe_b64decode(encoded_id.encode()).decode()
+    except:
+        logger.error(f"Не удалось декодировать ID: {encoded_id}")
+        await cb.answer("❌ Ошибка: неверный идентификатор события", show_alert=True)
+        return
+    
+    success = await snooze_event(event_id, hours)
     if success:
         try:
             await cb.message.delete()
@@ -936,8 +938,8 @@ async def process_snooze(cb, short_id, hours):
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('hour_'), state='*')
 async def handle_hour(cb):
-    short_id = cb.data.replace('hour_', '')
-    await process_snooze(cb, short_id, 1)
+    encoded_id = cb.data.replace('hour_', '')
+    await process_snooze(cb, encoded_id, 1)
 
 @dp.message_handler(lambda m: m.text == "⚠️ Просроченные", state='*')
 async def view_pending(msg, state):
@@ -1110,7 +1112,6 @@ async def on_startup(dp):
         logger.info("Удалён старый файл notifications.json")
     
     calendar_events_cache.clear()
-    # НЕ ОЧИЩАЕМ event_id_map, так как он должен накапливаться
     
     logger.info(f"\n{'='*50}\n🤖 БОТ v{BOT_VERSION} ЗАПУЩЕН\n{'='*50}")
     if get_caldav_available():
