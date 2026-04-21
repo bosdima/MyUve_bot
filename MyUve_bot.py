@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.4"
+BOT_VERSION = "4.5"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -72,7 +72,6 @@ config: Dict = {}
 notifications_enabled = True
 calendar_events_cache: Dict[str, List[Dict]] = {}
 last_sync_time: Optional[datetime] = None
-# Словарь для хранения соответствия коротких ID и реальных URL событий
 event_id_map: Dict[str, str] = {}
 
 TIMEZONES = {
@@ -365,7 +364,6 @@ END:VCALENDAR"""
                     
                     exdates = parse_exdates(ev.data)
                     
-                    # Генерируем короткий ID для callback_data
                     short_id = hashlib.md5(str(ev.url).encode()).hexdigest()[:12]
                     event_id_map[short_id] = str(ev.url)
                     
@@ -754,6 +752,7 @@ async def show_pending_list(chat_id, persistent=False):
             await send_with_auto_delete(chat_id, msg, delay=3600)
         return
     
+    # Отправляем каждое уведомление отдельным сообщением
     for idx, p in enumerate(pending, 1):
         recurring_mark = " 🔁" if p['is_recurring'] else ""
         
@@ -766,10 +765,7 @@ async def show_pending_list(chat_id, persistent=False):
         
         text = f"⚠️ **{idx}. {p['text']}**{recurring_mark}\n⏰ {p['time'].strftime('%d.%m.%Y %H:%M')}\n\nВыберите действие:"
         
-        if persistent:
-            await send_persistent_message(chat_id, text, reply_markup=kb)
-        else:
-            await send_with_auto_delete(chat_id, text, reply_markup=kb, delay=3600)
+        await send_persistent_message(chat_id, text, reply_markup=kb)
 
 # ---------- ОСНОВНЫЕ ОБРАБОТЧИКИ ----------
 @dp.message_handler(commands=['start'])
@@ -868,8 +864,13 @@ async def handle_done(cb):
     success = await mark_done(short_id, is_recurring, event_time)
     
     if success:
+        # Удаляем сообщение с кнопками
+        try:
+            await cb.message.delete()
+        except:
+            pass
         await cb.answer("✅ Событие отмечено как выполненное и удалено из календаря!")
-        await cb.message.delete()  # Удаляем сообщение с кнопками
+        # Обновляем списки
         now = get_current_time()
         await update_calendar_cache(now.year, now.month, force=True)
         await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
@@ -920,8 +921,11 @@ async def back_to_pending(cb):
 async def process_snooze(cb, short_id, hours):
     success = await snooze_event(short_id, hours)
     if success:
+        try:
+            await cb.message.delete()
+        except:
+            pass
         await cb.answer(f"✅ Событие отложено на {hours} час(ов)!")
-        await cb.message.delete()
         now = get_current_time()
         await update_calendar_cache(now.year, now.month, force=True)
         await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
