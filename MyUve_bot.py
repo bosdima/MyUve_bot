@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.2"
+BOT_VERSION = "3.3"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -284,10 +284,10 @@ DESCRIPTION:{description[:500]}"""
             logger.error(f"delete_event error: {e}")
             return False
 
-    async def add_exception_to_recurring_event(self, event_url, exception_date):
+    async def remove_recurring_instance(self, event_url, exception_date):
         """
-        Добавляет исключение (EXDATE) для повторяющегося события на указанную дату
-        Это удаляет только одно вхождение, не затрагивая остальные
+        Удаляет конкретное вхождение повторяющегося события,
+        добавляя EXDATE в iCalendar данные
         """
         try:
             cal = self.get_default_calendar()
@@ -302,62 +302,66 @@ DESCRIPTION:{description[:500]}"""
                     break
             
             if not target_event:
+                logger.error(f"Событие не найдено: {event_url}")
                 return False
             
-            # Получаем текущий iCalendar данных
+            # Получаем текущие iCalendar данные
             ical_data = target_event.data
+            logger.info(f"Исходные iCalendar данные:\n{ical_data[:500]}")
             
-            # Преобразуем дату исключения в формат UTC для EXDATE
+            # Преобразуем дату исключения в UTC для EXDATE
             tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
             if exception_date.tzinfo is None:
                 exception_date = tz.localize(exception_date)
             exception_utc = exception_date.astimezone(pytz.UTC)
             exdate_str = exception_utc.strftime('%Y%m%dT%H%M%SZ')
             
-            # Проверяем, есть ли уже EXDATE
-            if 'EXDATE;' in ical_data or 'EXDATE:' in ical_data:
-                # Добавляем к существующему EXDATE
-                lines = ical_data.split('\n')
-                new_lines = []
-                for line in lines:
-                    if line.startswith('EXDATE'):
-                        # Добавляем новую дату к существующей
-                        if exdate_str not in line:
-                            new_lines.append(line.rstrip('\r') + ',' + exdate_str)
-                        else:
-                            new_lines.append(line)
+            # Проверяем, есть ли уже EXDATE в данных
+            lines = ical_data.split('\n')
+            new_lines = []
+            exdate_added = False
+            
+            for line in lines:
+                if line.startswith('EXDATE'):
+                    # Добавляем новую дату к существующему EXDATE
+                    if exdate_str not in line:
+                        new_lines.append(line.rstrip('\r') + ',' + exdate_str)
                     else:
                         new_lines.append(line)
-                ical_data = '\n'.join(new_lines)
-            else:
-                # Создаем новый EXDATE
-                # Находим место для вставки (после RRULE или перед END:VEVENT)
-                lines = ical_data.split('\n')
-                inserted = False
-                new_lines = []
-                for line in lines:
+                    exdate_added = True
+                else:
                     new_lines.append(line)
-                    if not inserted and (line.startswith('RRULE:') or line.startswith('RRULE;')):
-                        new_lines.append(f'EXDATE:{exdate_str}')
-                        inserted = True
-                    elif not inserted and line.startswith('END:VEVENT'):
-                        new_lines.insert(-1, f'EXDATE:{exdate_str}')
-                        inserted = True
-                
-                if not inserted:
-                    new_lines.insert(-1, f'EXDATE:{exdate_str}')
-                
-                ical_data = '\n'.join(new_lines)
+            
+            # Если EXDATE не было, добавляем его после RRULE
+            if not exdate_added:
+                new_ical = []
+                rrule_found = False
+                for line in new_lines:
+                    new_ical.append(line)
+                    if not rrule_found and (line.startswith('RRULE:') or line.startswith('RRULE;')):
+                        new_ical.append(f'EXDATE:{exdate_str}')
+                        rrule_found = True
+                if not rrule_found:
+                    # Если RRULE не найден, добавляем EXDATE перед END:VEVENT
+                    for i, line in enumerate(new_ical):
+                        if line.startswith('END:VEVENT'):
+                            new_ical.insert(i, f'EXDATE:{exdate_str}')
+                            break
+                new_lines = new_ical
+            
+            # Собираем обновленные данные
+            updated_ical = '\n'.join(new_lines)
+            logger.info(f"Обновленные iCalendar данные:\n{updated_ical[:500]}")
             
             # Сохраняем обновленное событие
-            target_event.data = ical_data
+            target_event.data = updated_ical
             target_event.save()
             
-            logger.info(f"Добавлено исключение для события {event_url} на дату {exception_date.strftime('%Y-%m-%d')}")
+            logger.info(f"Успешно добавлено исключение для {event_url} на дату {exception_date.strftime('%Y-%m-%d %H:%M')}")
             return True
             
         except Exception as e:
-            logger.error(f"add_exception_to_recurring_event error: {e}")
+            logger.error(f"remove_recurring_instance error: {e}")
             return False
 
     async def update_event(self, url, new_summary=None, new_start=None):
@@ -1355,13 +1359,18 @@ async def pend_done(cb):
         if event_id and event_date_str:
             try:
                 api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
-                # Парсим дату события
+                # Парсим дату события (формат YYYYMMDD)
                 tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
                 exception_date = tz.localize(datetime.strptime(event_date_str, '%Y%m%d').replace(hour=7, minute=0))
-                await api.add_exception_to_recurring_event(event_id, exception_date)
-                logger.info(f"Добавлено исключение в календарь для {event_id} на дату {event_date_str}")
+                
+                # Удаляем конкретное вхождение через EXDATE
+                result = await api.remove_recurring_instance(event_id, exception_date)
+                if result:
+                    logger.info(f"Успешно удалено вхождение из календаря для {event_id} на дату {event_date_str}")
+                else:
+                    logger.error(f"Не удалось удалить вхождение из календаря для {event_id}")
             except Exception as e:
-                logger.error(f"Ошибка при добавлении исключения в календарь: {e}")
+                logger.error(f"Ошибка при удалении вхождения из календаря: {e}")
     else:
         # Для обычных событий удаляем из календаря
         if 'calendar_event_id' in notif:
