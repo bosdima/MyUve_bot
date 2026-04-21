@@ -21,23 +21,19 @@ except ImportError:
 # Настройка логирования с ротацией (максимум 200 КБ)
 LOG_FILE = 'bot.log'
 LOG_MAX_BYTES = 200 * 1024  # 200 KB
-LOG_BACKUP_COUNT = 1  # хранить только текущий и один старый
+LOG_BACKUP_COUNT = 1
 
-# Настройка корневого логгера
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 
-# Форматтер для логов
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# Обработчик для файла с ротацией
 file_handler = logging.handlers.RotatingFileHandler(
     LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding='utf-8'
 )
 file_handler.setFormatter(formatter)
 root_logger.addHandler(file_handler)
 
-# Обработчик для консоли
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 root_logger.addHandler(console_handler)
@@ -61,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "2.9"
+BOT_VERSION = "3.0"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -152,7 +148,6 @@ def get_next_weekday(target_weekdays, hour, minute, from_date=None):
     return None
 
 def expand_recurring_event(start_dt, rrule_str, until_date=None, max_count=150):
-    """Разворачивает повторяющееся событие в список дат с правильной обработкой UTC"""
     if not DATEUTIL_AVAILABLE or not rrule_str:
         return [start_dt]
     
@@ -409,13 +404,11 @@ async def check_caldav_connection():
     return await api.test_connection()
 
 def cleanup_old_completed_occurrences():
-    """Удаляет записи о выполненных вхождениях старше 30 дней"""
     global completed_occurrences
     now = get_current_time()
     thirty_days_ago = now - timedelta(days=30)
     new_set = set()
     for occ in completed_occurrences:
-        # Парсим дату из ключа (формат: event_id_YYYYMMDD)
         parts = occ.split('_')
         if len(parts) >= 2:
             try:
@@ -425,7 +418,6 @@ def cleanup_old_completed_occurrences():
                 if occ_date >= thirty_days_ago:
                     new_set.add(occ)
             except:
-                # Если не удалось распарсить, сохраняем
                 new_set.add(occ)
         else:
             new_set.add(occ)
@@ -447,7 +439,6 @@ async def update_calendar_events_cache(year, month, force=False):
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         events = await api.get_month_events(year, month)
         
-        # Фильтруем события: удаляем те, что уже отмечены как выполненные
         filtered_events = []
         for ev in events:
             dt = datetime.fromisoformat(ev['start'])
@@ -494,21 +485,16 @@ async def get_formatted_calendar_events(year, month, force_refresh=False):
             
             occ_key = f"{ev['id']}_{dt.strftime('%Y%m%d')}"
             
-            # Проверяем, не отмечено ли это вхождение как выполненное
             if occ_key in completed_occurrences:
                 continue
             
-            # Показываем только события от сегодня и вперед (исключаем прошедшие)
             if dt.date() < today:
                 continue
             
-            # ИСПРАВЛЕНИЕ: Для повторяющихся событий показываем только сегодня и завтра
             if ev.get('is_recurring', False):
-                # Показываем только если дата равна сегодня или завтра
                 if dt.date() <= today + timedelta(days=1):
                     future.append((dt, ev))
             else:
-                # Обычные события показываем все будущие
                 future.append((dt, ev))
         except Exception as e:
             logger.error(f"format event error: {e}")
@@ -629,11 +615,9 @@ def save_data():
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 async def sync_calendar_to_pending():
-    """Синхронизация календаря с неотмеченными уведомлениями"""
     if not get_caldav_available() or not config.get('calendar_sync_enabled', True):
         return
     now = get_current_time()
-    today = now.date()
     await update_calendar_events_cache(now.year, now.month)
     events = calendar_events_cache.get(f"{now.year}_{now.month}", [])
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
@@ -649,13 +633,10 @@ async def sync_calendar_to_pending():
             
             occ_key = f"{ev['id']}_{dt.strftime('%Y%m%d')}"
             
-            # Пропускаем уже отмеченные вхождения
             if occ_key in completed_occurrences:
                 continue
             
-            # Добавляем только просроченные события (время уже прошло)
             if dt <= now:
-                # Проверяем, нет ли уже такого в pending
                 exists = False
                 for n in pending_notifications.values():
                     if n.get('calendar_event_key') == occ_key:
@@ -737,7 +718,8 @@ async def show_pending_notification_actions(chat_id, nid, text, repeat=0):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("✅ Выполнено", callback_data=f"pend_done_{nid}"),
-        InlineKeyboardButton("✏️ Изменить время", callback_data=f"pend_edit_{nid}"),
+        InlineKeyboardButton("✏️ Изменить текст", callback_data=f"pend_edit_text_{nid}"),
+        InlineKeyboardButton("⏰ Изменить время", callback_data=f"pend_edit_time_{nid}"),
         InlineKeyboardButton("📅 Отложить", callback_data=f"pend_snooze_{nid}"),
         InlineKeyboardButton("❌ Отложить на час", callback_data=f"pend_hour_{nid}")
     )
@@ -1223,7 +1205,7 @@ async def refresh_pending(cb):
     await update_pending_list(cb.from_user.id, persistent=True)
     await cb.answer("Обновлено")
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_select_'), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('pend_select_'), state='*')
 async def pend_select(cb, state):
     nid = cb.data.replace('pend_select_', '')
     if nid not in pending_notifications:
@@ -1247,45 +1229,51 @@ async def pend_select(cb, state):
         dt = dt.astimezone(tz)
     recurring_info = "\n🔄 **Это повторяющееся событие** — при отметке \"Выполнено\" удалится только сегодняшнее вхождение." if n.get('is_recurring', False) else ""
     text = f"📝 **Уведомление:**\n{n['text']}{recurring_mark}\n\n⏰ **Время:** {dt.strftime('%d.%m.%Y %H:%M')}\n🔄 **Повторов:** {n.get('repeat_count', 0)}{recurring_info}\n\nВыберите действие:"
-    await cb.message.edit_text(text, reply_markup=kb)
+    
+    # Используем edit_text для обновления сообщения
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception as e:
+        logger.error(f"pend_select edit error: {e}")
+        await cb.message.answer(text, reply_markup=kb)
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_done_'), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('pend_done_'), state='*')
 async def pend_done(cb):
     nid = cb.data.replace('pend_done_', '')
     if nid not in pending_notifications:
         return await cb.answer("Уведомление не найдено")
+    
     notif = pending_notifications[nid]
+    logger.info(f"Отметка выполнено для {nid}, is_recurring={notif.get('is_recurring', False)}")
     
     # Для повторяющихся событий сохраняем отметку о выполнении
     if notif.get('is_recurring', False):
         occ_key = notif.get('calendar_event_key')
         if occ_key:
             completed_occurrences.add(occ_key)
-            save_data()  # Сохраняем сразу
+            save_data()
             logger.info(f"Добавлено обработанное вхождение: {occ_key}")
-            # Очищаем старые записи
             cleanup_old_completed_occurrences()
-    else:
-        if 'calendar_event_id' in notif:
-            await sync_notification_to_calendar(nid, 'delete')
     
+    # Удаляем из pending
     del pending_notifications[nid]
     save_data()
+    
+    # Принудительно обновляем кэш календаря
+    now = get_current_time()
+    await update_calendar_events_cache(now.year, now.month, force=True)
+    
+    # Обновляем отображение
+    await update_pending_list(cb.from_user.id, persistent=True)
+    await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
     
     if notif.get('is_recurring', False):
         await cb.answer("✅ Текущее вхождение повторяющегося события отмечено как выполненное!")
     else:
         await cb.answer("✅ Уведомление выполнено и удалено!")
-    
-    # Принудительно обновляем кэш календаря
-    now = get_current_time()
-    await update_calendar_events_cache(now.year, now.month, force=True)
-    await update_pending_list(cb.from_user.id, persistent=True)
-    await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
-    await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_edit_text_'), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('pend_edit_text_'), state='*')
 async def pend_edit_text(cb, state):
     nid = cb.data.replace('pend_edit_text_', '')
     if nid not in pending_notifications:
@@ -1295,7 +1283,7 @@ async def pend_edit_text(cb, state):
     await NotificationStates.waiting_for_edit_text.set()
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_edit_time_'), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('pend_edit_time_'), state='*')
 async def pend_edit_time(cb, state):
     nid = cb.data.replace('pend_edit_time_', '')
     if nid not in pending_notifications:
@@ -1305,7 +1293,7 @@ async def pend_edit_time(cb, state):
     await NotificationStates.waiting_for_edit_time.set()
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_snooze_') and not c.data.startswith(('pend_snooze_1h_','pend_snooze_3h_','pend_snooze_1d_','pend_snooze_7d_','pend_snooze_custom_')), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('pend_snooze_') and not c.data.startswith(('pend_snooze_1h_','pend_snooze_3h_','pend_snooze_1d_','pend_snooze_7d_','pend_snooze_custom_')), state='*')
 async def pend_snooze(cb, state):
     nid = cb.data.replace('pend_snooze_', '')
     if nid not in pending_notifications:
@@ -1320,30 +1308,34 @@ async def pend_snooze(cb, state):
         InlineKeyboardButton("🎯 Свой вариант", callback_data=f"pend_snooze_custom_{nid}"),
         InlineKeyboardButton("◀️ Назад", callback_data=f"pend_select_{nid}")
     )
-    await cb.message.edit_text(f"⏰ **Отложить уведомление?**\n\n📝 {pending_notifications[nid]['text']}", reply_markup=kb)
+    try:
+        await cb.message.edit_text(f"⏰ **Отложить уведомление?**\n\n📝 {pending_notifications[nid]['text']}", reply_markup=kb)
+    except Exception as e:
+        logger.error(f"pend_snooze edit error: {e}")
+        await cb.message.answer(f"⏰ **Отложить уведомление?**\n\n📝 {pending_notifications[nid]['text']}", reply_markup=kb)
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_hour_'), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('pend_hour_'), state='*')
 async def pend_hour(cb):
     nid = cb.data.replace('pend_hour_', '')
     await process_pending_snooze(cb, nid, 1, "hours")
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_snooze_1h_'), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('pend_snooze_1h_'), state='*')
 async def snooze_1h(cb):
     nid = cb.data.replace('pend_snooze_1h_', '')
     await process_pending_snooze(cb, nid, 1, "hours")
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_snooze_3h_'), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('pend_snooze_3h_'), state='*')
 async def snooze_3h(cb):
     nid = cb.data.replace('pend_snooze_3h_', '')
     await process_pending_snooze(cb, nid, 3, "hours")
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_snooze_1d_'), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('pend_snooze_1d_'), state='*')
 async def snooze_1d(cb):
     nid = cb.data.replace('pend_snooze_1d_', '')
     await process_pending_snooze(cb, nid, 1, "days")
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_snooze_7d_'), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('pend_snooze_7d_'), state='*')
 async def snooze_7d(cb):
     nid = cb.data.replace('pend_snooze_7d_', '')
     await process_pending_snooze(cb, nid, 7, "days")
@@ -1363,11 +1355,15 @@ async def process_pending_snooze(cb, nid, val, unit):
     n['last_reminder_time'] = None
     await sync_notification_to_calendar(nid, 'create')
     save_data()
-    await cb.message.edit_text(f"⏰ **Уведомление отложено на {val} {unit}**\n🕐 Новое время: {new_time.strftime('%d.%m.%Y %H:%M')}")
+    try:
+        await cb.message.edit_text(f"⏰ **Уведомление отложено на {val} {unit}**\n🕐 Новое время: {new_time.strftime('%d.%m.%Y %H:%M')}")
+    except Exception as e:
+        logger.error(f"process_pending_snooze edit error: {e}")
+        await cb.message.answer(f"⏰ **Уведомление отложено на {val} {unit}**\n🕐 Новое время: {new_time.strftime('%d.%m.%Y %H:%M')}")
     await update_pending_list(cb.from_user.id, persistent=True)
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('pend_snooze_custom_'), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('pend_snooze_custom_'), state='*')
 async def snooze_custom(cb, state):
     nid = cb.data.replace('pend_snooze_custom_', '')
     await state.update_data(snooze_notif_id=nid)
@@ -1475,25 +1471,25 @@ async def settings_menu(msg, state):
     await state.finish()
     await settings_menu_handler(msg, state)
 
-@dp.callback_query_handler(lambda c: c.data.startswith("cal_prev_"), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("cal_prev_"), state='*')
 async def cal_prev(cb):
     parts = cb.data.replace("cal_prev_", "").split("_")
     await show_calendar_events(cb.from_user.id, int(parts[0]), int(parts[1]), persistent=True)
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("cal_next_"), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("cal_next_"), state='*')
 async def cal_next(cb):
     parts = cb.data.replace("cal_next_", "").split("_")
     await show_calendar_events(cb.from_user.id, int(parts[0]), int(parts[1]), persistent=True)
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("cal_refresh_"), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("cal_refresh_"), state='*')
 async def cal_refresh(cb):
     parts = cb.data.replace("cal_refresh_", "").split("_")
     await show_calendar_events(cb.from_user.id, int(parts[0]), int(parts[1]), force_refresh=True, persistent=True)
     await cb.answer("✅ Календарь обновлён")
 
-@dp.callback_query_handler(lambda c: c.data.startswith("cal_sync_"), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("cal_sync_"), state='*')
 async def cal_sync(cb):
     parts = cb.data.replace("cal_sync_", "").split("_")
     y, m = int(parts[0]), int(parts[1])
@@ -1546,7 +1542,7 @@ async def edit_calendar(cb, state):
     await EditCalendarEventStates.waiting_for_event_selection.set()
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("sel_cal_event_"), state=EditCalendarEventStates.waiting_for_event_selection)
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("sel_cal_event_"), state=EditCalendarEventStates.waiting_for_event_selection)
 async def sel_cal_event(cb, state):
     sid = cb.data.replace("sel_cal_event_", "")
     full = event_id_map.get(sid)
@@ -1727,7 +1723,7 @@ async def set_timezone(cb):
     await cb.message.edit_text(f"🌍 **Выберите часовой пояс**\n\nТекущий: {config.get('timezone', 'Europe/Moscow')}", reply_markup=kb)
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("tz_"), state='*')
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("tz_"), state='*')
 async def save_tz(cb, state):
     name = cb.data.replace("tz_", "")
     tz = TIMEZONES.get(name, 'Europe/Moscow')
