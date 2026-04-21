@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.1"
+BOT_VERSION = "3.2"
 BOT_VERSION_DATE = "21.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -284,6 +284,82 @@ DESCRIPTION:{description[:500]}"""
             logger.error(f"delete_event error: {e}")
             return False
 
+    async def add_exception_to_recurring_event(self, event_url, exception_date):
+        """
+        Добавляет исключение (EXDATE) для повторяющегося события на указанную дату
+        Это удаляет только одно вхождение, не затрагивая остальные
+        """
+        try:
+            cal = self.get_default_calendar()
+            if not cal:
+                return False
+            
+            # Находим событие
+            target_event = None
+            for event in cal.events():
+                if str(event.url) == event_url:
+                    target_event = event
+                    break
+            
+            if not target_event:
+                return False
+            
+            # Получаем текущий iCalendar данных
+            ical_data = target_event.data
+            
+            # Преобразуем дату исключения в формат UTC для EXDATE
+            tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+            if exception_date.tzinfo is None:
+                exception_date = tz.localize(exception_date)
+            exception_utc = exception_date.astimezone(pytz.UTC)
+            exdate_str = exception_utc.strftime('%Y%m%dT%H%M%SZ')
+            
+            # Проверяем, есть ли уже EXDATE
+            if 'EXDATE;' in ical_data or 'EXDATE:' in ical_data:
+                # Добавляем к существующему EXDATE
+                lines = ical_data.split('\n')
+                new_lines = []
+                for line in lines:
+                    if line.startswith('EXDATE'):
+                        # Добавляем новую дату к существующей
+                        if exdate_str not in line:
+                            new_lines.append(line.rstrip('\r') + ',' + exdate_str)
+                        else:
+                            new_lines.append(line)
+                    else:
+                        new_lines.append(line)
+                ical_data = '\n'.join(new_lines)
+            else:
+                # Создаем новый EXDATE
+                # Находим место для вставки (после RRULE или перед END:VEVENT)
+                lines = ical_data.split('\n')
+                inserted = False
+                new_lines = []
+                for line in lines:
+                    new_lines.append(line)
+                    if not inserted and (line.startswith('RRULE:') or line.startswith('RRULE;')):
+                        new_lines.append(f'EXDATE:{exdate_str}')
+                        inserted = True
+                    elif not inserted and line.startswith('END:VEVENT'):
+                        new_lines.insert(-1, f'EXDATE:{exdate_str}')
+                        inserted = True
+                
+                if not inserted:
+                    new_lines.insert(-1, f'EXDATE:{exdate_str}')
+                
+                ical_data = '\n'.join(new_lines)
+            
+            # Сохраняем обновленное событие
+            target_event.data = ical_data
+            target_event.save()
+            
+            logger.info(f"Добавлено исключение для события {event_url} на дату {exception_date.strftime('%Y-%m-%d')}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"add_exception_to_recurring_event error: {e}")
+            return False
+
     async def update_event(self, url, new_summary=None, new_start=None):
         try:
             if not await self.delete_event(url):
@@ -404,7 +480,6 @@ async def check_caldav_connection():
     return await api.test_connection()
 
 def cleanup_old_completed_occurrences():
-    """Удаляет записи о выполненных вхождениях старше 30 дней"""
     global completed_occurrences
     now = get_current_time()
     thirty_days_ago = now - timedelta(days=30)
@@ -429,7 +504,6 @@ def cleanup_old_completed_occurrences():
         save_data()
 
 def clear_pending_for_completed():
-    """Удаляет из pending_notifications те уведомления, которые уже отмечены как выполненные"""
     global pending_notifications
     to_delete = []
     for nid, n in pending_notifications.items():
@@ -618,7 +692,6 @@ def load_data():
         notifications_enabled = config.get('notifications_enabled', True)
         completed_occurrences = set(config.get('completed_occurrences', []))
     
-    # Очищаем pending от уже отмеченных событий
     clear_pending_for_completed()
     
     logger.info(f"Загружено: {len(notifications)} уведомлений, {len(pending_notifications)} неотмеченных, обработанных вхождений: {len(completed_occurrences)}")
@@ -653,13 +726,10 @@ async def sync_calendar_to_pending():
             
             occ_key = f"{ev['id']}_{dt.strftime('%Y%m%d')}"
             
-            # Пропускаем уже отмеченные вхождения
             if occ_key in completed_occurrences:
                 continue
             
-            # Добавляем только просроченные события (время уже прошло)
             if dt <= now:
-                # Проверяем, нет ли уже такого в pending
                 exists = False
                 for n in pending_notifications.values():
                     if n.get('calendar_event_key') == occ_key:
@@ -944,7 +1014,7 @@ async def cmd_start(msg, state):
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
         return await msg.reply("❌ Нет доступа")
     ok, _ = await check_caldav_connection()
-    welcome = f"👋 **Добро пожаловать!**\n🤖 Версия v{BOT_VERSION}\n📧 CalDAV: {'✅ Доступен' if ok else '❌ Ошибка'}\n🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}\n\n⚠️ **Неотмеченные уведомления** — это напоминания, время которых уже истекло. Они будут повторяться каждый час, пока вы не отметите их как выполненные.\n\n🔄 **Для повторяющихся событий:** при отметке \"Выполнено\" удаляется только сегодняшнее вхождение, следующее остаётся в календаре.\n\n📅 **В календаре повторяющиеся события показываются только на сегодня и завтра.**"
+    welcome = f"👋 **Добро пожаловать!**\n🤖 Версия v{BOT_VERSION}\n📧 CalDAV: {'✅ Доступен' if ok else '❌ Ошибка'}\n🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}\n\n⚠️ **Неотмеченные уведомления** — это напоминания, время которых уже истекло. Они будут повторяться каждый час, пока вы не отметите их как выполненные.\n\n🔄 **Для повторяющихся событий:** при отметке \"Выполнено\" удаляется только сегодняшнее вхождение в календаре, следующие остаются.\n\n📅 **В календаре повторяющиеся события показываются только на сегодня и завтра.**"
     if not ok and get_caldav_available():
         welcome += "\n\n⚠️ Проблема с CalDAV. Проверьте пароль приложения."
     if not DATEUTIL_AVAILABLE:
@@ -1250,7 +1320,7 @@ async def pend_select(cb, state):
         dt = tz.localize(dt)
     else:
         dt = dt.astimezone(tz)
-    recurring_info = "\n🔄 **Это повторяющееся событие** — при отметке \"Выполнено\" удалится только сегодняшнее вхождение." if n.get('is_recurring', False) else ""
+    recurring_info = "\n🔄 **Это повторяющееся событие** — при отметке \"Выполнено\" удалится только сегодняшнее вхождение в календаре, следующие останутся." if n.get('is_recurring', False) else ""
     text = f"📝 **Уведомление:**\n{n['text']}{recurring_mark}\n\n⏰ **Время:** {dt.strftime('%d.%m.%Y %H:%M')}\n🔄 **Повторов:** {n.get('repeat_count', 0)}{recurring_info}\n\nВыберите действие:"
     
     try:
@@ -1269,14 +1339,29 @@ async def pend_done(cb):
     notif = pending_notifications[nid]
     logger.info(f"Отметка выполнено для {nid}, is_recurring={notif.get('is_recurring', False)}")
     
-    # Для повторяющихся событий сохраняем отметку о выполнении
+    # Для повторяющихся событий добавляем исключение в календарь (удаляем только сегодняшнее вхождение)
     if notif.get('is_recurring', False):
         occ_key = notif.get('calendar_event_key')
+        event_id = notif.get('calendar_event_id')
+        event_date_str = notif.get('event_date')
+        
         if occ_key:
             completed_occurrences.add(occ_key)
             save_data()
             logger.info(f"Добавлено обработанное вхождение: {occ_key}")
             cleanup_old_completed_occurrences()
+        
+        # Добавляем исключение в календарь (EXDATE) - удаляем только это вхождение
+        if event_id and event_date_str:
+            try:
+                api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
+                # Парсим дату события
+                tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+                exception_date = tz.localize(datetime.strptime(event_date_str, '%Y%m%d').replace(hour=7, minute=0))
+                await api.add_exception_to_recurring_event(event_id, exception_date)
+                logger.info(f"Добавлено исключение в календарь для {event_id} на дату {event_date_str}")
+            except Exception as e:
+                logger.error(f"Ошибка при добавлении исключения в календарь: {e}")
     else:
         # Для обычных событий удаляем из календаря
         if 'calendar_event_id' in notif:
@@ -1295,7 +1380,7 @@ async def pend_done(cb):
     await show_calendar_events(cb.from_user.id, now.year, now.month, force_refresh=True, persistent=True)
     
     if notif.get('is_recurring', False):
-        await cb.answer("✅ Текущее вхождение повторяющегося события отмечено как выполненное!")
+        await cb.answer("✅ Текущее вхождение повторяющегося события отмечено как выполненное и удалено из календаря! Следующие вхождения остались.")
     else:
         await cb.answer("✅ Уведомление выполнено и удалено!")
 
