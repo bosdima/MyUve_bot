@@ -13,6 +13,7 @@ from uuid import uuid4
 
 try:
     from dateutil.rrule import rrulestr
+    from dateutil.rrule import rrule as rrrule
     DATEUTIL_AVAILABLE = True
 except ImportError:
     DATEUTIL_AVAILABLE = False
@@ -55,7 +56,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "5.2"
+BOT_VERSION = "5.3"
 BOT_VERSION_DATE = "22.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -242,7 +243,7 @@ END:VCALENDAR"""
             logger.error(f"add_exception_to_recurring error: {e}")
             return False
 
-    async def get_events(self, from_date: datetime, to_date: datetime) -> List[Dict]:
+    async def get_events(self, from_date: datetime, to_date: datetime, expand: bool = True) -> List[Dict]:
         """Получает события из календаря за указанный период"""
         try:
             cal = self.get_calendar()
@@ -258,9 +259,16 @@ END:VCALENDAR"""
             from_utc = from_date.astimezone(pytz.UTC)
             to_utc = to_date.astimezone(pytz.UTC)
             
-            # Используем expand=False чтобы получить повторяющиеся события как одно событие с RRULE
-            events = cal.date_search(start=from_utc, end=to_utc, expand=False)
+            # Используем expand=True чтобы развернуть повторяющиеся события
+            # Но это может дать много событий, поэтому ограничим период
+            try:
+                events = cal.date_search(start=from_utc, end=to_utc, expand=expand)
+            except:
+                # Если expand не работает, пробуем без него
+                events = cal.date_search(start=from_utc, end=to_utc, expand=False)
+            
             result = []
+            seen_events = {}  # Для дедупликации
             
             for ev in events:
                 try:
@@ -277,22 +285,25 @@ END:VCALENDAR"""
                     else:
                         dtstart = dtstart.astimezone(tz)
                     
+                    # Пропускаем события вне нашего периода
+                    if dtstart < from_date or dtstart > to_date:
+                        continue
+                    
                     # Проверяем, является ли событие повторяющимся
                     is_recurring = hasattr(vevent, 'rrule') and vevent.rrule.value is not None
                     
-                    # Получаем EXDATE если есть
-                    exdates = []
-                    if hasattr(vevent, 'exdate'):
-                        for exdate in vevent.exdate:
-                            exdates.append(str(exdate.value))
+                    # Создаем уникальный ключ для дедупликации (url + дата)
+                    event_key = f"{ev.url}_{dtstart.strftime('%Y%m%d')}"
+                    if event_key in seen_events:
+                        continue
+                    seen_events[event_key] = True
                     
                     result.append({
                         'url': str(ev.url),
                         'summary': str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия',
                         'start': dtstart,
                         'is_recurring': is_recurring,
-                        'rrule': str(vevent.rrule.value) if is_recurring else None,
-                        'exdates': exdates
+                        'original_start': dtstart
                     })
                 except Exception as e:
                     logger.error(f"parse event error: {e}")
@@ -316,27 +327,25 @@ async def check_caldav_connection():
     return False, "Ошибка"
 
 async def update_calendar_cache():
-    """Обновляет кэш календаря на текущий и следующий месяц"""
+    """Обновляет кэш календаря на 60 дней вперед"""
     global calendar_events_cache, last_sync_time
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     
-    # Получаем события на текущий месяц и следующие 2 месяца
-    events = []
-    for month_offset in range(0, 3):
-        year = now.year
-        month = now.month + month_offset
-        while month > 12:
-            month -= 12
-            year += 1
-        start = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(datetime(year, month, 1, 0, 0, 0))
-        if month == 12:
-            end = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(datetime(year+1, 1, 1, 0, 0, 0)) - timedelta(seconds=1)
-        else:
-            end = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(datetime(year, month+1, 1, 0, 0, 0)) - timedelta(seconds=1)
-        
-        month_events = await api.get_events(start, end)
-        events.extend(month_events)
+    # Получаем события на 60 дней вперед (это достаточно для отображения)
+    end_date = now + timedelta(days=60)
+    
+    events = await api.get_events(now, end_date, expand=True)
+    
+    # Дедупликация: группируем по уникальному ключу (url + дата)
+    unique_events = {}
+    for ev in events:
+        key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d')}"
+        if key not in unique_events:
+            unique_events[key] = ev
+    
+    events = list(unique_events.values())
+    events.sort(key=lambda x: x['start'])
     
     calendar_events_cache['all'] = events
     last_sync_time = now
@@ -371,23 +380,29 @@ async def get_pending_notifications() -> List[Dict]:
     return pending
 
 async def get_upcoming_events() -> List[Tuple[datetime, Dict]]:
-    """Получает предстоящие события для отображения"""
+    """Получает предстоящие события для отображения (только на сегодня и завтра)"""
     now = get_current_time()
     await update_calendar_cache()
     events = calendar_events_cache.get('all', [])
     
+    today = now.date()
+    tomorrow = today + timedelta(days=1)
+    day_after_tomorrow = tomorrow + timedelta(days=1)
+    
     future = []
     for ev in events:
         dt = ev['start']
-        # Показываем события, которые еще не начались (включая сегодняшние)
-        if dt >= now - timedelta(minutes=30):  # Включаем события за последние 30 минут
+        event_date = dt.date()
+        
+        # Показываем только события на сегодня и завтра
+        if event_date == today or event_date == tomorrow:
             future.append((dt, ev))
     
     future.sort(key=lambda x: x[0])
     return future
 
 async def get_formatted_calendar_events():
-    """Форматирует события календаря для отображения"""
+    """Форматирует события календаря для отображения (только сегодня и завтра)"""
     future = await get_upcoming_events()
     
     if not future:
@@ -397,28 +412,43 @@ async def get_formatted_calendar_events():
     today = now.date()
     tomorrow = today + timedelta(days=1)
     
-    text = "📅 **ВСЕ СОБЫТИЯ КАЛЕНДАРЯ**\n\n"
+    text = "📅 **СОБЫТИЯ НА СЕГОДНЯ И ЗАВТРА**\n\n"
     
     # Группируем события по датам
-    current_date = None
-    for dt, ev in future[:50]:
-        weekday = ["пн","вт","ср","чт","пт","сб","вс"][dt.weekday()]
-        
-        if dt.date() != current_date:
-            if current_date is not None:
-                text += "\n"
-            current_date = dt.date()
-            
-            if dt.date() == today:
-                text += f"🔴 **СЕГОДНЯ**\n"
-            elif dt.date() == tomorrow:
-                text += f"🟠 **ЗАВТРА**\n"
-            else:
-                text += f"📌 **{dt.day:02d}.{dt.month:02d}.{dt.year}** ({weekday})\n"
-        
-        time_str = dt.strftime('%H:%M')
-        recurring_mark = " 🔁" if ev['is_recurring'] else ""
-        text += f"   • {time_str} — **{ev['summary']}**{recurring_mark}\n"
+    today_events = []
+    tomorrow_events = []
+    
+    for dt, ev in future:
+        if dt.date() == today:
+            today_events.append((dt, ev))
+        elif dt.date() == tomorrow:
+            tomorrow_events.append((dt, ev))
+    
+    # Отображаем события на сегодня
+    if today_events:
+        text += f"🔴 **СЕГОДНЯ**\n"
+        for dt, ev in today_events:
+            time_str = dt.strftime('%H:%M')
+            recurring_mark = " 🔁" if ev['is_recurring'] else ""
+            text += f"   • {time_str} — **{ev['summary']}**{recurring_mark}\n"
+        text += "\n"
+    
+    # Отображаем события на завтра
+    if tomorrow_events:
+        text += f"🟠 **ЗАВТРА**\n"
+        for dt, ev in tomorrow_events:
+            time_str = dt.strftime('%H:%M')
+            recurring_mark = " 🔁" if ev['is_recurring'] else ""
+            text += f"   • {time_str} — **{ev['summary']}**{recurring_mark}\n"
+        text += "\n"
+    
+    # Добавляем информацию о других событиях (если есть)
+    all_events = calendar_events_cache.get('all', [])
+    future_events = [ev for ev in all_events if ev['start'].date() > tomorrow]
+    if future_events:
+        text += f"📌 **А также есть события на другие дни**\n"
+        text += f"   • Всего событий в календаре: {len(all_events)}\n"
+        text += f"   • Из них предстоит: {len([e for e in all_events if e['start'] >= now])}\n"
     
     if last_sync_time:
         text += f"\n🔄 *Последняя синхронизация:* {last_sync_time.strftime('%d.%m.%Y %H:%M:%S')}"
@@ -429,8 +459,59 @@ async def show_calendar_events(chat_id, persistent=False):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("🔄 Обновить", callback_data="refresh_calendar"),
-        InlineKeyboardButton("📥 Синхр.", callback_data="sync_calendar")
+        InlineKeyboardButton("📥 Синхр.", callback_data="sync_calendar"),
+        InlineKeyboardButton("📋 Все события", callback_data="all_events")
     )
+    if persistent:
+        await send_persistent_message(chat_id, text, reply_markup=kb)
+    else:
+        await send_with_auto_delete(chat_id, text, reply_markup=kb, delay=3600)
+
+async def show_all_events(chat_id, persistent=False):
+    """Показывает все события календаря (без ограничения по датам)"""
+    await update_calendar_cache()
+    events = calendar_events_cache.get('all', [])
+    now = get_current_time()
+    
+    if not events:
+        text = "📅 **В календаре нет событий**"
+    else:
+        # Группируем по датам
+        events_by_date = {}
+        for ev in events:
+            date_key = ev['start'].date()
+            if date_key not in events_by_date:
+                events_by_date[date_key] = []
+            events_by_date[date_key].append(ev)
+        
+        text = "📅 **ВСЕ СОБЫТИЯ КАЛЕНДАРЯ**\n\n"
+        today = now.date()
+        
+        for date_key in sorted(events_by_date.keys()):
+            if date_key < today:
+                prefix = "✅ "
+            elif date_key == today:
+                prefix = "🔴 "
+            elif date_key == today + timedelta(days=1):
+                prefix = "🟠 "
+            else:
+                prefix = "📌 "
+            
+            weekday = ["пн","вт","ср","чт","пт","сб","вс"][date_key.weekday()]
+            text += f"{prefix}**{date_key.day:02d}.{date_key.month:02d}.{date_key.year}** ({weekday})\n"
+            
+            for ev in events_by_date[date_key]:
+                time_str = ev['start'].strftime('%H:%M')
+                recurring_mark = " 🔁" if ev['is_recurring'] else ""
+                text += f"   • {time_str} — **{ev['summary']}**{recurring_mark}\n"
+            text += "\n"
+        
+        if len(text) > 4000:
+            text = text[:3500] + "\n\n... и ещё события"
+    
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("◀️ Назад к календарю", callback_data="back_to_calendar"))
+    
     if persistent:
         await send_persistent_message(chat_id, text, reply_markup=kb)
     else:
@@ -712,7 +793,8 @@ async def cmd_start(msg, state):
 • При отметке "Выполнено" событие удаляется из календаря
 • Для повторяющихся событий удаляется только текущее вхождение
 
-📅 **В календаре отображаются все события**"""
+📅 **В календаре показываются события на сегодня и завтра**
+   (кнопка "Все события" покажет полный список)"""
     
     await send_persistent_message(msg.chat.id, welcome)
     await send_persistent_message(msg.chat.id, "👋 **Выберите действие:**", reply_markup=get_main_keyboard())
@@ -870,6 +952,16 @@ async def sync_calendar(cb):
     await update_calendar_cache()
     await show_calendar_events(cb.from_user.id, persistent=True)
     await cb.answer("✅ Синхронизация завершена")
+
+@dp.callback_query_handler(lambda c: c.data == "all_events", state='*')
+async def handle_all_events(cb):
+    await show_all_events(cb.from_user.id, persistent=True)
+    await cb.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "back_to_calendar", state='*')
+async def back_to_calendar(cb):
+    await show_calendar_events(cb.from_user.id, persistent=True)
+    await cb.answer()
 
 # ---------- НАСТРОЙКИ ----------
 @dp.message_handler(lambda m: m.text == "⚙️ Настройки", state='*')
