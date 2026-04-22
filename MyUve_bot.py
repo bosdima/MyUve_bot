@@ -1,6 +1,8 @@
 import logging
+import logging.handlers
 import json
 import re
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import pytz
@@ -19,6 +21,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Добавляем файловый обработчик
 file_handler = logging.handlers.RotatingFileHandler(
     LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding='utf-8'
 )
@@ -31,7 +34,6 @@ from telegram.ext import (
     MessageHandler, filters, ConversationHandler, ContextTypes
 )
 from dotenv import load_dotenv
-import os
 import requests
 
 load_dotenv()
@@ -39,7 +41,7 @@ load_dotenv()
 # Настройки
 TELEGRAM_BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID')) if os.getenv('ADMIN_ID') else None
-YANDEX_OAUTH_TOKEN = os.getenv('YANDEX_API_TOKEN')  # OAuth-токен Яндекс
+YANDEX_OAUTH_TOKEN = os.getenv('YANDEX_API_TOKEN')
 YANDEX_CLIENT_ID = os.getenv('YANDEX_CLIENT_ID')
 YANDEX_CLIENT_SECRET = os.getenv('YANDEX_CLIENT_SECRET')
 
@@ -47,7 +49,7 @@ YANDEX_CALENDAR_API_URL = "https://api.calendar.yandex.net/v1"
 YANDEX_OAUTH_AUTH_URL = "https://oauth.yandex.ru/authorize"
 YANDEX_OAUTH_TOKEN_URL = "https://oauth.yandex.ru/token"
 
-BOT_VERSION = "7.0"
+BOT_VERSION = "7.1"
 BOT_VERSION_DATE = "22.04.2026"
 
 # Состояния для ConversationHandler
@@ -71,8 +73,8 @@ TIMEZONES = {
     'Камчатка (UTC+12)': 'Asia/Kamchatka'
 }
 
-# Загрузка конфигурации
 def load_config():
+    """Загружает конфигурацию"""
     global notifications_enabled, selected_calendar_id
     config_file = 'config.json'
     if os.path.exists(config_file):
@@ -85,6 +87,7 @@ def load_config():
             pass
 
 def save_config():
+    """Сохраняет конфигурацию"""
     config_file = 'config.json'
     config = {
         'notifications_enabled': notifications_enabled,
@@ -95,10 +98,12 @@ def save_config():
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 def get_current_time():
+    """Возвращает текущее время в московском часовом поясе"""
     tz = pytz.timezone('Europe/Moscow')
     return datetime.now(tz)
 
 def parse_datetime(date_str: str):
+    """Парсит дату из строки"""
     now = get_current_time()
     tz = pytz.timezone('Europe/Moscow')
     patterns = [
@@ -136,6 +141,7 @@ def parse_datetime(date_str: str):
     return None
 
 def get_main_keyboard():
+    """Возвращает главную клавиатуру"""
     kb = ReplyKeyboardMarkup(
         [
             ["➕ Добавить", "📅 Календарь"],
@@ -146,6 +152,8 @@ def get_main_keyboard():
     return kb
 
 class YandexCalendarAPI:
+    """Класс для работы с Яндекс Календарем"""
+    
     def __init__(self, token: str):
         self.token = token
         self.calendar_id = "primary"
@@ -162,24 +170,23 @@ class YandexCalendarAPI:
             if end_time is None:
                 end_time = start_time + timedelta(hours=1)
             
-            tz = 'Europe/Moscow'
-            
             event_data = {
                 "summary": summary[:255],
                 "start": {
                     "dateTime": start_time.isoformat(),
-                    "timeZone": tz
+                    "timeZone": "Europe/Moscow"
                 },
                 "end": {
                     "dateTime": end_time.isoformat(),
-                    "timeZone": tz
+                    "timeZone": "Europe/Moscow"
                 }
             }
             
             response = requests.post(
                 f"{YANDEX_CALENDAR_API_URL}/calendars/{self.calendar_id}/events",
                 headers=self._get_headers(),
-                json=event_data
+                json=event_data,
+                timeout=30
             )
             
             if response.status_code == 201:
@@ -198,7 +205,8 @@ class YandexCalendarAPI:
         try:
             response = requests.delete(
                 f"{YANDEX_CALENDAR_API_URL}/calendars/{self.calendar_id}/events/{event_id}",
-                headers=self._get_headers()
+                headers=self._get_headers(),
+                timeout=30
             )
             if response.status_code == 204:
                 logger.info(f"Событие удалено: {event_id}")
@@ -221,7 +229,8 @@ class YandexCalendarAPI:
             response = requests.get(
                 f"{YANDEX_CALENDAR_API_URL}/calendars/{self.calendar_id}/events",
                 headers=self._get_headers(),
-                params=params
+                params=params,
+                timeout=30
             )
             
             if response.status_code == 200:
@@ -268,6 +277,7 @@ class YandexCalendarAPI:
             return []
 
 def get_yandex_api_available():
+    """Проверяет доступность API"""
     return bool(YANDEX_OAUTH_TOKEN)
 
 def update_calendar_cache():
@@ -496,7 +506,7 @@ async def add_event_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начать добавление события"""
     if not get_yandex_api_available():
         await update.message.reply_text("❌ **Сначала настройте доступ к Яндекс.Календарю!**\n\nНажмите кнопку 'Настройки'", parse_mode='Markdown')
-        return
+        return ConversationHandler.END
     
     await update.message.reply_text("✏️ **Введите текст уведомления:**\n\n💡 Для отмены /cancel", parse_mode='Markdown')
     return WAITING_FOR_EVENT_TEXT
@@ -631,9 +641,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("tz_"):
         name = query.data.replace("tz_", "")
         tz = TIMEZONES.get(name, 'Europe/Moscow')
-        config = {'timezone': tz}
+        config_data = {'timezone': tz}
         with open('config.json', 'w', encoding='utf-8') as f:
-            json.dump(config, f)
+            json.dump(config_data, f)
         await query.edit_message_text(f"✅ **Часовой пояс установлен:** {name}", parse_mode='Markdown')
     
     elif query.data == "cancel_tz":
@@ -669,7 +679,10 @@ async def setup_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 4. В поле 'Callback URL' укажите: https://oauth.yandex.ru/verification_code
 5. Скопируйте Client ID в файл .env"""
         
-        await update.callback_query.edit_message_text(text, parse_mode='Markdown')
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, parse_mode='Markdown')
+        else:
+            await update.message.reply_text(text, parse_mode='Markdown')
         return
     
     auth_params = {
@@ -698,7 +711,10 @@ async def setup_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🔗 **Ссылка для авторизации:**
 {auth_url}"""
     
-    await update.callback_query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
 
 async def enter_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Запросить код авторизации"""
@@ -726,7 +742,7 @@ async def process_token_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("🔄 Обмен кода на токен...")
     
     try:
-        response = requests.post(YANDEX_OAUTH_TOKEN_URL, data=data)
+        response = requests.post(YANDEX_OAUTH_TOKEN_URL, data=data, timeout=30)
         
         if response.status_code == 200:
             result = response.json()
@@ -768,6 +784,7 @@ async def cancel_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- ОСНОВНАЯ ФУНКЦИЯ ----------
 def main():
+    """Главная функция запуска бота"""
     load_config()
     
     # Создаем приложение
