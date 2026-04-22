@@ -49,7 +49,7 @@ YANDEX_CALENDAR_API_URL = "https://api.calendar.yandex.net/v1"
 YANDEX_OAUTH_AUTH_URL = "https://oauth.yandex.ru/authorize"
 YANDEX_OAUTH_TOKEN_URL = "https://oauth.yandex.ru/token"
 
-BOT_VERSION = "7.1"
+BOT_VERSION = "7.2"
 BOT_VERSION_DATE = "22.04.2026"
 
 # Состояния для ConversationHandler
@@ -164,6 +164,36 @@ class YandexCalendarAPI:
             "Content-Type": "application/json"
         }
     
+    def test_connection(self) -> bool:
+        """Тестирует подключение к API"""
+        try:
+            response = requests.get(
+                f"{YANDEX_CALENDAR_API_URL}/calendars",
+                headers=self._get_headers(),
+                timeout=30
+            )
+            logger.info(f"Test connection status: {response.status_code}")
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"Test connection error: {e}")
+            return False
+    
+    def get_calendars(self) -> List[Dict]:
+        """Получает список календарей"""
+        try:
+            response = requests.get(
+                f"{YANDEX_CALENDAR_API_URL}/calendars",
+                headers=self._get_headers(),
+                timeout=30
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('items', [])
+            return []
+        except Exception as e:
+            logger.error(f"get_calendars error: {e}")
+            return []
+    
     def create_event(self, summary: str, start_time: datetime, end_time: datetime = None) -> Optional[str]:
         """Создает новое событие в календаре"""
         try:
@@ -182,12 +212,16 @@ class YandexCalendarAPI:
                 }
             }
             
+            logger.info(f"Creating event: {event_data}")
+            
             response = requests.post(
                 f"{YANDEX_CALENDAR_API_URL}/calendars/{self.calendar_id}/events",
                 headers=self._get_headers(),
                 json=event_data,
                 timeout=30
             )
+            
+            logger.info(f"Create event response: {response.status_code}")
             
             if response.status_code == 201:
                 data = response.json()
@@ -211,6 +245,7 @@ class YandexCalendarAPI:
             if response.status_code == 204:
                 logger.info(f"Событие удалено: {event_id}")
                 return True
+            logger.error(f"Delete event failed: {response.status_code}")
             return False
         except Exception as e:
             logger.error(f"delete_event error: {e}")
@@ -219,12 +254,18 @@ class YandexCalendarAPI:
     def get_events(self, from_date: datetime, to_date: datetime) -> List[Dict]:
         """Получает события из календаря за указанный период"""
         try:
+            # Форматируем даты для API
+            from_str = from_date.strftime('%Y-%m-%dT00:00:00+03:00')
+            to_str = to_date.strftime('%Y-%m-%dT23:59:59+03:00')
+            
             params = {
-                "timeMin": from_date.isoformat(),
-                "timeMax": to_date.isoformat(),
+                "timeMin": from_str,
+                "timeMax": to_str,
                 "singleEvents": "true",
                 "orderBy": "startTime"
             }
+            
+            logger.info(f"Getting events from {from_str} to {to_str}")
             
             response = requests.get(
                 f"{YANDEX_CALENDAR_API_URL}/calendars/{self.calendar_id}/events",
@@ -233,8 +274,12 @@ class YandexCalendarAPI:
                 timeout=30
             )
             
+            logger.info(f"Get events response: {response.status_code}")
+            
             if response.status_code == 200:
                 data = response.json()
+                logger.info(f"Raw API response: {json.dumps(data, ensure_ascii=False)[:500]}")
+                
                 events = []
                 tz = pytz.timezone('Europe/Moscow')
                 
@@ -246,9 +291,12 @@ class YandexCalendarAPI:
                         if not start_str:
                             continue
                         
+                        # Парсим время начала
                         if 'T' in start_str:
+                            # Событие с временем
                             dt = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
                         else:
+                            # Целодневное событие
                             dt = datetime.fromisoformat(start_str)
                             dt = tz.localize(dt)
                         
@@ -268,9 +316,10 @@ class YandexCalendarAPI:
                         logger.error(f"Parse event error: {e}")
                         continue
                 
+                logger.info(f"Parsed {len(events)} events")
                 return events
             else:
-                logger.error(f"Get events error: {response.status_code}")
+                logger.error(f"Get events error: {response.status_code} - {response.text}")
                 return []
         except Exception as e:
             logger.error(f"get_events error: {e}")
@@ -291,12 +340,26 @@ def update_calendar_cache():
         return []
     
     api = YandexCalendarAPI(YANDEX_OAUTH_TOKEN)
+    
+    # Проверяем подключение
+    if not api.test_connection():
+        logger.error("API connection failed")
+        calendar_events_cache = []
+        last_sync_time = now
+        return []
+    
+    # Получаем события на 60 дней вперед
     end_date = now + timedelta(days=60)
     events = api.get_events(now, end_date)
     
     calendar_events_cache = events
     last_sync_time = now
     logger.info(f"Обновлён кэш календаря: {len(events)} событий")
+    
+    # Логируем первые 5 событий для отладки
+    for i, ev in enumerate(events[:5]):
+        logger.info(f"Event {i+1}: {ev['summary']} at {ev['start']}")
+    
     return events
 
 def get_pending_notifications() -> List[Dict]:
@@ -319,6 +382,7 @@ def get_pending_notifications() -> List[Dict]:
             })
     
     pending.sort(key=lambda x: x['time'])
+    logger.info(f"Found {len(pending)} pending notifications")
     return pending
 
 def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
@@ -338,6 +402,7 @@ def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
             result.append((dt, ev))
     
     result.sort(key=lambda x: x[0])
+    logger.info(f"Found {len(result)} events for today/tomorrow")
     return result
 
 def get_formatted_calendar_events() -> str:
@@ -349,9 +414,13 @@ def get_formatted_calendar_events() -> str:
             return "📅 **Требуется настройка API**\n\nНажмите кнопку \"Настройки\" и получите OAuth токен."
         
         if not calendar_events_cache:
+            # Проверяем, есть ли ошибка подключения
+            api = YandexCalendarAPI(YANDEX_OAUTH_TOKEN)
+            if not api.test_connection():
+                return "📅 **⚠️ Ошибка подключения к API**\n\nПроверьте токен и интернет-соединение.\n\nНажмите 'Настройки' → 'Проверить календарь'"
             return "📅 **В календаре нет событий**\n\nДобавьте события через Яндекс.Календарь или кнопку ➕ Добавить"
         else:
-            return "📅 **Нет событий на сегодня и завтра**\n\nЕсть события на другие дни."
+            return "📅 **Нет событий на сегодня и завтра**\n\nЕсть события на другие дни. Нажмите 'Все события' для просмотра."
     
     now = get_current_time()
     today = now.date()
@@ -429,11 +498,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(welcome, parse_mode='Markdown')
         await update.message.reply_text("👋 **Выберите действие:**", reply_markup=get_main_keyboard(), parse_mode='Markdown')
     else:
-        update_calendar_cache()
+        # Проверяем подключение
+        api = YandexCalendarAPI(YANDEX_OAUTH_TOKEN)
+        connection_ok = api.test_connection()
+        
+        if connection_ok:
+            update_calendar_cache()
+            connection_status = "✅ Подключено"
+        else:
+            connection_status = "❌ Ошибка подключения"
         
         welcome = f"""👋 **Добро пожаловать!**
 🤖 Версия v{BOT_VERSION}
-📧 Яндекс API: ✅ Подключено
+📧 Яндекс API: {connection_status}
 🌍 Часовой пояс: Europe/Moscow
 
 📌 **Как это работает:**
@@ -466,7 +543,8 @@ async def button_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("🔄 Обновить", callback_data="refresh")],
-        [InlineKeyboardButton("📋 Все события", callback_data="all_events")]
+        [InlineKeyboardButton("📋 Все события", callback_data="all_events")],
+        [InlineKeyboardButton("🔍 Проверить API", callback_data="check_api")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -486,12 +564,20 @@ async def button_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать настройки"""
     status = "🔔 Вкл" if notifications_enabled else "🔕 Выкл"
-    api_status = "✅ Настроен" if get_yandex_api_available() else "❌ Не настроен"
+    
+    # Проверяем подключение
+    api = YandexCalendarAPI(YANDEX_OAUTH_TOKEN) if YANDEX_OAUTH_TOKEN else None
+    if api:
+        connection_ok = api.test_connection()
+        api_status = "✅ Подключено" if connection_ok else "❌ Ошибка подключения"
+    else:
+        api_status = "❌ Не настроен"
     
     keyboard = [
         [InlineKeyboardButton(f"Уведомления: {status}", callback_data="toggle_notify")],
         [InlineKeyboardButton("🌍 Часовой пояс", callback_data="set_timezone")],
         [InlineKeyboardButton("🔐 Настроить Яндекс API", callback_data="setup_token")],
+        [InlineKeyboardButton("🔍 Проверить API", callback_data="check_api")],
         [InlineKeyboardButton("ℹ️ Информация", callback_data="info")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -545,7 +631,7 @@ async def add_event_get_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         events_text = get_formatted_calendar_events()
         await update.message.reply_text(events_text, parse_mode='Markdown')
     else:
-        await update.message.reply_text("❌ **Ошибка при создании уведомления!**", parse_mode='Markdown')
+        await update.message.reply_text("❌ **Ошибка при создании уведомления!**\n\nПроверьте логи для деталей.", parse_mode='Markdown')
     
     return ConversationHandler.END
 
@@ -564,6 +650,47 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_calendar_cache()
         events_text = get_formatted_calendar_events()
         await query.edit_message_text(events_text, parse_mode='Markdown')
+    
+    elif query.data == "check_api":
+        if not get_yandex_api_available():
+            await query.edit_message_text("❌ **API не настроен!**\n\nНажмите 'Настройки' → 'Настроить Яндекс API'", parse_mode='Markdown')
+            return
+        
+        await query.edit_message_text("🔍 **Проверка подключения к API...**", parse_mode='Markdown')
+        
+        api = YandexCalendarAPI(YANDEX_OAUTH_TOKEN)
+        connection_ok = api.test_connection()
+        
+        if connection_ok:
+            # Пробуем получить список календарей
+            calendars = api.get_calendars()
+            calendars_text = f"\n📁 Найдено календарей: {len(calendars)}"
+            if calendars:
+                calendars_text += "\n📋 Список календарей:\n"
+                for cal in calendars[:5]:
+                    calendars_text += f"   • {cal.get('summary', 'Без названия')} (ID: {cal.get('id', '?')})\n"
+            
+            # Пробуем получить события
+            now = get_current_time()
+            end_date = now + timedelta(days=7)
+            events = api.get_events(now, end_date)
+            
+            await query.edit_message_text(
+                f"✅ **API работает корректно!**{calendars_text}\n\n📊 Найдено событий на неделю: {len(events)}",
+                parse_mode='Markdown'
+            )
+            
+            # Обновляем кэш
+            update_calendar_cache()
+        else:
+            await query.edit_message_text(
+                "❌ **Ошибка подключения к API!**\n\n"
+                "Проверьте:\n"
+                "1. Корректность OAuth токена\n"
+                "2. Интернет-соединение\n"
+                "3. Права доступа приложения",
+                parse_mode='Markdown'
+            )
     
     elif query.data == "all_events":
         update_calendar_cache()
@@ -607,7 +734,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         events_text = get_formatted_calendar_events()
         keyboard = [
             [InlineKeyboardButton("🔄 Обновить", callback_data="refresh")],
-            [InlineKeyboardButton("📋 Все события", callback_data="all_events")]
+            [InlineKeyboardButton("📋 Все события", callback_data="all_events")],
+            [InlineKeyboardButton("🔍 Проверить API", callback_data="check_api")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(events_text, parse_mode='Markdown', reply_markup=reply_markup)
@@ -662,7 +790,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📁 **Календарь:** primary
 📊 **Событий в кэше:** {len(calendar_events_cache)}
 
-📌 Бот работает с Яндекс.Календарем через REST API"""
+📌 Бот работает с Яндекс.Календарем через REST API
+
+💡 **Совет:** Если не видите события, нажмите "Проверить API" для диагностики"""
         await query.edit_message_text(info_text, parse_mode='Markdown')
 
 async def setup_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -822,7 +952,7 @@ def main():
     application.add_handler(MessageHandler(filters.Regex('^⚙️ Настройки$'), button_settings))
     
     # Callback обработчики
-    application.add_handler(CallbackQueryHandler(handle_callback, pattern='^(refresh|all_events|back|complete_all|toggle_notify|setup_token|set_timezone|cancel_tz|info)$'))
+    application.add_handler(CallbackQueryHandler(handle_callback, pattern='^(refresh|all_events|back|complete_all|toggle_notify|setup_token|set_timezone|cancel_tz|info|check_api)$'))
     application.add_handler(CallbackQueryHandler(setup_token, pattern='^setup_token$'))
     application.add_handler(CallbackQueryHandler(enter_code, pattern='^enter_code$'))
     application.add_handler(CallbackQueryHandler(cancel_setup, pattern='^cancel_setup$'))
