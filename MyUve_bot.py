@@ -56,7 +56,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "5.3"
+BOT_VERSION = "5.4"
 BOT_VERSION_DATE = "22.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -216,7 +216,6 @@ END:VCALENDAR"""
                 new_lines = []
                 for line in lines:
                     if line.startswith('EXDATE'):
-                        # Добавляем новую дату к существующей
                         current_exdates = line.replace('EXDATE:', '').replace('\r', '')
                         if exdate_str not in current_exdates:
                             new_lines.append(f'EXDATE:{current_exdates},{exdate_str}')
@@ -226,7 +225,6 @@ END:VCALENDAR"""
                         new_lines.append(line)
                 ical_data = '\n'.join(new_lines)
             else:
-                # Добавляем новую EXDATE после RRULE
                 lines = ical_data.split('\n')
                 new_lines = []
                 for line in lines:
@@ -243,8 +241,60 @@ END:VCALENDAR"""
             logger.error(f"add_exception_to_recurring error: {e}")
             return False
 
-    async def get_events(self, from_date: datetime, to_date: datetime, expand: bool = True) -> List[Dict]:
-        """Получает события из календаря за указанный период"""
+    async def get_recurring_occurrences(self, event, start_date, end_date, tz, exdates):
+        """Вычисляет вхождения повторяющегося события в заданном диапазоне"""
+        try:
+            vevent = event.vobject_instance.vevent
+            
+            if not hasattr(vevent, 'rrule') or vevent.rrule.value is None:
+                return []
+            
+            # Получаем время начала
+            dtstart = vevent.dtstart.value
+            if hasattr(dtstart, 'dt'):
+                dtstart = dtstart.dt
+            
+            if dtstart.tzinfo is None:
+                dtstart = tz.localize(dtstart)
+            
+            # Получаем RRULE строку
+            rrule_str = str(vevent.rrule.value)
+            
+            if not DATEUTIL_AVAILABLE:
+                return []
+            
+            # Парсим RRULE
+            rule = rrulestr(rrule_str, dtstart=dtstart)
+            
+            # Получаем все вхождения до end_date
+            occurrences = []
+            for occ in rule:
+                # Приводим к часовому поясу
+                if occ.tzinfo is None:
+                    occ = tz.localize(occ)
+                else:
+                    occ = occ.astimezone(tz)
+                
+                # Проверяем, что вхождение в нашем диапазоне
+                if occ < start_date:
+                    continue
+                if occ > end_date:
+                    break
+                
+                # Проверяем, не исключено ли это вхождение
+                occ_date_str = occ.strftime('%Y%m%d')
+                if occ_date_str in exdates:
+                    continue
+                
+                occurrences.append(occ)
+            
+            return occurrences
+        except Exception as e:
+            logger.error(f"get_recurring_occurrences error: {e}")
+            return []
+
+    async def get_events(self, from_date: datetime, to_date: datetime) -> List[Dict]:
+        """Получает события из календаря за указанный период, включая вхождения повторяющихся"""
         try:
             cal = self.get_calendar()
             if not cal:
@@ -256,21 +306,12 @@ END:VCALENDAR"""
             if to_date.tzinfo is None:
                 to_date = tz.localize(to_date)
             
-            from_utc = from_date.astimezone(pytz.UTC)
-            to_utc = to_date.astimezone(pytz.UTC)
-            
-            # Используем expand=True чтобы развернуть повторяющиеся события
-            # Но это может дать много событий, поэтому ограничим период
-            try:
-                events = cal.date_search(start=from_utc, end=to_utc, expand=expand)
-            except:
-                # Если expand не работает, пробуем без него
-                events = cal.date_search(start=from_utc, end=to_utc, expand=False)
+            # Получаем все события (не разворачивая повторяющиеся)
+            all_events = cal.events()
             
             result = []
-            seen_events = {}  # Для дедупликации
             
-            for ev in events:
+            for ev in all_events:
                 try:
                     vevent = ev.vobject_instance.vevent
                     
@@ -285,31 +326,60 @@ END:VCALENDAR"""
                     else:
                         dtstart = dtstart.astimezone(tz)
                     
-                    # Пропускаем события вне нашего периода
-                    if dtstart < from_date or dtstart > to_date:
-                        continue
-                    
                     # Проверяем, является ли событие повторяющимся
                     is_recurring = hasattr(vevent, 'rrule') and vevent.rrule.value is not None
                     
-                    # Создаем уникальный ключ для дедупликации (url + дата)
-                    event_key = f"{ev.url}_{dtstart.strftime('%Y%m%d')}"
-                    if event_key in seen_events:
-                        continue
-                    seen_events[event_key] = True
+                    # Получаем EXDATE если есть
+                    exdates = []
+                    if hasattr(vevent, 'exdate'):
+                        for exdate in vevent.exdate:
+                            exdate_val = str(exdate.value)
+                            # Извлекаем только дату
+                            if len(exdate_val) >= 8:
+                                exdates.append(exdate_val[:8])
                     
-                    result.append({
-                        'url': str(ev.url),
-                        'summary': str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия',
-                        'start': dtstart,
-                        'is_recurring': is_recurring,
-                        'original_start': dtstart
-                    })
+                    summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия'
+                    event_url = str(ev.url)
+                    
+                    if is_recurring:
+                        # Для повторяющихся событий вычисляем вхождения в нужном диапазоне
+                        occurrences = await self.get_recurring_occurrences(ev, from_date, to_date, tz, exdates)
+                        for occ_time in occurrences:
+                            # Сохраняем информацию о родительском событии
+                            result.append({
+                                'url': event_url,
+                                'summary': summary,
+                                'start': occ_time,
+                                'is_recurring': True,
+                                'parent_start': dtstart,
+                                'rrule': str(vevent.rrule.value) if hasattr(vevent, 'rrule') else None
+                            })
+                    else:
+                        # Обычное событие
+                        if from_date <= dtstart <= to_date:
+                            result.append({
+                                'url': event_url,
+                                'summary': summary,
+                                'start': dtstart,
+                                'is_recurring': False
+                            })
                 except Exception as e:
                     logger.error(f"parse event error: {e}")
                     continue
             
-            return result
+            # Сортируем по времени
+            result.sort(key=lambda x: x['start'])
+            
+            # Дедупликация на случай дублей
+            unique_result = []
+            seen_keys = set()
+            for ev in result:
+                key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d%H%M')}"
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    unique_result.append(ev)
+            
+            return unique_result
         except Exception as e:
             logger.error(f"get_events error: {e}")
             return []
@@ -332,20 +402,10 @@ async def update_calendar_cache():
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     
-    # Получаем события на 60 дней вперед (это достаточно для отображения)
+    # Получаем события на 60 дней вперед
     end_date = now + timedelta(days=60)
     
-    events = await api.get_events(now, end_date, expand=True)
-    
-    # Дедупликация: группируем по уникальному ключу (url + дата)
-    unique_events = {}
-    for ev in events:
-        key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d')}"
-        if key not in unique_events:
-            unique_events[key] = ev
-    
-    events = list(unique_events.values())
-    events.sort(key=lambda x: x['start'])
+    events = await api.get_events(now, end_date)
     
     calendar_events_cache['all'] = events
     last_sync_time = now
@@ -380,7 +440,7 @@ async def get_pending_notifications() -> List[Dict]:
     return pending
 
 async def get_upcoming_events() -> List[Tuple[datetime, Dict]]:
-    """Получает предстоящие события для отображения (только на сегодня и завтра)"""
+    """Получает предстоящие события для отображения (на сегодня и завтра)"""
     now = get_current_time()
     await update_calendar_cache()
     events = calendar_events_cache.get('all', [])
@@ -394,7 +454,7 @@ async def get_upcoming_events() -> List[Tuple[datetime, Dict]]:
         dt = ev['start']
         event_date = dt.date()
         
-        # Показываем только события на сегодня и завтра
+        # Показываем события на сегодня и завтра
         if event_date == today or event_date == tomorrow:
             future.append((dt, ev))
     
@@ -406,7 +466,7 @@ async def get_formatted_calendar_events():
     future = await get_upcoming_events()
     
     if not future:
-        return "📅 **Нет предстоящих событий**\n\nВсе заметки из календаря будут отображаться здесь."
+        return "📅 **Нет событий на сегодня и завтра**\n\nВсе заметки из календаря будут отображаться здесь."
     
     now = get_current_time()
     today = now.date()
@@ -444,14 +504,15 @@ async def get_formatted_calendar_events():
     
     # Добавляем информацию о других событиях (если есть)
     all_events = calendar_events_cache.get('all', [])
-    future_events = [ev for ev in all_events if ev['start'].date() > tomorrow]
+    future_events = [ev for ev in all_events if ev['start'].date() > tomorrow and ev['start'] >= now]
     if future_events:
         text += f"📌 **А также есть события на другие дни**\n"
         text += f"   • Всего событий в календаре: {len(all_events)}\n"
         text += f"   • Из них предстоит: {len([e for e in all_events if e['start'] >= now])}\n"
+        text += f"\n💡 *Нажмите кнопку \"Все события\" для полного списка*"
     
     if last_sync_time:
-        text += f"\n🔄 *Последняя синхронизация:* {last_sync_time.strftime('%d.%m.%Y %H:%M:%S')}"
+        text += f"\n\n🔄 *Последняя синхронизация:* {last_sync_time.strftime('%d.%m.%Y %H:%M:%S')}"
     return text
 
 async def show_calendar_events(chat_id, persistent=False):
@@ -487,10 +548,12 @@ async def show_all_events(chat_id, persistent=False):
         text = "📅 **ВСЕ СОБЫТИЯ КАЛЕНДАРЯ**\n\n"
         today = now.date()
         
+        # Показываем только будущие события (включая сегодня)
         for date_key in sorted(events_by_date.keys()):
             if date_key < today:
-                prefix = "✅ "
-            elif date_key == today:
+                continue  # Пропускаем прошедшие даты
+            
+            if date_key == today:
                 prefix = "🔴 "
             elif date_key == today + timedelta(days=1):
                 prefix = "🟠 "
