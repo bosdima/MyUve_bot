@@ -49,7 +49,7 @@ YANDEX_CLIENT_ID = os.getenv('YANDEX_CLIENT_ID')
 YANDEX_CLIENT_SECRET = os.getenv('YANDEX_CLIENT_SECRET')
 YANDEX_API_TOKEN = os.getenv('YANDEX_API_TOKEN')
 
-BOT_VERSION = "5.9"
+BOT_VERSION = "6.0"
 BOT_VERSION_DATE = "22.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -64,6 +64,8 @@ config: Dict = {}
 notifications_enabled = True
 calendar_events_cache: Dict[str, List[Dict]] = {}
 last_sync_time: Optional[datetime] = None
+selected_calendar_id: str = "primary"  # ID выбранного календаря
+available_calendars: List[Dict] = []  # Список доступных календарей
 
 # Хранилище времени последнего уведомления для каждого события
 last_notification_time: Dict[str, datetime] = {}
@@ -123,15 +125,36 @@ def parse_datetime(date_str: str):
     return None
 
 class YandexCalendarAPI:
-    def __init__(self, token: str):
+    def __init__(self, token: str, calendar_id: str = "primary"):
         self.token = token
-        self.calendar_id = "primary"
+        self.calendar_id = calendar_id
     
     def _get_headers(self):
         return {
             "Authorization": f"OAuth {self.token}",
             "Content-Type": "application/json"
         }
+    
+    async def get_calendars(self) -> List[Dict]:
+        """Получает список всех календарей пользователя"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{YANDEX_API_BASE}/calendars",
+                    headers=self._get_headers()
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        calendars = data.get('items', [])
+                        logger.info(f"Найдено календарей: {len(calendars)}")
+                        return calendars
+                    else:
+                        text = await resp.text()
+                        logger.error(f"Get calendars error: {resp.status} - {text}")
+                        return []
+        except Exception as e:
+            logger.error(f"get_calendars error: {e}")
+            return []
     
     async def create_event(self, summary: str, start_time: datetime) -> Optional[str]:
         """Создает новое событие в календаре"""
@@ -159,7 +182,7 @@ class YandexCalendarAPI:
                 ) as resp:
                     if resp.status == 201:
                         data = await resp.json()
-                        logger.info(f"Создано событие: {data.get('id')}")
+                        logger.info(f"Создано событие: {data.get('id')} в календаре {self.calendar_id}")
                         return data.get('id')
                     else:
                         text = await resp.text()
@@ -170,13 +193,10 @@ class YandexCalendarAPI:
             return None
     
     async def delete_event_instance(self, event_id: str, event_time: datetime) -> bool:
-        """
-        Удаляет конкретное вхождение повторяющегося события.
-        Для обычных событий удаляет всё событие.
-        """
+        """Удаляет конкретное вхождение повторяющегося события или обычное событие"""
         try:
             async with aiohttp.ClientSession() as session:
-                # Сначала получаем информацию о событии
+                # Получаем информацию о событии
                 async with session.get(
                     f"{YANDEX_API_BASE}/calendars/{self.calendar_id}/events/{event_id}",
                     headers=self._get_headers()
@@ -186,23 +206,20 @@ class YandexCalendarAPI:
                         return False
                     event_data = await resp.json()
                 
-                # Проверяем, является ли событие повторяющимся
                 is_recurring = 'recurrence' in event_data and event_data.get('recurrence')
                 
                 if not is_recurring:
-                    # Обычное событие - удаляем полностью
+                    # Обычное событие
                     async with session.delete(
                         f"{YANDEX_API_BASE}/calendars/{self.calendar_id}/events/{event_id}",
                         headers=self._get_headers()
                     ) as resp:
                         if resp.status == 204:
-                            logger.info(f"Обычное событие удалено: {event_id}")
+                            logger.info(f"Событие удалено: {event_id}")
                             return True
-                        else:
-                            logger.error(f"Delete event error: {resp.status}")
-                            return False
+                        return False
                 else:
-                    # Повторяющееся событие - нужно удалить только конкретное вхождение
+                    # Повторяющееся событие - удаляем только текущее вхождение
                     event_date = event_time.strftime('%Y-%m-%d')
                     
                     async with session.get(
@@ -210,11 +227,9 @@ class YandexCalendarAPI:
                         headers=self._get_headers()
                     ) as resp:
                         if resp.status != 200:
-                            logger.error(f"Get instances error: {resp.status}")
                             return False
                         instances_data = await resp.json()
                     
-                    # Ищем экземпляр на нужную дату
                     instance_id = None
                     for instance in instances_data.get('items', []):
                         start = instance.get('start', {})
@@ -224,10 +239,8 @@ class YandexCalendarAPI:
                             break
                     
                     if not instance_id:
-                        logger.error(f"Instance not found for date {event_date}")
                         return False
                     
-                    # Удаляем экземпляр
                     async with session.delete(
                         f"{YANDEX_API_BASE}/calendars/{self.calendar_id}/events/{instance_id}",
                         headers=self._get_headers()
@@ -235,9 +248,7 @@ class YandexCalendarAPI:
                         if resp.status == 204:
                             logger.info(f"Вхождение повторяющегося события удалено: {instance_id}")
                             return True
-                        else:
-                            logger.error(f"Delete instance error: {resp.status}")
-                            return False
+                        return False
         except Exception as e:
             logger.error(f"delete_event_instance error: {e}")
             return False
@@ -261,46 +272,47 @@ class YandexCalendarAPI:
                     headers=self._get_headers(),
                     params=params
                 ) as resp:
-                    if resp.status != 200:
-                        logger.error(f"Get events error: {resp.status}")
-                        return []
-                    
-                    data = await resp.json()
-                    events = []
-                    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-                    
-                    for item in data.get('items', []):
-                        try:
-                            start_data = item.get('start', {})
-                            start_str = start_data.get('dateTime') or start_data.get('date')
-                            
-                            if not start_str:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        events = []
+                        tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+                        
+                        for item in data.get('items', []):
+                            try:
+                                start_data = item.get('start', {})
+                                start_str = start_data.get('dateTime') or start_data.get('date')
+                                
+                                if not start_str:
+                                    continue
+                                
+                                if 'T' in start_str:
+                                    dt = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
+                                else:
+                                    dt = datetime.fromisoformat(start_str)
+                                    dt = tz.localize(dt)
+                                
+                                if dt.tzinfo is None:
+                                    dt = pytz.UTC.localize(dt)
+                                dt = dt.astimezone(tz)
+                                
+                                is_recurring = 'recurrence' in item and item.get('recurrence')
+                                
+                                events.append({
+                                    'id': item.get('id'),
+                                    'summary': item.get('summary', 'Без названия'),
+                                    'start': dt,
+                                    'is_recurring': bool(is_recurring),
+                                })
+                            except Exception as e:
+                                logger.error(f"Parse event error: {e}")
                                 continue
-                            
-                            if 'T' in start_str:
-                                dt = datetime.fromisoformat(start_str.replace('Z', '+00:00'))
-                            else:
-                                dt = datetime.fromisoformat(start_str)
-                                dt = tz.localize(dt)
-                            
-                            if dt.tzinfo is None:
-                                dt = pytz.UTC.localize(dt)
-                            dt = dt.astimezone(tz)
-                            
-                            is_recurring = 'recurrence' in item and item.get('recurrence')
-                            
-                            events.append({
-                                'id': item.get('id'),
-                                'summary': item.get('summary', 'Без названия'),
-                                'start': dt,
-                                'is_recurring': bool(is_recurring),
-                                'recurring_event_id': item.get('recurringEventId')
-                            })
-                        except Exception as e:
-                            logger.error(f"Parse event error: {e}")
-                            continue
-                    
-                    return events
+                        
+                        logger.info(f"Получено {len(events)} событий из календаря {self.calendar_id}")
+                        return events
+                    else:
+                        text = await resp.text()
+                        logger.error(f"Get events error: {resp.status} - {text}")
+                        return []
         except Exception as e:
             logger.error(f"get_events error: {e}")
             return []
@@ -311,12 +323,23 @@ def get_yandex_api_available():
 async def check_yandex_connection():
     if not get_yandex_api_available():
         return False, "API не настроен (нужен OAuth токен)"
-    api = YandexCalendarAPI(YANDEX_API_TOKEN)
+    api = YandexCalendarAPI(YANDEX_API_TOKEN, selected_calendar_id)
     try:
         events = await api.get_events(get_current_time(), get_current_time() + timedelta(days=1))
-        return True, "Подключено"
+        return True, f"Подключено, найдено {len(events)} событий"
     except Exception as e:
         return False, f"Ошибка: {e}"
+
+async def load_calendars():
+    """Загружает список доступных календарей"""
+    global available_calendars
+    if not get_yandex_api_available():
+        return []
+    
+    api = YandexCalendarAPI(YANDEX_API_TOKEN)
+    calendars = await api.get_calendars()
+    available_calendars = calendars
+    return calendars
 
 async def update_calendar_cache():
     """Обновляет кэш календаря на 60 дней вперед"""
@@ -329,13 +352,13 @@ async def update_calendar_cache():
         last_sync_time = now
         return []
     
-    api = YandexCalendarAPI(YANDEX_API_TOKEN)
+    api = YandexCalendarAPI(YANDEX_API_TOKEN, selected_calendar_id)
     end_date = now + timedelta(days=60)
     events = await api.get_events(now, end_date)
     
     calendar_events_cache['all'] = events
     last_sync_time = now
-    logger.info(f"Обновлён кэш календаря: {len(events)} событий")
+    logger.info(f"Обновлён кэш календаря {selected_calendar_id}: {len(events)} событий")
     return events
 
 async def get_pending_notifications() -> List[Dict]:
@@ -389,7 +412,13 @@ async def get_formatted_calendar_events():
     if not events:
         if not get_yandex_api_available():
             return "📅 **Требуется настройка API**\n\nНажмите кнопку \"Настройки\" и получите OAuth токен."
-        return "📅 **Нет событий на сегодня и завтра**"
+        
+        # Проверяем, есть ли вообще события в календаре
+        all_events = calendar_events_cache.get('all', [])
+        if not all_events:
+            return "📅 **В календаре нет событий**\n\nДобавьте события через Яндекс.Календарь или кнопку ➕ Добавить"
+        else:
+            return "📅 **Нет событий на сегодня и завтра**\n\nЕсть события на другие дни. Нажмите 'Все события' для просмотра."
     
     now = get_current_time()
     today = now.date()
@@ -440,7 +469,8 @@ async def show_calendar_events(chat_id, persistent=False):
     kb.add(
         InlineKeyboardButton("🔄 Обновить", callback_data="refresh_calendar"),
         InlineKeyboardButton("📥 Синхр.", callback_data="sync_calendar"),
-        InlineKeyboardButton("📋 Все события", callback_data="all_events")
+        InlineKeyboardButton("📋 Все события", callback_data="all_events"),
+        InlineKeyboardButton("📁 Выбрать календарь", callback_data="select_calendar")
     )
     if persistent:
         await send_persistent_message(chat_id, text, reply_markup=kb)
@@ -454,7 +484,7 @@ async def show_all_events(chat_id, persistent=False):
     now = get_current_time()
     
     if not events:
-        text = "📅 **В календаре нет событий**"
+        text = "📅 **В календаре нет событий**\n\nДобавьте события через Яндекс.Календарь или кнопку ➕ Добавить"
     else:
         events_by_date = {}
         for ev in events:
@@ -465,28 +495,31 @@ async def show_all_events(chat_id, persistent=False):
                 events_by_date[date_key] = []
             events_by_date[date_key].append(ev)
         
-        text = "📅 **ВСЕ СОБЫТИЯ КАЛЕНДАРЯ**\n\n"
-        today = now.date()
-        
-        for date_key in sorted(events_by_date.keys()):
-            if date_key == today:
-                prefix = "🔴 "
-            elif date_key == today + timedelta(days=1):
-                prefix = "🟠 "
-            else:
-                prefix = "📌 "
+        if not events_by_date:
+            text = "📅 **Нет будущих событий**\n\nВсе события уже прошли."
+        else:
+            text = "📅 **ВСЕ СОБЫТИЯ КАЛЕНДАРЯ**\n\n"
+            today = now.date()
             
-            weekday = ["пн","вт","ср","чт","пт","сб","вс"][date_key.weekday()]
-            text += f"{prefix}**{date_key.day:02d}.{date_key.month:02d}.{date_key.year}** ({weekday})\n"
+            for date_key in sorted(events_by_date.keys()):
+                if date_key == today:
+                    prefix = "🔴 "
+                elif date_key == today + timedelta(days=1):
+                    prefix = "🟠 "
+                else:
+                    prefix = "📌 "
+                
+                weekday = ["пн","вт","ср","чт","пт","сб","вс"][date_key.weekday()]
+                text += f"{prefix}**{date_key.day:02d}.{date_key.month:02d}.{date_key.year}** ({weekday})\n"
+                
+                for ev in events_by_date[date_key]:
+                    time_str = ev['start'].strftime('%H:%M')
+                    recurring_mark = " 🔁" if ev.get('is_recurring', False) else ""
+                    text += f"   • {time_str} — **{ev['summary']}**{recurring_mark}\n"
+                text += "\n"
             
-            for ev in events_by_date[date_key]:
-                time_str = ev['start'].strftime('%H:%M')
-                recurring_mark = " 🔁" if ev.get('is_recurring', False) else ""
-                text += f"   • {time_str} — **{ev['summary']}**{recurring_mark}\n"
-            text += "\n"
-        
-        if len(text) > 4000:
-            text = text[:3500] + "\n\n... и ещё события"
+            if len(text) > 4000:
+                text = text[:3500] + "\n\n... и ещё события"
     
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("◀️ Назад к календарю", callback_data="back_to_calendar"))
@@ -495,6 +528,36 @@ async def show_all_events(chat_id, persistent=False):
         await send_persistent_message(chat_id, text, reply_markup=kb)
     else:
         await send_with_auto_delete(chat_id, text, reply_markup=kb, delay=3600)
+
+async def show_calendar_selection(chat_id):
+    """Показывает список доступных календарей для выбора"""
+    await load_calendars()
+    
+    if not available_calendars:
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("◀️ Назад", callback_data="back_to_calendar"))
+        await send_persistent_message(
+            chat_id,
+            "📁 **Нет доступных календарей**\n\n"
+            "Возможно, у вас нет календарей или токен не имеет доступа.",
+            reply_markup=kb
+        )
+        return
+    
+    kb = InlineKeyboardMarkup(row_width=1)
+    for cal in available_calendars:
+        cal_id = cal.get('id', '')
+        cal_name = cal.get('summary', 'Без названия')
+        is_selected = " ✅" if cal_id == selected_calendar_id else ""
+        kb.add(InlineKeyboardButton(f"{cal_name}{is_selected}", callback_data=f"cal_select_{cal_id}"))
+    
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="back_to_calendar"))
+    
+    await send_persistent_message(
+        chat_id,
+        f"📁 **Выберите календарь**\n\nТекущий: {selected_calendar_id}",
+        reply_markup=kb
+    )
 
 class NotificationStates(StatesGroup):
     waiting_for_text = State()
@@ -507,18 +570,22 @@ def init_config():
     if not os.path.exists(CONFIG_FILE):
         default_config = {
             'notifications_enabled': True,
-            'timezone': 'Europe/Moscow'
+            'timezone': 'Europe/Moscow',
+            'selected_calendar': 'primary'
         }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(default_config, f)
 
 def load_config():
-    global config, notifications_enabled
+    global config, notifications_enabled, selected_calendar_id
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
         config = json.load(f)
         notifications_enabled = config.get('notifications_enabled', True)
+        selected_calendar_id = config.get('selected_calendar', 'primary')
 
 def save_config():
+    global selected_calendar_id
+    config['selected_calendar'] = selected_calendar_id
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
@@ -609,7 +676,7 @@ async def snooze_event(short_id, hours=1):
             logger.error(f"Событие не найдено для short_id: {short_id}")
             return False
         
-        api = YandexCalendarAPI(YANDEX_API_TOKEN)
+        api = YandexCalendarAPI(YANDEX_API_TOKEN, selected_calendar_id)
         new_start = event_time + timedelta(hours=hours)
         new_id = await api.create_event(event_summary, new_start)
         
@@ -640,7 +707,7 @@ async def mark_done(short_id):
             logger.error(f"Событие не найдено для short_id: {short_id}")
             return False
         
-        api = YandexCalendarAPI(YANDEX_API_TOKEN)
+        api = YandexCalendarAPI(YANDEX_API_TOKEN, selected_calendar_id)
         return await api.delete_event_instance(event_id, event_time)
     except Exception as e:
         logger.error(f"mark_done error: {e}")
@@ -697,7 +764,6 @@ async def setup_yandex_token(message: types.Message):
         )
         return
     
-    # Создаем URL для авторизации
     auth_params = {
         'response_type': 'code',
         'client_id': YANDEX_CLIENT_ID,
@@ -713,14 +779,12 @@ async def setup_yandex_token(message: types.Message):
     await send_persistent_message(
         message.chat.id,
         f"🔐 **Настройка доступа к Яндекс.Календарю**\n\n"
-        f"Для работы бота необходимо получить OAuth токен.\n\n"
         f"**Инструкция:**\n"
         f"1. Нажмите кнопку 'Перейти к авторизации'\n"
         f"2. Войдите в свой Яндекс аккаунт\n"
         f"3. Разрешите доступ к календарю\n"
-        f"4. После авторизации вы увидите страницу с кодом\n"
-        f"5. Скопируйте полученный код\n"
-        f"6. Нажмите '✅ Я получил код' и вставьте код\n\n"
+        f"4. Скопируйте полученный код\n"
+        f"5. Нажмите '✅ Я получил код' и вставьте код\n\n"
         f"🔗 **Ссылка для авторизации:**\n{auth_url}",
         reply_markup=kb
     )
@@ -733,7 +797,6 @@ async def process_token_code(message: types.Message, state: FSMContext):
         await send_persistent_message(message.chat.id, "❌ Введите корректный код авторизации")
         return
     
-    # Обмениваем код на токен
     data = {
         'grant_type': 'authorization_code',
         'code': code,
@@ -751,7 +814,6 @@ async def process_token_code(message: types.Message, state: FSMContext):
                     token = result.get('access_token')
                     
                     if token:
-                        # Сохраняем токен в .env
                         env_path = os.path.join(os.path.dirname(__file__), ENV_FILE)
                         set_key(env_path, 'YANDEX_API_TOKEN', token)
                         global YANDEX_API_TOKEN
@@ -760,10 +822,12 @@ async def process_token_code(message: types.Message, state: FSMContext):
                         await send_persistent_message(
                             message.chat.id,
                             "✅ **Токен успешно получен и сохранен!**\n\n"
-                            "Бот готов к работе с Яндекс.Календарем."
+                            "Бот готов к работе с Яндекс.Календарем.\n\n"
+                            "📌 **Важно:** Если у вас несколько календарей, выберите нужный в меню календаря."
                         )
                         
-                        # Обновляем кэш
+                        # Загружаем календари и обновляем кэш
+                        await load_calendars()
                         await update_calendar_cache()
                         await show_calendar_events(message.chat.id, persistent=True)
                     else:
@@ -790,7 +854,7 @@ async def cmd_start(msg, state):
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
         return await msg.reply("❌ Нет доступа")
     
-    ok, _ = await check_yandex_connection()
+    ok, conn_msg = await check_yandex_connection()
     
     if not ok and not YANDEX_API_TOKEN:
         welcome = f"""👋 **Добро пожаловать!**
@@ -805,8 +869,9 @@ async def cmd_start(msg, state):
     else:
         welcome = f"""👋 **Добро пожаловать!**
 🤖 Версия v{BOT_VERSION}
-📧 Яндекс API: {'✅ Доступен' if ok else '❌ Ошибка'}
+📧 Яндекс API: {conn_msg}
 🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}
+📁 Календарь: {selected_calendar_id}
 
 📌 **Как это работает:**
 • Все уведомления берутся ТОЛЬКО из Яндекс.Календаря
@@ -818,6 +883,7 @@ async def cmd_start(msg, state):
         await send_persistent_message(msg.chat.id, welcome)
         await send_persistent_message(msg.chat.id, "👋 **Выберите действие:**", reply_markup=get_main_keyboard())
         
+        await load_calendars()
         await update_calendar_cache()
         await show_calendar_events(msg.chat.id, persistent=True)
         await show_pending_list(msg.chat.id, persistent=True)
@@ -861,7 +927,7 @@ async def set_specific_date(msg, state):
         return await send_with_auto_delete(msg.chat.id, "❌ **Неверный формат или дата в прошлом!**", delay=3600)
     
     data = await state.get_data()
-    api = YandexCalendarAPI(YANDEX_API_TOKEN)
+    api = YandexCalendarAPI(YANDEX_API_TOKEN, selected_calendar_id)
     ev_id = await api.create_event(data['text'], dt)
     
     if ev_id:
@@ -989,6 +1055,22 @@ async def back_to_calendar(cb):
     await show_calendar_events(cb.from_user.id, persistent=True)
     await cb.answer()
 
+@dp.callback_query_handler(lambda c: c.data == "select_calendar", state='*')
+async def select_calendar(cb):
+    await show_calendar_selection(cb.from_user.id)
+    await cb.answer()
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("cal_select_"), state='*')
+async def calendar_selected(cb):
+    global selected_calendar_id
+    calendar_id = cb.data.replace("cal_select_", "")
+    selected_calendar_id = calendar_id
+    save_config()
+    
+    await cb.answer(f"✅ Выбран календарь: {calendar_id}")
+    await update_calendar_cache()
+    await show_calendar_events(cb.from_user.id, persistent=True)
+
 # ---------- НАСТРОЙКИ ----------
 @dp.message_handler(lambda m: m.text == "⚙️ Настройки", state='*')
 async def settings_menu(msg, state):
@@ -1001,8 +1083,8 @@ async def settings_menu_handler(msg):
     status = "🔔 Вкл" if notifications_enabled else "🔕 Выкл"
     
     if get_yandex_api_available():
-        ok, _ = await check_yandex_connection()
-        api_status = "✅ Доступен" if ok else "❌ Ошибка"
+        ok, conn_msg = await check_yandex_connection()
+        api_status = f"✅ {conn_msg}" if ok else f"❌ {conn_msg}"
     else:
         api_status = "❌ Не настроен"
     
@@ -1012,13 +1094,15 @@ async def settings_menu_handler(msg):
         InlineKeyboardButton("🌍 Часовой пояс", callback_data="set_timezone"),
         InlineKeyboardButton("🔐 Настроить Яндекс API", callback_data="setup_yandex_token"),
         InlineKeyboardButton("🔍 Проверить календарь", callback_data="check_cal"),
+        InlineKeyboardButton("📁 Выбрать календарь", callback_data="select_calendar"),
         InlineKeyboardButton("ℹ️ Информация", callback_data="info")
     )
     await send_with_auto_delete(
         msg.chat.id,
         f"⚙️ **НАСТРОЙКИ**\n\n"
         f"📧 Яндекс API: {api_status}\n"
-        f"🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}\n\n"
+        f"🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}\n"
+        f"📁 Текущий календарь: {selected_calendar_id}\n\n"
         f"{'🔐 Токен не настроен! Нажмите кнопку ниже для настройки.' if not get_yandex_api_available() else ''}",
         reply_markup=kb,
         delay=3600
@@ -1099,8 +1183,8 @@ async def cancel_tz(cb, state):
 
 @dp.callback_query_handler(lambda c: c.data == "info", state='*')
 async def info(cb):
-    ok, _ = await check_yandex_connection() if get_yandex_api_available() else (False, "")
-    api_status = "✅ Доступен" if ok else "❌ Ошибка" if get_yandex_api_available() else "❌ Не настроен"
+    ok, conn_msg = await check_yandex_connection() if get_yandex_api_available() else (False, "Не настроен")
+    api_status = f"✅ {conn_msg}" if ok else f"❌ {conn_msg}"
     info_text = f"""📊 **СТАТИСТИКА**
 
 🤖 **Версия:** v{BOT_VERSION} ({BOT_VERSION_DATE})
@@ -1109,8 +1193,14 @@ async def info(cb):
 🕐 **Текущее время:** `{get_current_time().strftime('%d.%m.%Y %H:%M:%S')}`
 🔔 **Уведомления:** `{'Вкл' if notifications_enabled else 'Выкл'}`
 📧 **Яндекс API:** `{api_status}`
+📁 **Выбранный календарь:** `{selected_calendar_id}`
 
-📌 Бот работает с Яндекс.Календарем через REST API"""
+📌 Бот работает с Яндекс.Календарем через REST API
+
+💡 **Совет:** Если не видите события, проверьте:
+• Выбран ли правильный календарь (кнопка "Выбрать календарь")
+• Есть ли события в календаре на ближайшие дни
+• Правильно ли настроен часовой пояс"""
     await cb.message.edit_text(info_text)
     await cb.answer()
 
@@ -1154,13 +1244,15 @@ async def on_startup(dp):
     if get_yandex_api_available():
         ok, msg = await check_yandex_connection()
         logger.info(f"Яндекс API: {'✅' if ok else '❌'} {msg}")
+        await load_calendars()
+        logger.info(f"Доступно календарей: {len(available_calendars)}")
     else:
         logger.warning("Яндекс API не настроен! Используйте настройки бота для получения токена.")
         logger.info("Для настройки: отправьте боту команду /start и нажмите 'Настройки'")
     
     logger.info(f"Часовой пояс: {config.get('timezone', 'Europe/Moscow')}")
     logger.info(f"Текущее время: {get_current_time().strftime('%d.%m.%Y %H:%M:%S')}")
-    logger.info(f"Логирование настроено: файл {LOG_FILE}, макс. размер {LOG_MAX_BYTES} байт")
+    logger.info(f"Выбранный календарь: {selected_calendar_id}")
     logger.info(f"{'='*50}\n")
     
     asyncio.create_task(check_pending())
