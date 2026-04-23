@@ -71,8 +71,8 @@ notifications_enabled = True
 calendar_events_cache: Dict[str, List[Dict]] = {}
 last_sync_time: Optional[datetime] = None
 
-# Хранилище времени последнего уведомления для каждого события
-last_notification_time: Dict[str, datetime] = {}
+# Хранилище для активных просроченных событий с их данными
+pending_events_store: Dict[str, Dict] = {}
 
 TIMEZONES = {
     'Москва (UTC+3)': 'Europe/Moscow',
@@ -208,6 +208,7 @@ END:VCALENDAR"""
                     event.delete()
                     logger.info(f"Событие удалено: {event_url}")
                     return True
+            logger.warning(f"Событие не найдено для удаления: {event_url}")
             return False
         except Exception as e:
             logger.error(f"delete_event error: {e}")
@@ -227,64 +228,55 @@ END:VCALENDAR"""
                     break
             
             if not target_event:
-                logger.error(f"Событие не найдено: {event_url}")
+                logger.warning(f"Повторяющееся событие не найдено: {event_url}")
                 return False
             
             ical_data = target_event.data
             
-            # Форматируем дату для EXDATE в правильном формате (UTC)
-            # Конвертируем дату в UTC для EXDATE
-            if exception_date.tzinfo:
-                utc_date = exception_date.astimezone(pytz.UTC)
-            else:
-                utc_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(exception_date).astimezone(pytz.UTC)
+            tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+            if exception_date.tzinfo is None:
+                exception_date = tz.localize(exception_date)
             
-            # Формат EXDATE: YYYYMMDDTHHMMSSZ
-            exdate_str = utc_date.strftime('%Y%m%dT%H%M%SZ')
+            exdate_str = exception_date.strftime('%Y%m%d')
             
-            # Ищем и обновляем EXDATE
-            lines = ical_data.split('\n')
-            new_lines = []
-            exdate_found = False
-            
-            for line in lines:
-                if line.startswith('EXDATE'):
-                    # Добавляем новую дату к существующим
-                    current_value = line.replace('EXDATE:', '').replace('\r', '')
-                    if exdate_str not in current_value:
-                        new_line = f'EXDATE:{current_value},{exdate_str}'
-                        new_lines.append(new_line)
+            if 'EXDATE' in ical_data:
+                lines = ical_data.split('\n')
+                new_lines = []
+                for line in lines:
+                    if line.startswith('EXDATE'):
+                        current_exdates = line.replace('EXDATE:', '').replace('\r', '')
+                        exdate_list = current_exdates.split(',')
+                        if exdate_str not in exdate_list:
+                            exdate_list.append(exdate_str)
+                            new_lines.append(f'EXDATE:{",".join(exdate_list)}')
+                        else:
+                            new_lines.append(line)
                     else:
                         new_lines.append(line)
-                    exdate_found = True
-                else:
-                    new_lines.append(line)
-            
-            # Если EXDATE не было, добавляем после RRULE
-            if not exdate_found:
-                final_lines = []
+                ical_data = '\n'.join(new_lines)
+            else:
+                lines = ical_data.split('\n')
+                new_lines = []
                 inserted = False
-                for line in new_lines:
-                    final_lines.append(line)
+                for line in lines:
+                    new_lines.append(line)
                     if line.startswith('RRULE') and not inserted:
-                        final_lines.append(f'EXDATE:{exdate_str}')
+                        new_lines.append(f'EXDATE:{exdate_str}')
                         inserted = True
                 if not inserted:
-                    final_lines.append(f'EXDATE:{exdate_str}')
-                new_lines = final_lines
+                    new_lines.append(f'EXDATE:{exdate_str}')
+                ical_data = '\n'.join(new_lines)
             
-            new_ical = '\n'.join(new_lines)
-            target_event.data = new_ical
+            target_event.data = ical_data
             target_event.save()
             logger.info(f"Добавлено исключение для {event_url} на {exdate_str}")
             return True
-            
         except Exception as e:
             logger.error(f"add_exception_to_recurring error: {e}")
             return False
 
     async def get_all_calendar_events(self) -> List[Dict]:
-        """Получает все события из календаря (базовые события без разворачивания)"""
+        """Получает все события из календаря"""
         try:
             cal = self.get_calendar()
             if not cal:
@@ -317,9 +309,6 @@ END:VCALENDAR"""
                         try:
                             for exdate in vevent.exdate:
                                 exdate_val = str(exdate.value)
-                                # Извлекаем дату из EXDATE
-                                if 'T' in exdate_val:
-                                    exdate_val = exdate_val.split('T')[0]
                                 if len(exdate_val) >= 8:
                                     exdates.append(exdate_val[:8])
                         except Exception as e:
@@ -376,7 +365,7 @@ END:VCALENDAR"""
                 if occ > to_date:
                     break
                 
-                if occ < from_date - timedelta(days=1):
+                if occ < from_date:
                     continue
                 
                 occ_date_str = occ.strftime('%Y%m%d')
@@ -419,7 +408,7 @@ async def update_calendar_cache():
     base_events = await api.get_all_calendar_events()
     
     end_date = now + timedelta(days=60)
-    start_date = now - timedelta(days=1)
+    start_date = now  # Только с сегодняшнего дня
     expanded_events = []
     
     for event in base_events:
@@ -443,52 +432,48 @@ async def update_calendar_cache():
     last_sync_time = now
     logger.info(f"Обновлён кэш календаря: {len(calendar_events_cache['all'])} событий (базовых: {len(base_events)})")
     
-    if calendar_events_cache['all']:
-        logger.info(f"Примеры событий в кэше:")
-        for i, ev in enumerate(calendar_events_cache['all'][:5]):
-            logger.info(f"  {i+1}. {ev['start'].strftime('%d.%m.%Y %H:%M')} - {ev['summary']}")
-    
     return calendar_events_cache['all']
 
 async def get_pending_notifications() -> List[Dict]:
-    """Получает просроченные уведомления (время которых уже прошло)"""
+    """Получает просроченные уведомления (только за сегодня)"""
+    global pending_events_store
     now = get_current_time()
     await update_calendar_cache()
     events = calendar_events_cache.get('all', [])
     
     pending = []
+    today = now.date()
+    
     for ev in events:
         ev_start = ev['start'].replace(microsecond=0)
         now_clean = now.replace(microsecond=0)
+        event_date = ev_start.date()
         
-        if ev_start <= now_clean:
+        # Только события за сегодня, которые уже прошли
+        if event_date == today and ev_start <= now_clean:
             unique_key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d%H%M')}"
             short_id = hashlib.md5(unique_key.encode()).hexdigest()[:12]
             
-            pending.append({
+            event_data = {
                 'url': ev['url'],
                 'short_id': short_id,
                 'text': ev['summary'],
                 'time': ev['start'],
-                'is_recurring': ev.get('is_recurring', False)
-            })
+                'is_recurring': ev.get('is_recurring', False),
+                'start_time_str': ev['start'].strftime('%Y%m%d%H%M')
+            }
+            pending.append(event_data)
+            
+            # Сохраняем в глобальное хранилище
+            pending_events_store[short_id] = event_data
     
     pending.sort(key=lambda x: x['time'])
-    unique_pending = {}
-    for p in pending:
-        if p['short_id'] not in unique_pending:
-            unique_pending[p['short_id']] = p
+    logger.info(f"Найдено просроченных событий за сегодня: {len(pending)}")
     
-    result = list(unique_pending.values())
-    logger.info(f"Найдено просроченных событий: {len(result)}")
-    
-    for p in result:
-        logger.info(f"  Просрочено: {p['time'].strftime('%d.%m.%Y %H:%M')} - {p['text']}")
-    
-    return result
+    return pending
 
 async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
-    """Получает события на сегодня и завтра (включая прошедшие сегодняшние)"""
+    """Получает события на сегодня и завтра"""
     now = get_current_time()
     await update_calendar_cache()
     events = calendar_events_cache.get('all', [])
@@ -503,22 +488,20 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
         
         if event_date == today:
             result.append((dt, ev))
-            logger.info(f"Добавлено сегодняшнее событие: {dt.strftime('%d.%m.%Y %H:%M')} - {ev['summary']}")
         elif event_date == tomorrow:
             result.append((dt, ev))
-            logger.info(f"Добавлено завтрашнее событие: {dt.strftime('%d.%m.%Y %H:%M')} - {ev['summary']}")
     
     result.sort(key=lambda x: x[0])
     logger.info(f"Найдено событий на сегодня/завтра: {len(result)}")
     return result
 
 async def get_formatted_calendar_events():
-    """Форматирует события календаря для отображения (только сегодня и завтра)"""
+    """Форматирует события календаря для отображения"""
     events = await get_today_tomorrow_events()
     now = get_current_time()
     
     if not events:
-        return "📅 **Нет событий на сегодня и завтра**\n\nВсе заметки из календаря будут отображаться здесь."
+        return "📅 **Нет событий на сегодня и завтра**"
     
     today = now.date()
     tomorrow = today + timedelta(days=1)
@@ -568,7 +551,6 @@ async def get_formatted_calendar_events():
         text += f"📌 **А также есть события на другие дни**\n"
         text += f"   • Всего событий в календаре: {len(all_events)}\n"
         text += f"   • Из них предстоит: {len([e for e in all_events if e['start'] >= now])}\n"
-        text += f"\n💡 *Нажмите кнопку \"Все события\" для полного списка*"
     
     if last_sync_time:
         text += f"\n\n🔄 *Последняя синхронизация:* {last_sync_time.strftime('%d.%m.%Y %H:%M:%S')}"
@@ -703,8 +685,11 @@ async def show_pending_actions(chat_id, short_id, text, event_time, is_recurring
     )
 
 async def check_pending():
-    """Проверяет просроченные события и отправляет уведомления каждый час"""
-    global notifications_enabled, last_notification_time
+    """Проверяет просроченные события и отправляет уведомления"""
+    global notifications_enabled
+    
+    # Множество для отслеживания уже отправленных уведомлений за эту сессию
+    sent_notifications = set()
     
     while True:
         if notifications_enabled:
@@ -712,44 +697,37 @@ async def check_pending():
             now = get_current_time()
             
             for p in pending:
-                event_key = f"{p['short_id']}_{p['time'].strftime('%Y%m%d%H%M')}"
-                last_time = last_notification_time.get(event_key)
+                # Создаем уникальный ключ для события
+                notification_key = f"{p['short_id']}_{p['time'].strftime('%Y%m%d%H')}"
                 
-                if last_time is None or (now - last_time) >= timedelta(hours=1):
+                # Отправляем уведомление, если еще не отправляли в этом часе
+                if notification_key not in sent_notifications:
                     await show_pending_actions(ADMIN_ID, p['short_id'], p['text'], p['time'], p['is_recurring'])
-                    last_notification_time[event_key] = now
+                    sent_notifications.add(notification_key)
                     logger.info(f"Отправлено уведомление для события: {p['text']} в {p['time']}")
-                    
-                    to_remove = []
-                    for key, value in last_notification_time.items():
-                        if (now - value) > timedelta(hours=24):
-                            to_remove.append(key)
-                    for key in to_remove:
-                        del last_notification_time[key]
+            
+            # Очищаем старые ключи (старше 2 часов)
+            current_hour = now.strftime('%Y%m%d%H')
+            to_remove = [key for key in sent_notifications if key.split('_')[1][:10] != current_hour[:10]]
+            for key in to_remove:
+                sent_notifications.discard(key)
         
         await asyncio.sleep(60)
 
 async def snooze_event(short_id, hours=1):
     """Откладывает событие на указанное количество часов"""
+    global pending_events_store
+    
+    # Получаем данные события из хранилища
+    event_data = pending_events_store.get(short_id)
+    if not event_data:
+        logger.error(f"Событие не найдено в хранилище для short_id: {short_id}")
+        return False
+    
     try:
-        pending = await get_pending_notifications()
-        event_url = None
-        event_time = None
-        event_summary = None
-        for p in pending:
-            if p['short_id'] == short_id:
-                event_url = p['url']
-                event_time = p['time']
-                event_summary = p['text']
-                break
-        
-        if not event_url:
-            logger.error(f"Событие не найдено для short_id: {short_id}")
-            return False
-        
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
-        new_start = event_time + timedelta(hours=hours)
+        new_start = event_data['time'] + timedelta(hours=hours)
         new_end = new_start + timedelta(hours=1)
         
         tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
@@ -767,14 +745,17 @@ UID:{uid}
 DTSTAMP:{datetime.now().strftime('%Y%m%dT%H%M%SZ')}
 DTSTART;TZID={tzid}:{new_start.strftime('%Y%m%dT%H%M%S')}
 DTEND;TZID={tzid}:{new_end.strftime('%Y%m%dT%H%M%S')}
-SUMMARY:{event_summary[:255]}
+SUMMARY:{event_data['text'][:255]}
 END:VEVENT
 END:VCALENDAR"""
         
         cal = api.get_calendar()
         if cal:
             cal.save_event(ical)
-            logger.info(f"Событие отложено на {hours} часов: {event_summary}")
+            logger.info(f"Событие отложено на {hours} часов: {event_data['text']}")
+            
+            # Удаляем из хранилища
+            del pending_events_store[short_id]
             return True
         
         return False
@@ -783,32 +764,34 @@ END:VCALENDAR"""
         return False
 
 async def mark_done(short_id):
-    """Отмечает событие как выполненное - удаляет только текущее вхождение"""
+    """Отмечает событие как выполненное"""
+    global pending_events_store
+    
+    # Получаем данные события из хранилища
+    event_data = pending_events_store.get(short_id)
+    if not event_data:
+        logger.error(f"Событие не найдено в хранилище для short_id: {short_id}")
+        return False
+    
     try:
-        pending = await get_pending_notifications()
-        event_url = None
-        event_time = None
-        is_recurring = False
-        
-        for p in pending:
-            if p['short_id'] == short_id:
-                event_url = p['url']
-                event_time = p['time']
-                is_recurring = p.get('is_recurring', False)
-                break
-        
-        if not event_url:
-            logger.error(f"Событие не найдено для short_id: {short_id}")
-            return False
-        
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
-        if is_recurring and event_time:
-            logger.info(f"Добавление исключения для повторяющегося события: {event_url} на {event_time}")
-            return await api.add_exception_to_recurring(event_url, event_time)
+        if event_data.get('is_recurring'):
+            # Для повторяющихся событий добавляем EXDATE
+            logger.info(f"Добавление исключения для повторяющегося события: {event_data['url']}")
+            result = await api.add_exception_to_recurring(event_data['url'], event_data['time'])
         else:
-            logger.info(f"Удаление обычного события: {event_url}")
-            return await api.delete_event(event_url)
+            # Для обычных событий удаляем
+            logger.info(f"Удаление обычного события: {event_data['url']}")
+            result = await api.delete_event(event_data['url'])
+        
+        if result:
+            # Удаляем из хранилища
+            del pending_events_store[short_id]
+            # Принудительно обновляем кэш
+            await update_calendar_cache()
+        
+        return result
     except Exception as e:
         logger.error(f"mark_done error: {e}")
         return False
@@ -832,7 +815,8 @@ async def show_pending_list(chat_id, persistent=False):
         await send_persistent_message(chat_id, msg)
         return
     
-    await send_persistent_message(chat_id, f"⚠️ **ПРОСРОЧЕННЫЕ УВЕДОМЛЕНИЯ** ({len(pending)} шт.)\n\n")
+    # Отправляем общее сообщение о количестве
+    await send_persistent_message(chat_id, f"⚠️ **ПРОСРОЧЕННЫЕ УВЕДОМЛЕНИЯ** ({len(pending)} шт.)\n")
     
     for idx, p in enumerate(pending, 1):
         recurring_mark = " 🔁" if p['is_recurring'] else ""
@@ -940,7 +924,7 @@ async def handle_done(cb):
         await show_calendar_events(cb.from_user.id, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
-        await cb.answer("❌ Ошибка при удалении события! Попробуйте позже.", show_alert=True)
+        await cb.answer("❌ Ошибка при удалении события! Возможно, оно уже было удалено.", show_alert=True)
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
 async def handle_snooze(cb):
