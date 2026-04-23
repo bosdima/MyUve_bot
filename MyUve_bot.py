@@ -56,7 +56,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "5.6"
+BOT_VERSION = "1.2"
 BOT_VERSION_DATE = "22.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -402,6 +402,13 @@ async def update_calendar_cache():
     calendar_events_cache['base'] = base_events
     last_sync_time = now
     logger.info(f"Обновлён кэш календаря: {len(calendar_events_cache['all'])} событий (базовых: {len(base_events)})")
+    
+    # Логируем первые 5 событий для отладки
+    if calendar_events_cache['all']:
+        logger.info(f"Примеры событий в кэше:")
+        for i, ev in enumerate(calendar_events_cache['all'][:5]):
+            logger.info(f"  {i+1}. {ev['start'].strftime('%d.%m.%Y %H:%M')} - {ev['summary']}")
+    
     return calendar_events_cache['all']
 
 async def get_pending_notifications() -> List[Dict]:
@@ -444,11 +451,21 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
         dt = ev['start']
         event_date = dt.date()
         
-        # Показываем только события на сегодня и завтра
-        if event_date == today or event_date == tomorrow:
+        # Показываем события на сегодня и завтра
+        if event_date == today:
+            # На сегодня показываем только будущие события (которые ещё не начались)
+            # Это чтобы не показывать уже прошедшие события сегодняшнего дня
+            if dt >= now:
+                result.append((dt, ev))
+                logger.info(f"Добавлено сегодняшнее событие: {dt.strftime('%d.%m.%Y %H:%M')} - {ev['summary']}")
+        elif event_date == tomorrow:
+            # На завтра показываем ВСЕ события без фильтрации по времени,
+            # так как они гарантированно в будущем
             result.append((dt, ev))
+            logger.info(f"Добавлено завтрашнее событие: {dt.strftime('%d.%m.%Y %H:%M')} - {ev['summary']}")
     
     result.sort(key=lambda x: x[0])
+    logger.info(f"Найдено событий на сегодня/завтра: {len(result)}")
     return result
 
 async def get_formatted_calendar_events():
