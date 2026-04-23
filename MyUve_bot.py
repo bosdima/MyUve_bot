@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "1.9"
+BOT_VERSION = "2.0"
 BOT_VERSION_DATE = "23.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -242,8 +242,6 @@ END:VCALENDAR"""
                 exception_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(exception_date)
             exdate_utc = exception_date.astimezone(pytz.UTC)
             exdate_str = exdate_utc.strftime('%Y%m%dT%H%M%SZ')
-            
-            # Также добавляем версию без времени для DATE формата
             exdate_date_str = exception_date.strftime('%Y%m%d')
             
             logger.info(f"Добавляем EXDATE: {exdate_str} и {exdate_date_str}")
@@ -254,16 +252,23 @@ END:VCALENDAR"""
                 new_lines = []
                 for line in lines:
                     if line.startswith('EXDATE'):
-                        # Извлекаем текущие даты
                         if ':' in line:
                             current_part = line.split(':', 1)[1]
-                            # Убираем возможные параметры вроде ;TZID=
+                            # Убираем возможные параметры
                             if ';' in current_part:
                                 current_part = current_part.split(';')[-1]
                             exdate_list = current_part.split(',')
-                            # Добавляем новый EXDATE если его нет
-                            if exdate_str not in exdate_list and exdate_date_str not in exdate_list:
+                            # Очищаем список от пустых значений
+                            exdate_list = [x for x in exdate_list if x]
+                            # Добавляем оба формата EXDATE
+                            added = False
+                            if exdate_str not in exdate_list:
                                 exdate_list.append(exdate_str)
+                                added = True
+                            if exdate_date_str not in exdate_list:
+                                exdate_list.append(exdate_date_str)
+                                added = True
+                            if added:
                                 new_lines.append(f'EXDATE:{",".join(exdate_list)}')
                             else:
                                 new_lines.append(line)
@@ -273,25 +278,24 @@ END:VCALENDAR"""
                         new_lines.append(line)
                 ical_data = '\n'.join(new_lines)
             else:
-                # Вставляем EXDATE после RRULE или в конец VEVENT
                 lines = ical_data.split('\n')
                 new_lines = []
                 inserted = False
                 for line in lines:
                     new_lines.append(line)
                     if line.startswith('RRULE') and not inserted:
-                        new_lines.append(f'EXDATE:{exdate_str}')
+                        new_lines.append(f'EXDATE:{exdate_str},{exdate_date_str}')
                         inserted = True
                 if not inserted:
                     for i, line in enumerate(new_lines):
                         if line.strip() == 'END:VEVENT':
-                            new_lines.insert(i, f'EXDATE:{exdate_str}')
+                            new_lines.insert(i, f'EXDATE:{exdate_str},{exdate_date_str}')
                             break
                 ical_data = '\n'.join(new_lines)
             
             target_event.data = ical_data
             target_event.save()
-            logger.info(f"Добавлено исключение для {event_url} на {exdate_str}")
+            logger.info(f"Добавлено исключение для {event_url}")
             
             # Ждём, пока сервер обработает изменение
             await asyncio.sleep(3)
@@ -334,15 +338,15 @@ END:VCALENDAR"""
                         try:
                             for exdate in vevent.exdate:
                                 exdate_val = str(exdate.value)
-                                # Извлекаем дату в формате YYYYMMDD
-                                # Может быть в форматах: 20260423, 20260423T070000Z, 20260423T070000
+                                # Извлекаем дату в формате YYYYMMDD любым способом
+                                # Очищаем от всех нецифровых символов
                                 clean_val = re.sub(r'[^0-9]', '', exdate_val)
                                 if len(clean_val) >= 8:
                                     exdates.add(clean_val[:8])
-                                # Также пробуем извлечь из строки
-                                date_match = re.search(r'(\d{8})', exdate_val)
-                                if date_match:
-                                    exdates.add(date_match.group(1))
+                                # Пробуем найти 8 цифр подряд
+                                match = re.search(r'(\d{8})', exdate_val)
+                                if match:
+                                    exdates.add(match.group(1))
                         except Exception as e:
                             pass
                     
@@ -383,7 +387,10 @@ END:VCALENDAR"""
             if not rrule_str:
                 return []
             
-            rule = rrulestr(rrule_str, dtstart=dtstart)
+            # Очищаем RRULE от возможных проблем
+            rrule_str = rrule_str.replace('RRULE:', '').strip()
+            
+            rule = rrulestr(f'RRULE:{rrule_str}', dtstart=dtstart)
             
             occurrences = []
             day_start = from_date.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -440,6 +447,9 @@ async def update_calendar_cache(force_full_reload=False):
     if force_full_reload:
         logger.info("Принудительная полная перезагрузка кэша...")
         calendar_events_cache.clear()
+        # Очищаем processed_short_ids при полной перезагрузке
+        global processed_short_ids
+        processed_short_ids.clear()
     
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
@@ -479,7 +489,7 @@ async def update_calendar_cache(force_full_reload=False):
     return calendar_events_cache['all']
 
 async def get_pending_notifications() -> List[Dict]:
-    global pending_events_store
+    global pending_events_store, processed_short_ids
     now = get_current_time()
     await update_calendar_cache()
     events = calendar_events_cache.get('all', [])
@@ -1035,7 +1045,7 @@ async def refresh_calendar(cb):
 
 @dp.callback_query_handler(lambda c: c.data == "sync_calendar", state='*')
 async def sync_calendar(cb):
-    await cb.message.edit_text("🔄 **Синхронизация...**")
+    await cb.message.edit_text("🔄 **Полная синхронизация...**")
     await update_calendar_cache(force_full_reload=True)
     await show_calendar_events(cb.from_user.id, persistent=True)
     await cb.answer("✅ Синхронизация завершена")
