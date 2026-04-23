@@ -56,7 +56,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "1.3"
+BOT_VERSION = "1.4"
 BOT_VERSION_DATE = "23.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -376,7 +376,7 @@ END:VCALENDAR"""
                 if occ > to_date:
                     break
                 
-                if occ < from_date:
+                if occ < from_date - timedelta(days=1):  # Показываем события с вчерашнего дня для просроченных
                     continue
                 
                 # Проверяем, не исключено ли это вхождение
@@ -422,15 +422,16 @@ async def update_calendar_cache():
     
     # Разворачиваем повторяющиеся события на 60 дней вперед
     end_date = now + timedelta(days=60)
+    start_date = now - timedelta(days=1)  # Начинаем с вчера, чтобы поймать просроченные
     expanded_events = []
     
     for event in base_events:
         if event.get('is_recurring'):
-            occurrences = api.expand_recurring_event(event, now, end_date)
+            occurrences = api.expand_recurring_event(event, start_date, end_date)
             expanded_events.extend(occurrences)
         else:
             # Показываем события, которые ещё не прошли (или прошли не более дня назад)
-            if event['start'] >= now - timedelta(days=1):
+            if event['start'] >= start_date:
                 expanded_events.append(event)
     
     # Сортируем по времени
@@ -465,7 +466,11 @@ async def get_pending_notifications() -> List[Dict]:
     pending = []
     for ev in events:
         # Событие просрочено, если его время начала <= текущего времени
-        if ev['start'] <= now:
+        # Используем compare без наносекунд для надежности
+        ev_start = ev['start'].replace(microsecond=0)
+        now_clean = now.replace(microsecond=0)
+        
+        if ev_start <= now_clean:
             # Генерируем короткий ID для callback
             unique_key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d%H%M')}"
             short_id = hashlib.md5(unique_key.encode()).hexdigest()[:12]
@@ -478,12 +483,24 @@ async def get_pending_notifications() -> List[Dict]:
                 'is_recurring': ev.get('is_recurring', False)
             })
     
+    # Сортируем по времени и удаляем дубликаты по short_id
     pending.sort(key=lambda x: x['time'])
-    logger.info(f"Найдено просроченных событий: {len(pending)}")
-    return pending
+    unique_pending = {}
+    for p in pending:
+        if p['short_id'] not in unique_pending:
+            unique_pending[p['short_id']] = p
+    
+    result = list(unique_pending.values())
+    logger.info(f"Найдено просроченных событий: {len(result)}")
+    
+    # Логируем просроченные события для отладки
+    for p in result:
+        logger.info(f"  Просрочено: {p['time'].strftime('%d.%m.%Y %H:%M')} - {p['text']}")
+    
+    return result
 
 async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
-    """Получает события на сегодня и завтра"""
+    """Получает события на сегодня и завтра (включая прошедшие сегодняшние)"""
     now = get_current_time()
     await update_calendar_cache()
     events = calendar_events_cache.get('all', [])
@@ -496,12 +513,10 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
         dt = ev['start']
         event_date = dt.date()
         
-        # Показываем события на сегодня и завтра
+        # Показываем события на сегодня (ВСЕ, включая прошедшие)
         if event_date == today:
-            # На сегодня показываем только будущие события (которые ещё не начались)
-            if dt >= now:
-                result.append((dt, ev))
-                logger.info(f"Добавлено сегодняшнее событие: {dt.strftime('%d.%m.%Y %H:%M')} - {ev['summary']}")
+            result.append((dt, ev))
+            logger.info(f"Добавлено сегодняшнее событие: {dt.strftime('%d.%m.%Y %H:%M')} - {ev['summary']}")
         elif event_date == tomorrow:
             # На завтра показываем ВСЕ события
             result.append((dt, ev))
@@ -514,11 +529,11 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
 async def get_formatted_calendar_events():
     """Форматирует события календаря для отображения (только сегодня и завтра)"""
     events = await get_today_tomorrow_events()
+    now = get_current_time()
     
     if not events:
         return "📅 **Нет событий на сегодня и завтра**\n\nВсе заметки из календаря будут отображаться здесь."
     
-    now = get_current_time()
     today = now.date()
     tomorrow = today + timedelta(days=1)
     
@@ -526,17 +541,30 @@ async def get_formatted_calendar_events():
     
     # Группируем события по датам
     today_events = []
+    today_passed_events = []
     tomorrow_events = []
     
     for dt, ev in events:
         if dt.date() == today:
-            today_events.append((dt, ev))
+            if dt < now:
+                today_passed_events.append((dt, ev))
+            else:
+                today_events.append((dt, ev))
         elif dt.date() == tomorrow:
             tomorrow_events.append((dt, ev))
     
-    # Отображаем события на сегодня
+    # Отображаем прошедшие сегодняшние события (красным)
+    if today_passed_events:
+        text += f"🔴 **СЕГОДНЯ (ПРОШЕДШИЕ)**\n"
+        for dt, ev in today_passed_events:
+            time_str = dt.strftime('%H:%M')
+            recurring_mark = " 🔁" if ev.get('is_recurring', False) else ""
+            text += f"   • {time_str} — **{ev['summary']}**{recurring_mark} ⚠️\n"
+        text += "\n"
+    
+    # Отображаем будущие сегодняшние события
     if today_events:
-        text += f"🔴 **СЕГОДНЯ**\n"
+        text += f"🟢 **СЕГОДНЯ (ПРЕДСТОЯЩИЕ)**\n"
         for dt, ev in today_events:
             time_str = dt.strftime('%H:%M')
             recurring_mark = " 🔁" if ev.get('is_recurring', False) else ""
@@ -590,7 +618,8 @@ async def show_all_events(chat_id, persistent=False):
         # Группируем по датам
         events_by_date = {}
         for ev in events:
-            if ev['start'] < now:
+            # Показываем все события, включая прошедшие за последние 7 дней
+            if ev['start'] < now - timedelta(days=7):
                 continue
             date_key = ev['start'].date()
             if date_key not in events_by_date:
@@ -614,7 +643,8 @@ async def show_all_events(chat_id, persistent=False):
             for ev in events_by_date[date_key]:
                 time_str = ev['start'].strftime('%H:%M')
                 recurring_mark = " 🔁" if ev.get('is_recurring', False) else ""
-                text += f"   • {time_str} — **{ev['summary']}**{recurring_mark}\n"
+                passed_mark = " ⚠️" if ev['start'] < now else ""
+                text += f"   • {time_str} — **{ev['summary']}**{recurring_mark}{passed_mark}\n"
             text += "\n"
         
         if len(text) > 4000:
