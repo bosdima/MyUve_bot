@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "1.8"
+BOT_VERSION = "1.9"
 BOT_VERSION_DATE = "23.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -237,13 +237,16 @@ END:VCALENDAR"""
             
             ical_data = target_event.data
             
-            tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+            # Переводим дату в UTC для EXDATE
             if exception_date.tzinfo is None:
-                exception_date = tz.localize(exception_date)
-            
-            # EXDATE в формате DATE-TIME UTC
+                exception_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(exception_date)
             exdate_utc = exception_date.astimezone(pytz.UTC)
             exdate_str = exdate_utc.strftime('%Y%m%dT%H%M%SZ')
+            
+            # Также добавляем версию без времени для DATE формата
+            exdate_date_str = exception_date.strftime('%Y%m%d')
+            
+            logger.info(f"Добавляем EXDATE: {exdate_str} и {exdate_date_str}")
             
             # Ищем существующие EXDATE строки
             if 'EXDATE' in ical_data:
@@ -253,13 +256,17 @@ END:VCALENDAR"""
                     if line.startswith('EXDATE'):
                         # Извлекаем текущие даты
                         if ':' in line:
-                            current_exdates = line.split(':', 1)[1]
-                        else:
-                            current_exdates = ''
-                        exdate_list = current_exdates.split(',')
-                        if exdate_str not in exdate_list:
-                            exdate_list.append(exdate_str)
-                            new_lines.append(f'EXDATE:{",".join(exdate_list)}')
+                            current_part = line.split(':', 1)[1]
+                            # Убираем возможные параметры вроде ;TZID=
+                            if ';' in current_part:
+                                current_part = current_part.split(';')[-1]
+                            exdate_list = current_part.split(',')
+                            # Добавляем новый EXDATE если его нет
+                            if exdate_str not in exdate_list and exdate_date_str not in exdate_list:
+                                exdate_list.append(exdate_str)
+                                new_lines.append(f'EXDATE:{",".join(exdate_list)}')
+                            else:
+                                new_lines.append(line)
                         else:
                             new_lines.append(line)
                     else:
@@ -287,7 +294,7 @@ END:VCALENDAR"""
             logger.info(f"Добавлено исключение для {event_url} на {exdate_str}")
             
             # Ждём, пока сервер обработает изменение
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
             
             return True
         except Exception as e:
@@ -328,10 +335,14 @@ END:VCALENDAR"""
                             for exdate in vevent.exdate:
                                 exdate_val = str(exdate.value)
                                 # Извлекаем дату в формате YYYYMMDD
-                                if 'T' in exdate_val:
-                                    exdates.add(exdate_val[:8])
-                                elif len(exdate_val) >= 8:
-                                    exdates.add(exdate_val[:8])
+                                # Может быть в форматах: 20260423, 20260423T070000Z, 20260423T070000
+                                clean_val = re.sub(r'[^0-9]', '', exdate_val)
+                                if len(clean_val) >= 8:
+                                    exdates.add(clean_val[:8])
+                                # Также пробуем извлечь из строки
+                                date_match = re.search(r'(\d{8})', exdate_val)
+                                if date_match:
+                                    exdates.add(date_match.group(1))
                         except Exception as e:
                             pass
                     
@@ -802,10 +813,10 @@ async def mark_done(short_id):
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
         if event_data.get('is_recurring'):
-            logger.info(f"Добавление исключения для повторяющегося события")
+            logger.info(f"Добавление исключения для повторяющегося события: {event_data['text']} на {event_data['time']}")
             result = await api.add_exception_to_recurring(event_data['url'], event_data['time'])
         else:
-            logger.info(f"Удаление обычного события")
+            logger.info(f"Удаление обычного события: {event_data['text']}")
             result = await api.delete_event(event_data['url'])
         
         if result:
@@ -814,6 +825,7 @@ async def mark_done(short_id):
             
             # Принудительно обновляем кэш с полной перезагрузкой
             await update_calendar_cache(force_full_reload=True)
+            return True
         
         return result
     except Exception as e:
