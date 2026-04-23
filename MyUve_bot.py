@@ -4,8 +4,8 @@ import os
 import logging
 import logging.handlers
 import re
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, date
+from typing import Dict, List, Optional, Tuple, Union
 import pytz
 import caldav
 import hashlib
@@ -56,8 +56,8 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "1.2"
-BOT_VERSION_DATE = "22.04.2026"
+BOT_VERSION = "1.3"
+BOT_VERSION_DATE = "23.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -123,6 +123,41 @@ def parse_datetime(date_str: str):
             except:
                 return None
     return None
+
+def convert_to_datetime(dt_value: Union[datetime, date, str], tz) -> Optional[datetime]:
+    """Конвертирует различные форматы даты/времени в datetime с часовым поясом"""
+    try:
+        if dt_value is None:
+            return None
+        
+        # Если уже datetime
+        if isinstance(dt_value, datetime):
+            if dt_value.tzinfo is None:
+                dt_value = tz.localize(dt_value)
+            else:
+                dt_value = dt_value.astimezone(tz)
+            return dt_value
+        
+        # Если date (целый день)
+        if isinstance(dt_value, date):
+            # Для целодневных событий устанавливаем время на начало дня (00:00)
+            dt_value = datetime(dt_value.year, dt_value.month, dt_value.day, 0, 0, 0)
+            return tz.localize(dt_value)
+        
+        # Если строка
+        if isinstance(dt_value, str):
+            # Пробуем распарсить строку
+            for fmt in ['%Y%m%dT%H%M%S', '%Y%m%d', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d']:
+                try:
+                    dt = datetime.strptime(dt_value, fmt)
+                    return tz.localize(dt)
+                except:
+                    continue
+        
+        return None
+    except Exception as e:
+        logger.error(f"convert_to_datetime error: {e}")
+        return None
 
 class CalDAVCalendarAPI:
     def __init__(self, email, pwd):
@@ -260,15 +295,19 @@ END:VCALENDAR"""
                 try:
                     vevent = ev.vobject_instance.vevent
                     
-                    # Получаем время начала
-                    dtstart = vevent.dtstart.value
-                    if hasattr(dtstart, 'dt'):
-                        dtstart = dtstart.dt
+                    # Получаем время начала - обрабатываем разные типы
+                    dtstart_raw = vevent.dtstart.value
+                    dtstart = convert_to_datetime(dtstart_raw, tz)
                     
-                    if dtstart.tzinfo is None:
-                        dtstart = tz.localize(dtstart)
-                    else:
-                        dtstart = dtstart.astimezone(tz)
+                    if dtstart is None:
+                        logger.warning(f"Не удалось распарсить время начала события: {dtstart_raw}")
+                        continue
+                    
+                    # Получаем время окончания (если есть)
+                    dtend = None
+                    if hasattr(vevent, 'dtend'):
+                        dtend_raw = vevent.dtend.value
+                        dtend = convert_to_datetime(dtend_raw, tz)
                     
                     # Проверяем, является ли событие повторяющимся
                     is_recurring = hasattr(vevent, 'rrule') and vevent.rrule.value is not None
@@ -276,10 +315,13 @@ END:VCALENDAR"""
                     # Получаем EXDATE если есть
                     exdates = []
                     if hasattr(vevent, 'exdate'):
-                        for exdate in vevent.exdate:
-                            exdate_val = str(exdate.value)
-                            if len(exdate_val) >= 8:
-                                exdates.append(exdate_val[:8])
+                        try:
+                            for exdate in vevent.exdate:
+                                exdate_val = str(exdate.value)
+                                if len(exdate_val) >= 8:
+                                    exdates.append(exdate_val[:8])
+                        except Exception as e:
+                            logger.error(f"exdate parsing error: {e}")
                     
                     summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия'
                     event_url = str(ev.url)
@@ -288,6 +330,7 @@ END:VCALENDAR"""
                         'url': event_url,
                         'summary': summary,
                         'start': dtstart,
+                        'end': dtend,
                         'is_recurring': is_recurring,
                         'exdates': exdates
                     }
@@ -345,6 +388,7 @@ END:VCALENDAR"""
                     'url': event['url'],
                     'summary': event['summary'],
                     'start': occ,
+                    'end': event.get('end'),
                     'is_recurring': True,
                     'parent_url': event['url'],
                     'parent_start': dtstart
@@ -385,6 +429,7 @@ async def update_calendar_cache():
             occurrences = api.expand_recurring_event(event, now, end_date)
             expanded_events.extend(occurrences)
         else:
+            # Показываем события, которые ещё не прошли (или прошли не более дня назад)
             if event['start'] >= now - timedelta(days=1):
                 expanded_events.append(event)
     
@@ -454,13 +499,11 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
         # Показываем события на сегодня и завтра
         if event_date == today:
             # На сегодня показываем только будущие события (которые ещё не начались)
-            # Это чтобы не показывать уже прошедшие события сегодняшнего дня
             if dt >= now:
                 result.append((dt, ev))
                 logger.info(f"Добавлено сегодняшнее событие: {dt.strftime('%d.%m.%Y %H:%M')} - {ev['summary']}")
         elif event_date == tomorrow:
-            # На завтра показываем ВСЕ события без фильтрации по времени,
-            # так как они гарантированно в будущем
+            # На завтра показываем ВСЕ события
             result.append((dt, ev))
             logger.info(f"Добавлено завтрашнее событие: {dt.strftime('%d.%m.%Y %H:%M')} - {ev['summary']}")
     
