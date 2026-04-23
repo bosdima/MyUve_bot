@@ -56,7 +56,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.1"
+BOT_VERSION = "3.2"
 BOT_VERSION_DATE = "23.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -87,6 +87,16 @@ TIMEZONES = {
 def get_current_time():
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
     return datetime.now(tz)
+
+def get_naive_datetime(year, month, day, hour, minute):
+    """Создаёт naive datetime без часового пояса"""
+    return datetime(year, month, day, hour, minute)
+
+def make_aware(dt: datetime, tz) -> datetime:
+    """Преобразует naive datetime в aware, если нужно"""
+    if dt.tzinfo is None:
+        return tz.localize(dt)
+    return dt.astimezone(tz)
 
 def parse_datetime(date_str: str):
     now = get_current_time()
@@ -169,40 +179,7 @@ END:VCALENDAR"""
             logger.error(f"create_event error: {e}")
             return None
 
-    async def delete_single_occurrence(self, event_url, recurrence_id):
-        """Удаляет ТОЛЬКО одно вхождение повторяющегося события"""
-        try:
-            # Формируем URL для конкретного вхождения
-            # URL должен содержать RECURRENCE-ID
-            if recurrence_id:
-                # Добавляем RECURRENCE-ID к URL
-                base_url = event_url
-                if '.ics' in base_url:
-                    base_url = base_url.replace('.ics', f'_{recurrence_id}.ics')
-                else:
-                    base_url = f"{base_url}_{recurrence_id}"
-                
-                logger.info(f"Удаление конкретного вхождения: {base_url}")
-                
-                # Используем caldav библиотеку для удаления
-                cal = self.get_calendar()
-                if not cal:
-                    return False
-                
-                # Ищем событие с таким URL
-                for event in cal.events():
-                    if str(event.url) == base_url or str(event.url) == event_url:
-                        event.delete()
-                        logger.info(f"Удалено вхождение: {base_url}")
-                        return True
-            
-            return False
-        except Exception as e:
-            logger.error(f"delete_single_occurrence error: {e}")
-            return False
-
     async def delete_event(self, event_url):
-        """Удаляет обычное событие (не повторяющееся)"""
         try:
             cal = self.get_calendar()
             if not cal:
@@ -300,12 +277,7 @@ END:VCALENDAR"""
             start_utc = start_date.astimezone(pytz.UTC)
             end_utc = end_date.astimezone(pytz.UTC)
             
-            # Используем search вместо date_search (устаревший)
-            from caldav.lib.namespace import ns
-            import xml.etree.ElementTree as ET
-            
-            # Формируем запрос на поиск событий с expand=True
-            # Это заставит сервер развернуть повторяющиеся события
+            # Используем search
             results = cal.search(
                 start=start_utc,
                 end=end_utc,
@@ -335,20 +307,11 @@ END:VCALENDAR"""
                     # Проверяем, является ли событие повторяющимся
                     is_recurring = hasattr(vevent, 'rrule') and vevent.rrule.value is not None
                     
-                    # Получаем UID и RECURRENCE-ID если есть
-                    uid = str(vevent.uid.value) if hasattr(vevent, 'uid') else None
-                    recurrence_id = None
-                    if hasattr(vevent, 'recurrence_id'):
-                        recurrence_id = str(vevent.recurrence_id.value)
-                    
                     result.append({
                         'url': event_url,
                         'summary': summary,
                         'start': dtstart,
-                        'is_recurring': is_recurring,
-                        'uid': uid,
-                        'recurrence_id': recurrence_id,
-                        'raw_url': event_url
+                        'is_recurring': is_recurring
                     })
                 except Exception as e:
                     logger.error(f"parse event error: {e}")
@@ -379,12 +342,14 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
     today = now.date()
     tomorrow = today + timedelta(days=1)
     
-    # Запрашиваем события с начала сегодняшнего дня до конца завтрашнего
-    start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_date = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59)
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-    start_date = tz.localize(start_date)
-    end_date = tz.localize(end_date)
+    
+    # Создаём naive datetime и затем делаем aware
+    start_naive = datetime(today.year, today.month, today.day, 0, 0, 0)
+    end_naive = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59)
+    
+    start_date = tz.localize(start_naive)
+    end_date = tz.localize(end_naive)
     
     events = await api.get_events_for_date_range(start_date, end_date)
     
@@ -475,11 +440,15 @@ async def get_pending_notifications() -> List[Dict]:
     # Получаем события напрямую из календаря
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     today = now.date()
-    start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_date = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-    start_date = tz.localize(start_date)
-    end_date = tz.localize(end_date)
+    
+    # Создаём naive datetime и затем делаем aware
+    start_naive = datetime(today.year, today.month, today.day, 0, 0, 0)
+    end_naive = datetime(today.year, today.month, today.day, 23, 59, 59)
+    
+    start_date = tz.localize(start_naive)
+    end_date = tz.localize(end_naive)
     
     events = await api.get_events_for_date_range(start_date, end_date)
     
@@ -497,10 +466,7 @@ async def get_pending_notifications() -> List[Dict]:
                 'short_id': short_id,
                 'text': ev['summary'],
                 'time': ev['start'],
-                'is_recurring': ev.get('is_recurring', False),
-                'uid': ev.get('uid'),
-                'recurrence_id': ev.get('recurrence_id'),
-                'raw_url': ev.get('raw_url')
+                'is_recurring': ev.get('is_recurring', False)
             }
             pending.append(event_data)
             pending_events_store[short_id] = event_data
@@ -515,14 +481,13 @@ async def show_all_events(chat_id, persistent=False):
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     
-    start_date = now - timedelta(days=7)
-    start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_date = now + timedelta(days=30)
-    end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=0)
-    
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-    start_date = tz.localize(start_date)
-    end_date = tz.localize(end_date)
+    
+    start_naive = datetime(now.year, now.month, now.day, 0, 0, 0) - timedelta(days=7)
+    end_naive = datetime(now.year, now.month, now.day, 23, 59, 59) + timedelta(days=30)
+    
+    start_date = tz.localize(start_naive)
+    end_date = tz.localize(end_naive)
     
     events = await api.get_events_for_date_range(start_date, end_date)
     
@@ -637,17 +602,20 @@ async def check_pending():
     
     while True:
         if notifications_enabled:
-            pending = await get_pending_notifications()
-            current_hour = get_current_time().hour
-            
-            for p in pending:
-                event_key = f"{p['short_id']}_{p['time'].strftime('%Y%m%d')}"
-                last_hour = last_notification_hour.get(event_key)
+            try:
+                pending = await get_pending_notifications()
+                current_hour = get_current_time().hour
                 
-                if last_hour != current_hour:
-                    await show_pending_actions(ADMIN_ID, p['short_id'], p['text'], p['time'], p['is_recurring'])
-                    last_notification_hour[event_key] = current_hour
-                    logger.info(f"Отправлено уведомление для: {p['text']} (час {current_hour})")
+                for p in pending:
+                    event_key = f"{p['short_id']}_{p['time'].strftime('%Y%m%d')}"
+                    last_hour = last_notification_hour.get(event_key)
+                    
+                    if last_hour != current_hour:
+                        await show_pending_actions(ADMIN_ID, p['short_id'], p['text'], p['time'], p['is_recurring'])
+                        last_notification_hour[event_key] = current_hour
+                        logger.info(f"Отправлено уведомление для: {p['text']} (час {current_hour})")
+            except Exception as e:
+                logger.error(f"check_pending error: {e}")
         
         await asyncio.sleep(60)
 
@@ -697,7 +665,6 @@ END:VCALENDAR"""
         return False
 
 async def mark_done(short_id):
-    """Отмечает событие как выполненное - удаляет ТОЛЬКО текущее вхождение"""
     global pending_events_store
     
     event_data = pending_events_store.get(short_id)
@@ -709,11 +676,9 @@ async def mark_done(short_id):
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
         if event_data.get('is_recurring'):
-            # Для повторяющихся событий добавляем EXDATE
-            logger.info(f"Добавление исключения для повторяющегося события: {event_data['text']} на {event_data['time']}")
+            logger.info(f"Добавление исключения для повторяющегося события: {event_data['text']}")
             result = await api.add_exception_to_recurring(event_data['url'], event_data['time'])
         else:
-            # Для обычных событий удаляем
             logger.info(f"Удаление обычного события: {event_data['text']}")
             result = await api.delete_event(event_data['url'])
         
@@ -842,7 +807,6 @@ async def handle_done(cb):
         except:
             pass
         await cb.answer("✅ Событие отмечено как выполненное!")
-        # Небольшая задержка перед обновлением
         await asyncio.sleep(2)
         await show_calendar_events(cb.from_user.id, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
@@ -1029,8 +993,7 @@ async def info(cb):
 
 📌 **Как работает удаление повторяющихся событий:**
 • При отметке "Выполнено" удаляется ТОЛЬКО текущее вхождение
-• Следующие события серии сохраняются
-• Прошедшие события остаются в календаре"""
+• Следующие события серии сохраняются"""
     await cb.message.edit_text(info_text)
     await cb.answer()
 
