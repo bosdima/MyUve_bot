@@ -56,7 +56,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "1.5"
+BOT_VERSION = "1.6"
 BOT_VERSION_DATE = "23.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -356,6 +356,9 @@ END:VCALENDAR"""
             rule = rrulestr(rrule_str, dtstart=dtstart)
             
             occurrences = []
+            # Начинаем с начала дня from_date, чтобы захватить все события за сегодня
+            day_start = from_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            
             for occ in rule:
                 if occ.tzinfo is None:
                     occ = tz.localize(occ)
@@ -365,7 +368,8 @@ END:VCALENDAR"""
                 if occ > to_date:
                     break
                 
-                if occ < from_date:
+                # Показываем все события начиная с сегодняшнего дня (включая прошедшие)
+                if occ < day_start:
                     continue
                 
                 occ_date_str = occ.strftime('%Y%m%d')
@@ -408,7 +412,8 @@ async def update_calendar_cache():
     base_events = await api.get_all_calendar_events()
     
     end_date = now + timedelta(days=60)
-    start_date = now  # Только с сегодняшнего дня
+    # Начинаем с начала сегодняшнего дня, чтобы захватить все события за сегодня
+    start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
     expanded_events = []
     
     for event in base_events:
@@ -416,6 +421,7 @@ async def update_calendar_cache():
             occurrences = api.expand_recurring_event(event, start_date, end_date)
             expanded_events.extend(occurrences)
         else:
+            # Показываем все события с сегодняшнего дня
             if event['start'] >= start_date:
                 expanded_events.append(event)
     
@@ -432,10 +438,16 @@ async def update_calendar_cache():
     last_sync_time = now
     logger.info(f"Обновлён кэш календаря: {len(calendar_events_cache['all'])} событий (базовых: {len(base_events)})")
     
+    # Логируем все события за сегодня для отладки
+    today_events = [ev for ev in calendar_events_cache['all'] if ev['start'].date() == now.date()]
+    logger.info(f"Событий на сегодня: {len(today_events)}")
+    for ev in today_events:
+        logger.info(f"  {ev['start'].strftime('%H:%M')} - {ev['summary']} (просрочено: {ev['start'] <= now})")
+    
     return calendar_events_cache['all']
 
 async def get_pending_notifications() -> List[Dict]:
-    """Получает просроченные уведомления (только за сегодня)"""
+    """Получает просроченные уведомления (только за сегодня, которые уже прошли)"""
     global pending_events_store
     now = get_current_time()
     await update_calendar_cache()
@@ -469,6 +481,10 @@ async def get_pending_notifications() -> List[Dict]:
     
     pending.sort(key=lambda x: x['time'])
     logger.info(f"Найдено просроченных событий за сегодня: {len(pending)}")
+    
+    # Логируем просроченные события
+    for p in pending:
+        logger.info(f"  Просрочено: {p['time'].strftime('%H:%M')} - {p['text']}")
     
     return pending
 
@@ -688,7 +704,6 @@ async def check_pending():
     """Проверяет просроченные события и отправляет уведомления"""
     global notifications_enabled
     
-    # Множество для отслеживания уже отправленных уведомлений за эту сессию
     sent_notifications = set()
     
     while True:
@@ -697,16 +712,13 @@ async def check_pending():
             now = get_current_time()
             
             for p in pending:
-                # Создаем уникальный ключ для события
                 notification_key = f"{p['short_id']}_{p['time'].strftime('%Y%m%d%H')}"
                 
-                # Отправляем уведомление, если еще не отправляли в этом часе
                 if notification_key not in sent_notifications:
                     await show_pending_actions(ADMIN_ID, p['short_id'], p['text'], p['time'], p['is_recurring'])
                     sent_notifications.add(notification_key)
                     logger.info(f"Отправлено уведомление для события: {p['text']} в {p['time']}")
             
-            # Очищаем старые ключи (старше 2 часов)
             current_hour = now.strftime('%Y%m%d%H')
             to_remove = [key for key in sent_notifications if key.split('_')[1][:10] != current_hour[:10]]
             for key in to_remove:
@@ -718,7 +730,6 @@ async def snooze_event(short_id, hours=1):
     """Откладывает событие на указанное количество часов"""
     global pending_events_store
     
-    # Получаем данные события из хранилища
     event_data = pending_events_store.get(short_id)
     if not event_data:
         logger.error(f"Событие не найдено в хранилище для short_id: {short_id}")
@@ -753,8 +764,6 @@ END:VCALENDAR"""
         if cal:
             cal.save_event(ical)
             logger.info(f"Событие отложено на {hours} часов: {event_data['text']}")
-            
-            # Удаляем из хранилища
             del pending_events_store[short_id]
             return True
         
@@ -767,7 +776,6 @@ async def mark_done(short_id):
     """Отмечает событие как выполненное"""
     global pending_events_store
     
-    # Получаем данные события из хранилища
     event_data = pending_events_store.get(short_id)
     if not event_data:
         logger.error(f"Событие не найдено в хранилище для short_id: {short_id}")
@@ -777,18 +785,14 @@ async def mark_done(short_id):
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
         if event_data.get('is_recurring'):
-            # Для повторяющихся событий добавляем EXDATE
             logger.info(f"Добавление исключения для повторяющегося события: {event_data['url']}")
             result = await api.add_exception_to_recurring(event_data['url'], event_data['time'])
         else:
-            # Для обычных событий удаляем
             logger.info(f"Удаление обычного события: {event_data['url']}")
             result = await api.delete_event(event_data['url'])
         
         if result:
-            # Удаляем из хранилища
             del pending_events_store[short_id]
-            # Принудительно обновляем кэш
             await update_calendar_cache()
         
         return result
@@ -815,7 +819,6 @@ async def show_pending_list(chat_id, persistent=False):
         await send_persistent_message(chat_id, msg)
         return
     
-    # Отправляем общее сообщение о количестве
     await send_persistent_message(chat_id, f"⚠️ **ПРОСРОЧЕННЫЕ УВЕДОМЛЕНИЯ** ({len(pending)} шт.)\n")
     
     for idx, p in enumerate(pending, 1):
