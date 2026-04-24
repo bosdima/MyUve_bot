@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.7"
+BOT_VERSION = "3.8"
 BOT_VERSION_DATE = "24.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -130,16 +130,10 @@ class CalDAVCalendarAPI:
     def __init__(self, email, pwd):
         self.email = email
         self.pwd = pwd
-        self.client = None
-
-    def _get_client(self):
-        if self.client is None:
-            self.client = caldav.DAVClient(url=YANDEX_CALDAV_URL, username=self.email, password=self.pwd)
-        return self.client
 
     def get_calendar(self):
         try:
-            client = self._get_client()
+            client = caldav.DAVClient(url=YANDEX_CALDAV_URL, username=self.email, password=self.pwd)
             principal = client.principal()
             calendars = principal.calendars()
             return calendars[0] if calendars else None
@@ -191,18 +185,14 @@ END:VCALENDAR"""
             logger.error(f"delete_event error: {e}")
             return False
 
-    async def delete_recurring_instance(self, event_url, recurrence_date, retry_count=3):
-        """
-        Удаляет конкретное вхождение повторяющегося события.
-        Для этого нужно создать новое событие с RECURRENCE-ID и STATUS:CANCELLED
-        """
+    async def add_exception_to_recurring(self, event_url, exception_date, retry_count=3):
+        """Добавляет EXDATE к повторяющемуся событию (правильный метод для Яндекс Календаря)"""
         for attempt in range(retry_count):
             try:
                 cal = self.get_calendar()
                 if not cal:
                     return False
                 
-                # Находим основное событие
                 target_event = None
                 for event in cal.events():
                     if str(event.url) == event_url:
@@ -213,49 +203,63 @@ END:VCALENDAR"""
                     logger.error(f"Event not found: {event_url}")
                     return False
                 
-                # Получаем UID основного события
-                vevent = target_event.vobject_instance.vevent
-                uid = str(vevent.uid.value)
+                ical_data = target_event.data
                 
-                # Конвертируем дату в UTC для RECURRENCE-ID
-                if recurrence_date.tzinfo is None:
-                    recurrence_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(recurrence_date)
-                recurrence_utc = recurrence_date.astimezone(pytz.UTC)
-                recurrence_id_str = recurrence_utc.strftime('%Y%m%dT%H%M%SZ')
+                # Переводим дату в UTC для EXDATE
+                if exception_date.tzinfo is None:
+                    exception_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(exception_date)
+                exdate_utc = exception_date.astimezone(pytz.UTC)
+                exdate_str = exdate_utc.strftime('%Y%m%dT%H%M%SZ')
                 
-                # Формируем URL для удаления конкретного вхождения
-                # URL обычно имеет вид: .../UID.ics
-                base_url = str(target_event.url)
-                base_url = re.sub(r'\.ics$', '', base_url)
-                instance_url = f"{base_url}_{recurrence_id_str}.ics"
+                logger.info(f"Добавление EXDATE: {exdate_str} для {event_url}")
                 
-                # Создаем iCal для удаления конкретного вхождения
-                tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-                start_local = recurrence_date.astimezone(tz)
-                end_local = start_local + timedelta(hours=1)
+                # Добавляем EXDATE в iCal данные
+                if 'EXDATE' in ical_data:
+                    lines = ical_data.split('\n')
+                    new_lines = []
+                    for line in lines:
+                        if line.startswith('EXDATE'):
+                            if ':' in line:
+                                current_part = line.split(':', 1)[1]
+                                if ';' in current_part:
+                                    current_part = current_part.split(';')[-1]
+                                exdate_list = current_part.split(',')
+                                exdate_list = [x for x in exdate_list if x]
+                                if exdate_str not in exdate_list:
+                                    exdate_list.append(exdate_str)
+                                    new_lines.append(f'EXDATE:{",".join(exdate_list)}')
+                                else:
+                                    new_lines.append(line)
+                            else:
+                                new_lines.append(line)
+                        else:
+                            new_lines.append(line)
+                    ical_data = '\n'.join(new_lines)
+                else:
+                    lines = ical_data.split('\n')
+                    new_lines = []
+                    inserted = False
+                    for line in lines:
+                        new_lines.append(line)
+                        if line.startswith('RRULE') and not inserted:
+                            new_lines.append(f'EXDATE:{exdate_str}')
+                            inserted = True
+                    if not inserted:
+                        for i, line in enumerate(new_lines):
+                            if line.strip() == 'END:VEVENT':
+                                new_lines.insert(i, f'EXDATE:{exdate_str}')
+                                break
+                    ical_data = '\n'.join(new_lines)
                 
-                ical = f"""BEGIN:VCALENDAR
-VERSION:2.0
-METHOD:CANCEL
-BEGIN:VEVENT
-UID:{uid}
-RECURRENCE-ID;TZID={config.get('timezone', 'Europe/Moscow')}:{start_local.strftime('%Y%m%dT%H%M%S')}
-DTSTART;TZID={config.get('timezone', 'Europe/Moscow')}:{start_local.strftime('%Y%m%dT%H%M%S')}
-DTEND;TZID={config.get('timezone', 'Europe/Moscow')}:{end_local.strftime('%Y%m%dT%H%M%S')}
-SUMMARY:{vevent.summary.value}
-STATUS:CANCELLED
-END:VEVENT
-END:VCALENDAR"""
+                target_event.data = ical_data
+                target_event.save()
+                logger.info(f"Исключение добавлено для {event_url} на {exdate_str}")
                 
-                # Сохраняем событие-отмену
-                cal.save_event(ical)
-                logger.info(f"Отмена вхождения {recurrence_id_str} для {uid}")
-                
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
                 return True
                 
             except Exception as e:
-                logger.error(f"delete_recurring_instance attempt {attempt + 1}/{retry_count} error: {e}")
+                logger.error(f"add_exception_to_recurring attempt {attempt + 1}/{retry_count} error: {e}")
                 if attempt < retry_count - 1:
                     await asyncio.sleep(5)
                 else:
@@ -297,13 +301,14 @@ END:VCALENDAR"""
                         is_recurring = True
                         rrule_str = vevent.rrule.value
                     
-                    # Проверяем, не является ли это событие отменой (RECURRENCE-ID)
-                    is_cancelled = False
-                    recurrence_id = None
-                    if hasattr(vevent, 'status') and vevent.status.value == 'CANCELLED':
-                        is_cancelled = True
-                    if hasattr(vevent, 'recurrence_id') and vevent.recurrence_id.value:
-                        recurrence_id = str(vevent.recurrence_id.value)
+                    # Получаем EXDATE (исключенные даты)
+                    exdates = []
+                    try:
+                        if hasattr(vevent, 'exdate') and vevent.exdate.value_list:
+                            for ex in vevent.exdate.value_list:
+                                exdates.append(str(ex))
+                    except:
+                        pass
                     
                     result.append({
                         'url': event_url,
@@ -312,8 +317,7 @@ END:VCALENDAR"""
                         'is_recurring': is_recurring,
                         'rrule': rrule_str,
                         'uid': uid,
-                        'is_cancelled': is_cancelled,
-                        'recurrence_id': recurrence_id
+                        'exdates': exdates
                     })
                 except Exception as e:
                     logger.error(f"parse event error: {e}")
@@ -324,8 +328,8 @@ END:VCALENDAR"""
             logger.error(f"get_all_events error: {e}")
             return []
 
-    def expand_recurring_event(self, event: Dict, target_date: date, include_today: bool = True, cancelled_instances: List[str] = None) -> List[datetime]:
-        """Разворачивает повторяющееся событие, исключая отмененные вхождения"""
+    def expand_recurring_event(self, event: Dict, target_date: date, include_today: bool = True) -> List[datetime]:
+        """Разворачивает повторяющееся событие, исключая даты в EXDATE"""
         if not event.get('is_recurring') or not DATEUTIL_AVAILABLE:
             return []
         
@@ -342,18 +346,26 @@ END:VCALENDAR"""
             end_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(end_date)
             end_date = end_date + timedelta(days=30)
             
-            occurrences = []
+            # Получаем исключенные даты из EXDATE
+            exdates = event.get('exdates', [])
+            exdates_clean = []
+            for ex in exdates:
+                # EXDATE может быть в формате YYYYMMDDTHHMMSSZ
+                if 'T' in ex:
+                    try:
+                        ex_date = datetime.strptime(ex.split('T')[0], '%Y%m%d')
+                        exdates_clean.append(ex_date.date())
+                    except:
+                        pass
             
-            # Список отмененных вхождений
-            cancelled = cancelled_instances or []
+            occurrences = []
             
             for occurrence in rule:
                 if occurrence.tzinfo is None:
                     occurrence = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(occurrence)
                 
-                # Проверяем, не отменено ли вхождение
-                occ_str = occurrence.strftime('%Y%m%dT%H%M%S')
-                if occ_str in cancelled:
+                # Проверяем, не исключена ли дата
+                if occurrence.date() in exdates_clean:
                     continue
                 
                 if include_today:
@@ -390,28 +402,16 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
     
     all_events = await api.get_all_events()
     
-    # Собираем отмененные вхождения для каждой серии
-    cancelled_by_uid = {}
-    for ev in all_events:
-        if ev.get('is_cancelled') and ev.get('recurrence_id'):
-            if ev['uid'] not in cancelled_by_uid:
-                cancelled_by_uid[ev['uid']] = []
-            cancelled_by_uid[ev['uid']].append(ev['recurrence_id'])
-    
     result = []
     
     for ev in all_events:
-        if ev.get('is_cancelled'):
-            continue
-            
         event_start = ev['start']
         event_date = event_start.date()
         
         if (event_date == today or event_date == tomorrow) and not ev.get('is_recurring'):
             result.append((event_start, ev))
         elif ev.get('is_recurring'):
-            cancelled = cancelled_by_uid.get(ev['uid'], [])
-            occurrences = api.expand_recurring_event(ev, tomorrow, include_today=True, cancelled_instances=cancelled)
+            occurrences = api.expand_recurring_event(ev, tomorrow, include_today=True)
             
             for occ in occurrences:
                 occ_date = occ.date()
@@ -514,20 +514,9 @@ async def get_pending_notifications() -> List[Dict]:
     
     all_events = await api.get_all_events()
     
-    # Собираем отмененные вхождения
-    cancelled_by_uid = {}
-    for ev in all_events:
-        if ev.get('is_cancelled') and ev.get('recurrence_id'):
-            if ev['uid'] not in cancelled_by_uid:
-                cancelled_by_uid[ev['uid']] = []
-            cancelled_by_uid[ev['uid']].append(ev['recurrence_id'])
-    
     pending = []
     
     for ev in all_events:
-        if ev.get('is_cancelled'):
-            continue
-            
         event_start = ev['start']
         event_date = event_start.date()
         
@@ -542,14 +531,12 @@ async def get_pending_notifications() -> List[Dict]:
                     'text': ev['summary'],
                     'time': ev['start'],
                     'is_recurring': False,
-                    'uid': ev.get('uid')
                 }
                 pending.append(event_data)
                 pending_events_store[short_id] = event_data
         
         elif ev.get('is_recurring'):
-            cancelled = cancelled_by_uid.get(ev['uid'], [])
-            occurrences = api.expand_recurring_event(ev, today, include_today=True, cancelled_instances=cancelled)
+            occurrences = api.expand_recurring_event(ev, today, include_today=True)
             
             for occ in occurrences:
                 occ_date = occ.date()
@@ -563,7 +550,6 @@ async def get_pending_notifications() -> List[Dict]:
                         'text': ev['summary'],
                         'time': occ,
                         'is_recurring': True,
-                        'uid': ev.get('uid')
                     }
                     pending.append(event_data)
                     pending_events_store[short_id] = event_data
@@ -586,20 +572,9 @@ async def show_all_events(chat_id, persistent=False):
     
     all_events = await api.get_all_events()
     
-    # Собираем отмененные вхождения
-    cancelled_by_uid = {}
-    for ev in all_events:
-        if ev.get('is_cancelled') and ev.get('recurrence_id'):
-            if ev['uid'] not in cancelled_by_uid:
-                cancelled_by_uid[ev['uid']] = []
-            cancelled_by_uid[ev['uid']].append(ev['recurrence_id'])
-    
     events_by_date = {}
     
     for ev in all_events:
-        if ev.get('is_cancelled'):
-            continue
-            
         event_start = ev['start']
         event_date = event_start.date()
         
@@ -609,8 +584,7 @@ async def show_all_events(chat_id, persistent=False):
             events_by_date[event_date].append(ev)
         
         elif ev.get('is_recurring'):
-            cancelled = cancelled_by_uid.get(ev['uid'], [])
-            occurrences = api.expand_recurring_event(ev, end_date, include_today=True, cancelled_instances=cancelled)
+            occurrences = api.expand_recurring_event(ev, end_date, include_today=True)
             
             for occ in occurrences:
                 occ_date = occ.date()
@@ -795,9 +769,10 @@ async def mark_done(short_id):
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
         if event_data.get('is_recurring'):
-            # Для повторяющихся событий - удаляем конкретное вхождение
-            result = await api.delete_recurring_instance(event_data['url'], event_data['time'], retry_count=3)
+            # Для повторяющихся событий добавляем EXDATE
+            result = await api.add_exception_to_recurring(event_data['url'], event_data['time'], retry_count=3)
         else:
+            # Для обычных событий удаляем
             result = await api.delete_event(event_data['url'])
         
         if result:
@@ -927,6 +902,7 @@ async def handle_done(cb):
         except:
             pass
         await bot.send_message(cb.from_user.id, "✅ Событие отмечено как выполненное!")
+        await asyncio.sleep(2)  # Ждем синхронизации
         await show_calendar_events(cb.from_user.id, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
