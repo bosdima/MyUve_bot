@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.5"
+BOT_VERSION = "4.5.1"
 BOT_VERSION_DATE = "24.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -89,10 +89,10 @@ def parse_datetime(date_str: str):
     now = get_current_time()
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
     patterns = [
-        r'^(\d{1,2}).(\d{1,2}).(\d{2,4})\s+(\d{1,2}):(\d{2})$',
-        r'^(\d{1,2}).(\d{1,2})\s+(\d{1,2}):(\d{2})$',
-        r'^(\d{1,2}).(\d{1,2}).(\d{2,4})$',
-        r'^(\d{1,2}).(\d{1,2})$'
+        r'^(\d{1,2})\.(\d{1,2})\.(\d{2,4})\s+(\d{1,2}):(\d{2})$',
+        r'^(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})$',
+        r'^(\d{1,2})\.(\d{1,2})\.(\d{2,4})$',
+        r'^(\d{1,2})\.(\d{1,2})$'
     ]
     for pat in patterns:
         m = re.match(pat, date_str.strip())
@@ -231,7 +231,6 @@ END:VCALENDAR"""
                 
                 for line in lines:
                     if line.strip().startswith('EXDATE:'):
-                        # Обновляем существующий EXDATE
                         prefix, values = line.split(':', 1)
                         if ';VALUE=DATE-TIME' in values:
                             values = values.replace(';VALUE=DATE-TIME', '')
@@ -243,14 +242,12 @@ END:VCALENDAR"""
                     else:
                         new_lines.append(line)
                 
-                # Если EXDATE не было — добавляем после RRULE
                 if not exdate_added:
                     for i, line in enumerate(new_lines):
                         if line.strip().startswith('RRULE:'):
                             new_lines.insert(i+1, f"EXDATE:{exdate_str}")
                             break
                     else:
-                        # Фоллбэк: перед END:VEVENT
                         for i, line in enumerate(new_lines):
                             if line.strip() == 'END:VEVENT':
                                 new_lines.insert(i, f"EXDATE:{exdate_str}")
@@ -270,7 +267,7 @@ END:VCALENDAR"""
         return False
 
     async def get_all_events(self) -> List[Dict]:
-        """Получает все события, включая EXDATE"""
+        """Получает все события, включая EXDATE — исправлено для всех типов событий"""
         try:
             cal = self.get_calendar()
             if not cal:
@@ -285,19 +282,28 @@ END:VCALENDAR"""
                     vevent = ev.vobject_instance.vevent
                     dtstart_raw = vevent.dtstart.value
                     
+                    # Обработка всех типов дат: datetime, date, all-day
                     if isinstance(dtstart_raw, datetime):
                         if dtstart_raw.tzinfo is None:
                             dtstart = tz.localize(dtstart_raw)
                         else:
                             dtstart = dtstart_raw.astimezone(tz)
-                    else:
+                    elif isinstance(dtstart_raw, date):
+                        # All-day event: создаём начало дня в локальном поясе
                         dtstart = tz.localize(datetime.combine(dtstart_raw, datetime.min.time()))
+                    else:
+                        logger.warning(f"Unknown dtstart type: {type(dtstart_raw)}")
+                        continue
 
-                    summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия'
+                    summary = str(vevent.summary.value) if hasattr(vevent, 'summary') and vevent.summary.value else 'Без названия'
                     event_url = str(ev.url)
                     
                     is_recurring = hasattr(vevent, 'rrule') and vevent.rrule.value is not None
-                    rrule_str = vevent.rrule.to_ical().decode() if is_recurring and hasattr(vevent.rrule, 'to_ical') else None
+                    rrule_str = None
+                    if is_recurring and hasattr(vevent.rrule, 'to_ical'):
+                        rrule_str = vevent.rrule.to_ical().decode()
+                    elif is_recurring:
+                        rrule_str = str(vevent.rrule.value)
 
                     # Парсим EXDATE (полный формат!)
                     exdates = []
@@ -309,7 +315,7 @@ END:VCALENDAR"""
                                     vals = vals.replace(';VALUE=DATE-TIME', '')
                                 for ex in vals.split(','):
                                     ex = ex.strip()
-                                    if ex and 'T' in ex:  # Только полные таймстампы
+                                    if ex and 'T' in ex:
                                         exdates.append(ex)
 
                     result.append({
@@ -318,10 +324,11 @@ END:VCALENDAR"""
                         'start': dtstart,
                         'is_recurring': is_recurring,
                         'rrule': rrule_str,
-                        'exdates': exdates
+                        'exdates': exdates,
+                        'all_day': not isinstance(dtstart_raw, datetime)
                     })
                 except Exception as e:
-                    logger.error(f"parse event error: {e}")
+                    logger.error(f"parse event error: {e}", exc_info=True)
                     continue
             return result
         except Exception as e:
@@ -342,23 +349,18 @@ END:VCALENDAR"""
             rule = rrulestr(rrule_str, dtstart=start_time)
             tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
             
-            # Диапазон поиска
             end_dt = tz.localize(datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)) + timedelta(days=60)
 
-            # EXDATE хранятся как полный UTC-таймстамп: YYYYMMDDTHHMMSSZ
             excluded_set = set(event.get('exdates', []))
 
             occurrences = []
-            # Используем .between() для корректной итерации
             for occurrence in rule.between(start_time, end_dt, inc=True):
                 if occurrence.tzinfo is None:
                     occurrence = tz.localize(occurrence)
                 
-                # Конвертируем вхождение в тот же формат, что и EXDATE
                 occ_utc = occurrence.astimezone(pytz.UTC)
-                occ_key = occ_utc.strftime('%Y%m%dT%H%M%SZ')  # 🔑 Полный ключ!
+                occ_key = occ_utc.strftime('%Y%m%dT%H%M%SZ')
                 
-                # Пропускаем, если точное совпадение по времени
                 if occ_key in excluded_set:
                     logger.debug(f"Пропущено исключённое вхождение: {occ_key}")
                     continue
@@ -485,6 +487,7 @@ async def show_calendar_events(chat_id, persistent=False):
         await send_with_auto_delete(chat_id, text, reply_markup=kb, delay=3600)
 
 async def get_pending_notifications() -> List[Dict]:
+    """Получает просроченные события — исправлено для всех типов"""
     global pending_events_store
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
@@ -494,32 +497,39 @@ async def get_pending_notifications() -> List[Dict]:
     pending = []
     
     for ev in all_events:
-        if not ev.get('is_recurring'):
-            if ev['start'].date() == today and ev['start'] <= now:
-                key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d%H%M')}"
+        event_start = ev['start']
+        event_date = event_start.date()
+        
+        # Проверяем: событие сегодня И время уже прошло (или all-day событие)
+        is_today = (event_date == today)
+        is_past = (event_start <= now) or ev.get('all_day', False)
+        
+        if is_today and is_past:
+            if not ev.get('is_recurring'):
+                key = f"{ev['url']}_{event_start.strftime('%Y%m%d%H%M')}"
                 short_id = hashlib.md5(key.encode()).hexdigest()[:12]
                 pending_events_store[short_id] = {
                     'url': ev['url'],
                     'short_id': short_id,
                     'text': ev['summary'],
-                    'time': ev['start'],
+                    'time': event_start,
                     'is_recurring': False
                 }
                 pending.append(pending_events_store[short_id])
-        else:
-            occurrences = api.expand_recurring_event(ev, today, include_today=True)
-            for occ in occurrences:
-                if occ.date() == today and occ <= now:
-                    key = f"{ev['url']}_{occ.strftime('%Y%m%d%H%M')}"
-                    short_id = hashlib.md5(key.encode()).hexdigest()[:12]
-                    pending_events_store[short_id] = {
-                        'url': ev['url'],
-                        'short_id': short_id,
-                        'text': ev['summary'],
-                        'time': occ,
-                        'is_recurring': True
-                    }
-                    pending.append(pending_events_store[short_id])
+            else:
+                occurrences = api.expand_recurring_event(ev, today, include_today=True)
+                for occ in occurrences:
+                    if occ.date() == today and (occ <= now or ev.get('all_day', False)):
+                        key = f"{ev['url']}_{occ.strftime('%Y%m%d%H%M')}"
+                        short_id = hashlib.md5(key.encode()).hexdigest()[:12]
+                        pending_events_store[short_id] = {
+                            'url': ev['url'],
+                            'short_id': short_id,
+                            'text': ev['summary'],
+                            'time': occ,
+                            'is_recurring': True
+                        }
+                        pending.append(pending_events_store[short_id])
 
     pending.sort(key=lambda x: x['time'])
     logger.info(f"Найдено просроченных событий за сегодня: {len(pending)}")
