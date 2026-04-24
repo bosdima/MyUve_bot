@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.5.1"
+BOT_VERSION = "4.5"
 BOT_VERSION_DATE = "24.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -351,16 +351,20 @@ END:VCALENDAR"""
             
             end_dt = tz.localize(datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)) + timedelta(days=60)
 
+            # EXDATE хранятся как полный UTC-таймстамп: YYYYMMDDTHHMMSSZ
             excluded_set = set(event.get('exdates', []))
 
             occurrences = []
+            # 🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: используем .between() для корректной итерации
             for occurrence in rule.between(start_time, end_dt, inc=True):
                 if occurrence.tzinfo is None:
                     occurrence = tz.localize(occurrence)
                 
+                # Конвертируем вхождение в тот же формат, что и EXDATE
                 occ_utc = occurrence.astimezone(pytz.UTC)
                 occ_key = occ_utc.strftime('%Y%m%dT%H%M%SZ')
                 
+                # 🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: сравниваем полный таймстамп, а не только дату!
                 if occ_key in excluded_set:
                     logger.debug(f"Пропущено исключённое вхождение: {occ_key}")
                     continue
