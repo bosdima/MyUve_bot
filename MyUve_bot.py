@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.5"
+BOT_VERSION = "3.6"
 BOT_VERSION_DATE = "24.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -185,77 +185,84 @@ END:VCALENDAR"""
             logger.error(f"delete_event error: {e}")
             return False
 
-    async def add_exception_to_recurring(self, event_url, exception_date):
-        """Добавляет EXDATE к повторяющемуся событию"""
-        try:
-            cal = self.get_calendar()
-            if not cal:
-                return False
-            
-            target_event = None
-            for event in cal.events():
-                if str(event.url) == event_url:
-                    target_event = event
-                    break
-            
-            if not target_event:
-                return False
-            
-            ical_data = target_event.data
-            
-            # Переводим дату в UTC для EXDATE
-            if exception_date.tzinfo is None:
-                exception_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(exception_date)
-            exdate_utc = exception_date.astimezone(pytz.UTC)
-            exdate_str = exdate_utc.strftime('%Y%m%dT%H%M%SZ')
-            
-            # Ищем существующие EXDATE строки
-            if 'EXDATE' in ical_data:
-                lines = ical_data.split('\n')
-                new_lines = []
-                for line in lines:
-                    if line.startswith('EXDATE'):
-                        if ':' in line:
-                            current_part = line.split(':', 1)[1]
-                            if ';' in current_part:
-                                current_part = current_part.split(';')[-1]
-                            exdate_list = current_part.split(',')
-                            exdate_list = [x for x in exdate_list if x]
-                            if exdate_str not in exdate_list:
-                                exdate_list.append(exdate_str)
-                                new_lines.append(f'EXDATE:{",".join(exdate_list)}')
+    async def add_exception_to_recurring(self, event_url, exception_date, retry_count=3):
+        """Добавляет EXDATE к повторяющемуся событию с повторными попытками"""
+        for attempt in range(retry_count):
+            try:
+                cal = self.get_calendar()
+                if not cal:
+                    return False
+                
+                target_event = None
+                for event in cal.events():
+                    if str(event.url) == event_url:
+                        target_event = event
+                        break
+                
+                if not target_event:
+                    return False
+                
+                ical_data = target_event.data
+                
+                # Переводим дату в UTC для EXDATE
+                if exception_date.tzinfo is None:
+                    exception_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(exception_date)
+                exdate_utc = exception_date.astimezone(pytz.UTC)
+                exdate_str = exdate_utc.strftime('%Y%m%dT%H%M%SZ')
+                
+                # Ищем существующие EXDATE строки
+                if 'EXDATE' in ical_data:
+                    lines = ical_data.split('\n')
+                    new_lines = []
+                    for line in lines:
+                        if line.startswith('EXDATE'):
+                            if ':' in line:
+                                current_part = line.split(':', 1)[1]
+                                if ';' in current_part:
+                                    current_part = current_part.split(';')[-1]
+                                exdate_list = current_part.split(',')
+                                exdate_list = [x for x in exdate_list if x]
+                                if exdate_str not in exdate_list:
+                                    exdate_list.append(exdate_str)
+                                    new_lines.append(f'EXDATE:{",".join(exdate_list)}')
+                                else:
+                                    new_lines.append(line)
                             else:
                                 new_lines.append(line)
                         else:
                             new_lines.append(line)
-                    else:
+                    ical_data = '\n'.join(new_lines)
+                else:
+                    lines = ical_data.split('\n')
+                    new_lines = []
+                    inserted = False
+                    for line in lines:
                         new_lines.append(line)
-                ical_data = '\n'.join(new_lines)
-            else:
-                lines = ical_data.split('\n')
-                new_lines = []
-                inserted = False
-                for line in lines:
-                    new_lines.append(line)
-                    if line.startswith('RRULE') and not inserted:
-                        new_lines.append(f'EXDATE:{exdate_str}')
-                        inserted = True
-                if not inserted:
-                    for i, line in enumerate(new_lines):
-                        if line.strip() == 'END:VEVENT':
-                            new_lines.insert(i, f'EXDATE:{exdate_str}')
-                            break
-                ical_data = '\n'.join(new_lines)
-            
-            target_event.data = ical_data
-            target_event.save()
-            logger.info(f"Добавлено исключение для {event_url} на {exdate_str}")
-            
-            await asyncio.sleep(3)
-            return True
-        except Exception as e:
-            logger.error(f"add_exception_to_recurring error: {e}")
-            return False
+                        if line.startswith('RRULE') and not inserted:
+                            new_lines.append(f'EXDATE:{exdate_str}')
+                            inserted = True
+                    if not inserted:
+                        for i, line in enumerate(new_lines):
+                            if line.strip() == 'END:VEVENT':
+                                new_lines.insert(i, f'EXDATE:{exdate_str}')
+                                break
+                    ical_data = '\n'.join(new_lines)
+                
+                target_event.data = ical_data
+                target_event.save()
+                logger.info(f"Добавлено исключение для {event_url} на {exdate_str}")
+                
+                await asyncio.sleep(3)
+                return True
+                
+            except Exception as e:
+                logger.error(f"add_exception_to_recurring attempt {attempt + 1}/{retry_count} error: {e}")
+                if attempt < retry_count - 1:
+                    await asyncio.sleep(5)  # Ждем 5 секунд перед повторной попыткой
+                else:
+                    return False
+        
+        return False
 
     async def get_all_events(self) -> List[Dict]:
         """Получает ВСЕ события из календаря без фильтрации по дате"""
@@ -305,7 +312,6 @@ END:VCALENDAR"""
                         if hasattr(vevent, 'exdate') and vevent.exdate.value_list:
                             exdates = vevent.exdate.value_list
                     except AttributeError:
-                        # Некоторые версии vobject не имеют value_list
                         pass
                     
                     result.append({
@@ -575,7 +581,6 @@ async def get_pending_notifications() -> List[Dict]:
     pending.sort(key=lambda x: x['time'])
     logger.info(f"Найдено просроченных событий за сегодня: {len(pending)}")
     for p in pending:
-        # Исправлено: используем 'text' вместо 'summary'
         logger.info(f"  - {p['time'].strftime('%H:%M')}: {p['text']}")
     
     return pending
@@ -791,7 +796,8 @@ async def mark_done(short_id):
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
         if event_data.get('is_recurring'):
-            result = await api.add_exception_to_recurring(event_data['url'], event_data['time'])
+            # Для повторяющихся событий - добавляем исключение с повторными попытками
+            result = await api.add_exception_to_recurring(event_data['url'], event_data['time'], retry_count=3)
         else:
             result = await api.delete_event(event_data['url'])
         
@@ -912,6 +918,9 @@ async def handle_done(cb):
     short_id = cb.data.replace('done_', '')
     logger.info(f"Обработка done для short_id: {short_id}")
     
+    # Сначала отвечаем на callback, чтобы не было timeout
+    await cb.answer("⏳ Обработка...")
+    
     success = await mark_done(short_id)
     
     if success:
@@ -919,11 +928,12 @@ async def handle_done(cb):
             await cb.message.delete()
         except:
             pass
-        await cb.answer("✅ Событие отмечено как выполненное!")
+        # Отправляем новое уведомление об успехе
+        await bot.send_message(cb.from_user.id, "✅ Событие отмечено как выполненное!")
         await show_calendar_events(cb.from_user.id, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
-        await cb.answer("❌ Ошибка при удалении события!", show_alert=True)
+        await bot.send_message(cb.from_user.id, "❌ Ошибка при удалении события! Попробуйте позже.")
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
 async def handle_snooze(cb):
@@ -966,17 +976,18 @@ async def back_to_pending(cb):
     await cb.answer()
 
 async def process_snooze(cb, short_id, hours):
+    await cb.answer("⏳ Обработка...")
     success = await snooze_event(short_id, hours)
     if success:
         try:
             await cb.message.delete()
         except:
             pass
-        await cb.answer(f"✅ Событие отложено на {hours} час(ов)!")
+        await bot.send_message(cb.from_user.id, f"✅ Событие отложено на {hours} час(ов)!")
         await show_calendar_events(cb.from_user.id, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
-        await cb.answer("❌ Ошибка при откладывании!", show_alert=True)
+        await bot.send_message(cb.from_user.id, "❌ Ошибка при откладывании! Попробуйте позже.")
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('hour_'), state='*')
 async def handle_hour(cb):
