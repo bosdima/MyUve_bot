@@ -59,7 +59,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.2"
+BOT_VERSION = "4.3"
 BOT_VERSION_DATE = "24.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -73,9 +73,7 @@ config: Dict = {}
 notifications_enabled = True
 last_sync_time: Optional[datetime] = None
 
-# Хранилище для активных просроченных событий с их данными
 pending_events_store: Dict[str, Dict] = {}
-# Хранилище времени последнего уведомления для каждого события (в часах)
 last_notification_hour: Dict[str, int] = {}
 
 TIMEZONES = {
@@ -201,7 +199,7 @@ END:VCALENDAR"""
         Удаляет конкретное вхождение повторяющегося события.
         Следуя инструкции:
         1. Получаем UID серии.
-        2. Формируем RECURRENCE-ID в UTC.
+        2. Формируем RECURRENCE-ID в UTC (из локального времени события).
         3. Строим URL вида: .../UID_RECURRENCE-ID.ics
         4. Отправляем DELETE с заголовком If-Match (ETag).
         """
@@ -226,40 +224,34 @@ END:VCALENDAR"""
                 vevent = target_event.vobject_instance.vevent
                 uid = str(vevent.uid.value)
 
-                # Получаем ETag (необходим для If-Match)
-                # В библиотеке caldav ETag хранится в свойстве .etag
+                # Получаем ETag
                 etag = None
                 if hasattr(target_event, 'etag'):
                     etag = target_event.etag
                 elif hasattr(target_event, '_etag'):
                     etag = target_event._etag
-                else:
-                    # Пытаемся получить через PROPFIND (не реализовано, пропускаем)
-                    pass
 
                 # Формируем RECURRENCE-ID в UTC
+                # recurrence_date - это локальное время события (в часовом поясе пользователя)
                 if recurrence_date.tzinfo is None:
-                    recurrence_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(recurrence_date)
+                    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+                    recurrence_date = tz.localize(recurrence_date)
                 recurrence_utc = recurrence_date.astimezone(pytz.UTC)
                 recurrence_id_str = recurrence_utc.strftime('%Y%m%dT%H%M%SZ')
+                logger.info(f"RECURRENCE-ID: {recurrence_id_str} (UTC) для локального времени {recurrence_date}")
 
                 # Формируем URL для удаления конкретного вхождения
-                # Базовый URL события
                 base_url = str(target_event.url)
-                # Убираем расширение .ics, если есть
                 base_url = re.sub(r'\.ics$', '', base_url)
                 delete_url = f"{base_url}_{recurrence_id_str}.ics"
 
-                # Создаём сессию с аутентификацией
                 auth = HTTPBasicAuth(self.email, self.pwd)
-
                 headers = {'Content-Type': 'text/calendar'}
                 if etag:
                     headers['If-Match'] = etag
 
                 logger.info(f"DELETE {delete_url} with If-Match: {etag}")
 
-                # Отправляем DELETE запрос
                 response = requests.delete(delete_url, auth=auth, headers=headers)
 
                 if response.status_code == 204:
@@ -267,21 +259,17 @@ END:VCALENDAR"""
                     return True
                 elif response.status_code == 412:
                     logger.warning(f"Precondition Failed (ETag mismatch) для {delete_url}. Пробуем без If-Match.")
-                    # Повторяем без If-Match
                     response = requests.delete(delete_url, auth=auth, headers={'Content-Type': 'text/calendar'})
                     if response.status_code == 204:
                         logger.info(f"Вхождение {recurrence_id_str} удалено без ETag")
                         return True
                 elif response.status_code == 404:
                     logger.warning(f"URL {delete_url} не найден. Пробуем альтернативный формат.")
-                    # Пробуем добавить параметр recurrence-id
                     alt_url = f"{base_url}?recurrence-id={recurrence_id_str}"
                     response = requests.delete(alt_url, auth=auth, headers=headers)
                     if response.status_code == 204:
                         logger.info(f"Вхождение {recurrence_id_str} удалено через параметр")
                         return True
-                    else:
-                        logger.error(f"Альтернативный URL тоже не работает: {response.status_code}")
                 else:
                     logger.error(f"Ошибка при удалении: {response.status_code} - {response.text}")
 
@@ -298,12 +286,19 @@ END:VCALENDAR"""
                     return False
         return False
 
-    async def get_all_events(self) -> List[Dict]:
-        """Получает ВСЕ события из календаря"""
+    async def get_all_events(self, force_refresh: bool = True) -> List[Dict]:
+        """Получает ВСЕ события из календаря, считывая также EXDATE"""
         try:
             cal = self.get_calendar()
             if not cal:
                 return []
+
+            # При force_refresh=True библиотека caldav всё равно кеширует, но мы пересоздаём клиент
+            if force_refresh:
+                self.client = None
+                cal = self.get_calendar()
+                if not cal:
+                    return []
 
             events = cal.events()
             tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
@@ -332,7 +327,17 @@ END:VCALENDAR"""
                         is_recurring = True
                         rrule_str = vevent.rrule.value
 
-                    # Получаем ETag для возможного использования при удалении
+                    # Получаем EXDATE (исключённые даты)
+                    exdates = []
+                    ical_data = ev.data
+                    for line in ical_data.split('\n'):
+                        if line.startswith('EXDATE:'):
+                            exdate_part = line.replace('EXDATE:', '').replace(';VALUE=DATE-TIME', '')
+                            for ex in exdate_part.split(','):
+                                ex = ex.strip()
+                                if ex:
+                                    exdates.append(ex)
+
                     etag = None
                     if hasattr(ev, 'etag'):
                         etag = ev.etag
@@ -344,6 +349,7 @@ END:VCALENDAR"""
                         'is_recurring': is_recurring,
                         'rrule': rrule_str,
                         'uid': uid,
+                        'exdates': exdates,
                         'etag': etag
                     })
                 except Exception as e:
@@ -356,7 +362,7 @@ END:VCALENDAR"""
             return []
 
     def expand_recurring_event(self, event: Dict, target_date: date, include_today: bool = True) -> List[datetime]:
-        """Разворачивает повторяющееся событие"""
+        """Разворачивает повторяющееся событие, исключая даты в EXDATE"""
         if not event.get('is_recurring') or not DATEUTIL_AVAILABLE:
             return []
 
@@ -370,12 +376,27 @@ END:VCALENDAR"""
 
             end_date = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
             end_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(end_date)
-            end_date = end_date + timedelta(days=60)  # генерируем на 60 дней вперёд
+            end_date = end_date + timedelta(days=60)
+
+            # Исключённые даты из EXDATE
+            exdates = event.get('exdates', [])
+            excluded_dates = set()
+            for ex in exdates:
+                try:
+                    if 'T' in ex:
+                        date_part = ex.split('T')[0]
+                        excluded_dates.add(date_part)
+                except Exception:
+                    pass
 
             occurrences = []
             for occurrence in rule:
                 if occurrence.tzinfo is None:
                     occurrence = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(occurrence)
+
+                occ_date_str = occurrence.strftime('%Y%m%d')
+                if occ_date_str in excluded_dates:
+                    continue
 
                 if include_today:
                     if occurrence <= end_date:
@@ -407,38 +428,36 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
     today = now.date()
     tomorrow = today + timedelta(days=1)
 
-    all_events = await api.get_all_events()
+    all_events = await api.get_all_events(force_refresh=True)
 
     result = []
+    seen_keys = set()
 
     for ev in all_events:
         event_start = ev['start']
         event_date = event_start.date()
 
         if (event_date == today or event_date == tomorrow) and not ev.get('is_recurring'):
-            result.append((event_start, ev))
+            key = f"{ev['url']}_{event_start.strftime('%Y%m%d%H%M')}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                result.append((event_start, ev))
         elif ev.get('is_recurring'):
             occurrences = api.expand_recurring_event(ev, tomorrow, include_today=True)
             for occ in occurrences:
                 occ_date = occ.date()
                 if occ_date == today or occ_date == tomorrow:
-                    ev_copy = ev.copy()
-                    ev_copy['start'] = occ
-                    ev_copy['is_recurring'] = True
-                    result.append((occ, ev_copy))
+                    key = f"{ev['url']}_{occ.strftime('%Y%m%d%H%M')}"
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        ev_copy = ev.copy()
+                        ev_copy['start'] = occ
+                        ev_copy['is_recurring'] = True
+                        result.append((occ, ev_copy))
 
     result.sort(key=lambda x: x[0])
-
-    unique_result = []
-    seen_keys = set()
-    for dt, ev in result:
-        key = f"{ev['url']}_{dt.strftime('%Y%m%d%H%M')}"
-        if key not in seen_keys:
-            seen_keys.add(key)
-            unique_result.append((dt, ev))
-
-    logger.info(f"Найдено событий на сегодня/завтра: {len(unique_result)}")
-    return unique_result
+    logger.info(f"Найдено событий на сегодня/завтра: {len(result)}")
+    return result
 
 async def get_formatted_calendar_events():
     events = await get_today_tomorrow_events()
@@ -513,7 +532,7 @@ async def get_pending_notifications() -> List[Dict]:
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     today = now.date()
 
-    all_events = await api.get_all_events()
+    all_events = await api.get_all_events(force_refresh=True)
 
     pending = []
 
@@ -573,7 +592,7 @@ async def show_all_events(chat_id, persistent=False):
     start_date = today - timedelta(days=7)
     end_date = today + timedelta(days=30)
 
-    all_events = await api.get_all_events()
+    all_events = await api.get_all_events(force_refresh=True)
 
     events_by_date = {}
 
@@ -768,7 +787,6 @@ async def mark_done(short_id):
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
 
         if event_data.get('is_recurring'):
-            # Передаём дату вхождения и ETag для надёжного удаления
             result = await api.delete_recurring_instance(event_data['url'], event_data['time'])
         else:
             result = await api.delete_event(event_data['url'])
@@ -1099,7 +1117,6 @@ async def cancel(msg, state):
     await send_with_auto_delete(msg.chat.id, "✅ **Операция отменена!**", delay=3600)
 
 async def auto_update():
-    """Автоматически обновляет данные каждые 5 минут"""
     while True:
         try:
             await asyncio.sleep(300)
@@ -1108,7 +1125,6 @@ async def auto_update():
             logger.error(f"auto_update error: {e}")
 
 async def update_sync_time():
-    """Обновляет время последней синхронизации"""
     global last_sync_time
     while True:
         last_sync_time = get_current_time()
