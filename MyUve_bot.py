@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.3"
+BOT_VERSION = "3.4"
 BOT_VERSION_DATE = "24.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -264,7 +264,7 @@ END:VCALENDAR"""
             if not cal:
                 return []
             
-            # Получаем все события без разворачивания
+            # Получаем все события
             try:
                 events = cal.events()
             except Exception as e:
@@ -299,12 +299,18 @@ END:VCALENDAR"""
                         is_recurring = True
                         rrule_str = vevent.rrule.value
                     
+                    # Проверяем наличие EXDATE (исключенных дат)
+                    exdates = []
+                    if hasattr(vevent, 'exdate') and vevent.exdate.value_list:
+                        exdates = vevent.exdate.value_list
+                    
                     result.append({
                         'url': event_url,
                         'summary': summary,
                         'start': dtstart,
                         'is_recurring': is_recurring,
                         'rrule': rrule_str,
+                        'exdates': exdates,
                         'ical_data': vevent
                     })
                 except Exception as e:
@@ -316,8 +322,8 @@ END:VCALENDAR"""
             logger.error(f"get_all_events error: {e}")
             return []
 
-    def expand_recurring_event(self, event: Dict, target_date: date) -> List[datetime]:
-        """Разворачивает повторяющееся событие и возвращает все вхождения до target_date"""
+    def expand_recurring_event(self, event: Dict, target_date: date, include_today: bool = True) -> List[datetime]:
+        """Разворачивает повторяющееся событие и возвращает все вхождения до target_date + 30 дней"""
         if not event.get('is_recurring') or not DATEUTIL_AVAILABLE:
             return []
         
@@ -331,14 +337,39 @@ END:VCALENDAR"""
             # Парсим RRULE
             rule = rrulestr(rrule_str, dtstart=start_time)
             
-            # Генерируем все вхождения до target_date + 30 дней
+            # Генерируем все вхождения
             end_date = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
             end_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(end_date)
+            end_date = end_date + timedelta(days=30)  # На 30 дней вперед
             
             occurrences = []
+            
+            # Получаем исключенные даты
+            exdates = event.get('exdates', [])
+            exdates_clean = []
+            for ex in exdates:
+                if isinstance(ex, datetime):
+                    exdates_clean.append(ex.astimezone(pytz.timezone(config.get('timezone', 'Europe/Moscow'))).date())
+                elif hasattr(ex, 'date'):
+                    exdates_clean.append(ex.date())
+            
             for occurrence in rule:
-                if occurrence > start_time and occurrence <= end_date + timedelta(days=30):
-                    occurrences.append(occurrence)
+                # Приводим к часовому поясу
+                if occurrence.tzinfo is None:
+                    occurrence = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(occurrence)
+                
+                # Проверяем, не исключена ли дата
+                occ_date = occurrence.date()
+                if occ_date in exdates_clean:
+                    continue
+                
+                # Если нужно включать сегодняшние и будущие
+                if include_today:
+                    if occurrence <= end_date:
+                        occurrences.append(occurrence)
+                else:
+                    if occurrence > start_time and occurrence <= end_date:
+                        occurrences.append(occurrence)
             
             return occurrences
         except Exception as e:
@@ -380,8 +411,8 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
         
         # Для повторяющихся событий - разворачиваем
         elif ev.get('is_recurring'):
-            # Получаем все вхождения повторяющегося события
-            occurrences = api.expand_recurring_event(ev, tomorrow)
+            # Получаем все вхождения повторяющегося события (включая сегодня)
+            occurrences = api.expand_recurring_event(ev, tomorrow, include_today=True)
             
             for occ in occurrences:
                 occ_date = occ.date()
@@ -515,7 +546,8 @@ async def get_pending_notifications() -> List[Dict]:
         
         # Для повторяющихся событий
         elif ev.get('is_recurring'):
-            occurrences = api.expand_recurring_event(ev, today)
+            # Получаем все вхождения повторяющегося события на сегодня и будущие
+            occurrences = api.expand_recurring_event(ev, today, include_today=True)
             
             for occ in occurrences:
                 occ_date = occ.date()
@@ -540,7 +572,7 @@ async def get_pending_notifications() -> List[Dict]:
     pending.sort(key=lambda x: x['time'])
     logger.info(f"Найдено просроченных событий за сегодня: {len(pending)}")
     for p in pending:
-        logger.info(f"  - {p['time'].strftime('%H:%M')}: {p['text']}")
+        logger.info(f"  - {p['time'].strftime('%H:%M')}: {p['summary']}")
     
     return pending
 
@@ -570,7 +602,7 @@ async def show_all_events(chat_id, persistent=False):
         
         # Для повторяющихся событий
         elif ev.get('is_recurring'):
-            occurrences = api.expand_recurring_event(ev, end_date)
+            occurrences = api.expand_recurring_event(ev, end_date, include_today=True)
             
             for occ in occurrences:
                 occ_date = occ.date()
