@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.8"
+BOT_VERSION = "3.9"
 BOT_VERSION_DATE = "24.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -71,9 +71,7 @@ config: Dict = {}
 notifications_enabled = True
 last_sync_time: Optional[datetime] = None
 
-# Хранилище для активных просроченных событий с их данными
 pending_events_store: Dict[str, Dict] = {}
-# Хранилище времени последнего уведомления для каждого события (в часах)
 last_notification_hour: Dict[str, int] = {}
 
 TIMEZONES = {
@@ -186,7 +184,7 @@ END:VCALENDAR"""
             return False
 
     async def add_exception_to_recurring(self, event_url, exception_date, retry_count=3):
-        """Добавляет EXDATE к повторяющемуся событию (правильный метод для Яндекс Календаря)"""
+        """Добавляет EXDATE к повторяющемуся событию"""
         for attempt in range(retry_count):
             try:
                 cal = self.get_calendar()
@@ -204,6 +202,7 @@ END:VCALENDAR"""
                     return False
                 
                 ical_data = target_event.data
+                logger.info(f"Original ical data length: {len(ical_data)}")
                 
                 # Переводим дату в UTC для EXDATE
                 if exception_date.tzinfo is None:
@@ -211,49 +210,47 @@ END:VCALENDAR"""
                 exdate_utc = exception_date.astimezone(pytz.UTC)
                 exdate_str = exdate_utc.strftime('%Y%m%dT%H%M%SZ')
                 
-                logger.info(f"Добавление EXDATE: {exdate_str} для {event_url}")
+                logger.info(f"Добавление EXDATE: {exdate_str}")
                 
-                # Добавляем EXDATE в iCal данные
-                if 'EXDATE' in ical_data:
+                # Формируем новую строку EXDATE
+                exdate_line = f'EXDATE:{exdate_str}'
+                
+                # Проверяем, есть ли уже EXDATE
+                if 'EXDATE:' in ical_data:
+                    # Обновляем существующую EXDATE
                     lines = ical_data.split('\n')
                     new_lines = []
                     for line in lines:
-                        if line.startswith('EXDATE'):
-                            if ':' in line:
-                                current_part = line.split(':', 1)[1]
-                                if ';' in current_part:
-                                    current_part = current_part.split(';')[-1]
-                                exdate_list = current_part.split(',')
-                                exdate_list = [x for x in exdate_list if x]
-                                if exdate_str not in exdate_list:
-                                    exdate_list.append(exdate_str)
-                                    new_lines.append(f'EXDATE:{",".join(exdate_list)}')
-                                else:
-                                    new_lines.append(line)
+                        if line.startswith('EXDATE:'):
+                            current_exdates = line.replace('EXDATE:', '').split(',')
+                            if exdate_str not in current_exdates:
+                                current_exdates.append(exdate_str)
+                                new_lines.append(f'EXDATE:{",".join(current_exdates)}')
                             else:
                                 new_lines.append(line)
                         else:
                             new_lines.append(line)
                     ical_data = '\n'.join(new_lines)
                 else:
+                    # Добавляем EXDATE после RRULE или перед END:VEVENT
                     lines = ical_data.split('\n')
                     new_lines = []
                     inserted = False
-                    for line in lines:
+                    for i, line in enumerate(lines):
                         new_lines.append(line)
-                        if line.startswith('RRULE') and not inserted:
-                            new_lines.append(f'EXDATE:{exdate_str}')
+                        if line.startswith('RRULE:') and not inserted:
+                            new_lines.append(exdate_line)
                             inserted = True
                     if not inserted:
                         for i, line in enumerate(new_lines):
                             if line.strip() == 'END:VEVENT':
-                                new_lines.insert(i, f'EXDATE:{exdate_str}')
+                                new_lines.insert(i, exdate_line)
                                 break
                     ical_data = '\n'.join(new_lines)
                 
                 target_event.data = ical_data
                 target_event.save()
-                logger.info(f"Исключение добавлено для {event_url} на {exdate_str}")
+                logger.info(f"EXDATE успешно добавлен")
                 
                 await asyncio.sleep(3)
                 return True
@@ -293,7 +290,6 @@ END:VCALENDAR"""
                     
                     summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия'
                     event_url = str(ev.url)
-                    uid = str(vevent.uid.value) if hasattr(vevent, 'uid') else None
                     
                     is_recurring = False
                     rrule_str = None
@@ -301,14 +297,18 @@ END:VCALENDAR"""
                         is_recurring = True
                         rrule_str = vevent.rrule.value
                     
-                    # Получаем EXDATE (исключенные даты)
+                    # Получаем все EXDATE строки
                     exdates = []
-                    try:
-                        if hasattr(vevent, 'exdate') and vevent.exdate.value_list:
-                            for ex in vevent.exdate.value_list:
-                                exdates.append(str(ex))
-                    except:
-                        pass
+                    ical_data = ev.data
+                    for line in ical_data.split('\n'):
+                        if line.startswith('EXDATE:'):
+                            exdate_part = line.replace('EXDATE:', '').replace(';VALUE=DATE-TIME', '')
+                            for ex in exdate_part.split(','):
+                                ex = ex.strip()
+                                if ex:
+                                    exdates.append(ex)
+                    
+                    logger.info(f"Event {summary}: recurring={is_recurring}, exdates={exdates}")
                     
                     result.append({
                         'url': event_url,
@@ -316,8 +316,8 @@ END:VCALENDAR"""
                         'start': dtstart,
                         'is_recurring': is_recurring,
                         'rrule': rrule_str,
-                        'uid': uid,
-                        'exdates': exdates
+                        'exdates': exdates,
+                        'ical_data': ev.data
                     })
                 except Exception as e:
                     logger.error(f"parse event error: {e}")
@@ -340,23 +340,29 @@ END:VCALENDAR"""
             if not rrule_str:
                 return []
             
+            # Парсим RRULE
             rule = rrulestr(rrule_str, dtstart=start_time)
             
+            # Конечная дата для генерации
             end_date = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
             end_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(end_date)
-            end_date = end_date + timedelta(days=30)
+            end_date = end_date + timedelta(days=60)  # На 60 дней вперед
             
             # Получаем исключенные даты из EXDATE
             exdates = event.get('exdates', [])
-            exdates_clean = []
+            excluded_dates = set()
+            
             for ex in exdates:
-                # EXDATE может быть в формате YYYYMMDDTHHMMSSZ
-                if 'T' in ex:
-                    try:
-                        ex_date = datetime.strptime(ex.split('T')[0], '%Y%m%d')
-                        exdates_clean.append(ex_date.date())
-                    except:
-                        pass
+                try:
+                    # EXDATE в формате YYYYMMDDTHHMMSSZ
+                    if 'T' in ex:
+                        date_part = ex.split('T')[0]
+                        excluded_dates.add(date_part)
+                        logger.info(f"Добавлена исключенная дата: {date_part}")
+                except Exception as e:
+                    logger.error(f"Parse exdate error: {e}")
+            
+            logger.info(f"Всего исключенных дат для {event['summary']}: {len(excluded_dates)}")
             
             occurrences = []
             
@@ -364,13 +370,18 @@ END:VCALENDAR"""
                 if occurrence.tzinfo is None:
                     occurrence = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(occurrence)
                 
+                # Форматируем дату для сравнения с EXDATE
+                occ_date_str = occurrence.strftime('%Y%m%d')
+                
                 # Проверяем, не исключена ли дата
-                if occurrence.date() in exdates_clean:
+                if occ_date_str in excluded_dates:
+                    logger.info(f"  - Исключено: {occurrence.strftime('%Y-%m-%d %H:%M')}")
                     continue
                 
                 if include_today:
                     if occurrence <= end_date:
                         occurrences.append(occurrence)
+                        logger.info(f"  - Добавлено: {occurrence.strftime('%Y-%m-%d %H:%M')}")
                 else:
                     if occurrence > start_time and occurrence <= end_date:
                         occurrences.append(occurrence)
@@ -438,7 +449,6 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
     return unique_result
 
 async def get_formatted_calendar_events():
-    """Форматирует события календаря для отображения"""
     events = await get_today_tomorrow_events()
     now = get_current_time()
     
@@ -505,7 +515,6 @@ async def show_calendar_events(chat_id, persistent=False):
         await send_with_auto_delete(chat_id, text, reply_markup=kb, delay=3600)
 
 async def get_pending_notifications() -> List[Dict]:
-    """Получает просроченные уведомления"""
     global pending_events_store
     now = get_current_time()
     
@@ -562,7 +571,6 @@ async def get_pending_notifications() -> List[Dict]:
     return pending
 
 async def show_all_events(chat_id, persistent=False):
-    """Показывает все события календаря"""
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     
@@ -769,10 +777,8 @@ async def mark_done(short_id):
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
         if event_data.get('is_recurring'):
-            # Для повторяющихся событий добавляем EXDATE
             result = await api.add_exception_to_recurring(event_data['url'], event_data['time'], retry_count=3)
         else:
-            # Для обычных событий удаляем
             result = await api.delete_event(event_data['url'])
         
         if result:
@@ -902,7 +908,7 @@ async def handle_done(cb):
         except:
             pass
         await bot.send_message(cb.from_user.id, "✅ Событие отмечено как выполненное!")
-        await asyncio.sleep(2)  # Ждем синхронизации
+        await asyncio.sleep(3)
         await show_calendar_events(cb.from_user.id, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
@@ -1102,7 +1108,6 @@ async def cancel(msg, state):
     await send_with_auto_delete(msg.chat.id, "✅ **Операция отменена!**", delay=3600)
 
 async def auto_update():
-    """Автоматически обновляет данные каждые 5 минут"""
     while True:
         try:
             await asyncio.sleep(300)
@@ -1111,7 +1116,6 @@ async def auto_update():
             logger.error(f"auto_update error: {e}")
 
 async def update_sync_time():
-    """Обновляет время последней синхронизации"""
     global last_sync_time
     while True:
         last_sync_time = get_current_time()
