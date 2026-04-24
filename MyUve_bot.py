@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.5"
+BOT_VERSION = "4.5.1"
 BOT_VERSION_DATE = "24.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
