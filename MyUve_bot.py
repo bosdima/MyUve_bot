@@ -267,11 +267,11 @@ END:VCALENDAR"""
             start_utc = start_date.astimezone(pytz.UTC)
             end_utc = end_date.astimezone(pytz.UTC)
             
-            # Получаем события за период с expand=True для разворачивания повторяющихся
+            # Получаем события за период
             events = cal.date_search(
                 start=start_utc,
                 end=end_utc,
-                expand=True  # ВАЖНО! Разворачиваем повторяющиеся события
+                expand=True  # Важно! Разворачиваем повторяющиеся события на сервере
             )
             
             tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
@@ -294,20 +294,10 @@ END:VCALENDAR"""
                     summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия'
                     event_url = str(ev.url)
                     
-                    # Проверяем, является ли исходное событие повторяющимся
-                    # Для этого нужно получить оригинальное событие или проверить наличие RRULE в данных
+                    # Проверяем, является ли событие повторяющимся (по наличию RRULE в исходных данных)
                     is_recurring = False
-                    try:
-                        # Пытаемся получить оригинальное событие (для развернутых экземпляров)
-                        if hasattr(vevent, 'rrule') and vevent.rrule.value is not None:
-                            is_recurring = True
-                        elif hasattr(ev, 'vobject_instance') and hasattr(ev.vobject_instance, 'vevent'):
-                            # Проверяем в исходных данных
-                            original_data = ev.data
-                            if 'RRULE:' in original_data:
-                                is_recurring = True
-                    except:
-                        pass
+                    if hasattr(vevent, 'rrule') and vevent.rrule.value is not None:
+                        is_recurring = True
                     
                     result.append({
                         'url': event_url,
@@ -319,7 +309,6 @@ END:VCALENDAR"""
                     logger.error(f"parse event error: {e}")
                     continue
             
-            logger.info(f"Найдено событий в диапазоне: {len(result)}")
             return result
         except Exception as e:
             logger.error(f"get_events_for_date_range error: {e}")
@@ -338,20 +327,17 @@ async def check_caldav_connection():
     return False, "Ошибка"
 
 async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
-    """Получает события на сегодня и завтра напрямую из календаря"""
+    """Получает события на сегодня и завтра напрямую из календаря (ВКЛЮЧАЯ ПОВТОРЯЮЩИЕСЯ)"""
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     
     today = now.date()
     tomorrow = today + timedelta(days=1)
-    day_after_tomorrow = tomorrow + timedelta(days=1)
     
     # Запрашиваем события с начала сегодняшнего дня до конца завтрашнего
     start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_date = datetime(day_after_tomorrow.year, day_after_tomorrow.month, day_after_tomorrow.day, 0, 0, 0) - timedelta(seconds=1)
-    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-    start_date = tz.localize(start_date)
-    end_date = tz.localize(end_date)
+    end_date = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59)
+    end_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(end_date)
     
     events = await api.get_events_for_date_range(start_date, end_date)
     
@@ -360,17 +346,16 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
         dt = ev['start']
         event_date = dt.date()
         
-        # Показываем события на сегодня и завтра (включая повторяющиеся)
+        # УБРАН ФИЛЬТР, ТЕПЕРЬ ВСЕ СОБЫТИЯ ПОКАЗЫВАЮТСЯ (включая повторяющиеся)
         if event_date == today or event_date == tomorrow:
             result.append((dt, ev))
-            logger.info(f"Найдено событие: {ev['summary']} на {event_date} (повторяющееся: {ev['is_recurring']})")
     
     result.sort(key=lambda x: x[0])
-    logger.info(f"Найдено событий на сегодня/завтра: {len(result)}")
+    logger.info(f"Найдено событий на сегодня/завтра (включая повторяющиеся): {len(result)}")
     return result
 
 async def get_formatted_calendar_events():
-    """Форматирует события календаря для отображения"""
+    """Форматирует события календаря для отображения (ВКЛЮЧАЯ ПОВТОРЯЮЩИЕСЯ)"""
     events = await get_today_tomorrow_events()
     now = get_current_time()
     
@@ -437,7 +422,7 @@ async def show_calendar_events(chat_id, persistent=False):
         await send_with_auto_delete(chat_id, text, reply_markup=kb, delay=3600)
 
 async def get_pending_notifications() -> List[Dict]:
-    """Получает просроченные уведомления (только за сегодня)"""
+    """Получает просроченные уведомления (только за сегодня, ВКЛЮЧАЯ ПОВТОРЯЮЩИЕСЯ)"""
     global pending_events_store
     now = get_current_time()
     
@@ -446,9 +431,6 @@ async def get_pending_notifications() -> List[Dict]:
     today = now.date()
     start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end_date = now.replace(hour=23, minute=59, second=59, microsecond=0)
-    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-    start_date = tz.localize(start_date)
-    end_date = tz.localize(end_date)
     
     events = await api.get_events_for_date_range(start_date, end_date)
     
@@ -457,8 +439,8 @@ async def get_pending_notifications() -> List[Dict]:
         ev_start = ev['start'].replace(microsecond=0)
         now_clean = now.replace(microsecond=0)
         
+        # УБРАН ФИЛЬТР - теперь ВСЕ просроченные события показываются
         if ev_start <= now_clean:
-            # Используем URL и время для уникального ключа
             unique_key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d%H%M')}"
             short_id = hashlib.md5(unique_key.encode()).hexdigest()[:12]
             
@@ -473,12 +455,12 @@ async def get_pending_notifications() -> List[Dict]:
             pending_events_store[short_id] = event_data
     
     pending.sort(key=lambda x: x['time'])
-    logger.info(f"Найдено просроченных событий за сегодня: {len(pending)}")
+    logger.info(f"Найдено просроченных событий за сегодня (включая повторяющиеся): {len(pending)}")
     
     return pending
 
 async def show_all_events(chat_id, persistent=False):
-    """Показывает все события календаря за последние 7 дней и следующие 30"""
+    """Показывает все события календаря за последние 7 дней и следующие 30 (ВКЛЮЧАЯ ПОВТОРЯЮЩИЕСЯ)"""
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     
@@ -646,7 +628,7 @@ BEGIN:VEVENT
 UID:{uid}
 DTSTAMP:{datetime.now().strftime('%Y%m%dT%H%M%SZ')}
 DTSTART;TZID={tzid}:{new_start.strftime('%Y%m%dT%H%M%S')}
-DTEND;TZID={tzid}:{new_end.strftime('%Y%mdt%H%M%S')}
+DTEND;TZID={tzid}:{new_end.strftime('%Y%m%dT%H%M%S')}
 SUMMARY:{event_data['text'][:255]}
 END:VEVENT
 END:VCALENDAR"""
