@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.2"
+BOT_VERSION = "3.3"
 BOT_VERSION_DATE = "24.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -257,32 +257,19 @@ END:VCALENDAR"""
             logger.error(f"add_exception_to_recurring error: {e}")
             return False
 
-    async def get_events_for_date_range(self, start_date: datetime, end_date: datetime, force_expand: bool = True) -> List[Dict]:
-        """Получает события из календаря за указанный диапазон дат"""
+    async def get_all_events(self) -> List[Dict]:
+        """Получает ВСЕ события из календаря без фильтрации по дате"""
         try:
             cal = self.get_calendar()
             if not cal:
                 return []
             
-            # Конвертируем в UTC для запроса
-            start_utc = start_date.astimezone(pytz.UTC)
-            end_utc = end_date.astimezone(pytz.UTC)
-            
-            # Пробуем использовать метод search (новый) вместо date_search (устаревший)
+            # Получаем все события без разворачивания
             try:
-                # Используем calendar.search для получения событий с разворотом повторяющихся
-                events = cal.search(
-                    start=start_utc,
-                    end=end_utc,
-                    expand=force_expand
-                )
-            except AttributeError:
-                # fallback на date_search если search недоступен
-                events = cal.date_search(
-                    start=start_utc,
-                    end=end_utc,
-                    expand=force_expand
-                )
+                events = cal.events()
+            except Exception as e:
+                logger.error(f"Error getting events: {e}")
+                return []
             
             tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
             result = []
@@ -307,14 +294,18 @@ END:VCALENDAR"""
                     
                     # Проверяем, является ли событие повторяющимся
                     is_recurring = False
+                    rrule_str = None
                     if hasattr(vevent, 'rrule') and vevent.rrule.value is not None:
                         is_recurring = True
+                        rrule_str = vevent.rrule.value
                     
                     result.append({
                         'url': event_url,
                         'summary': summary,
                         'start': dtstart,
-                        'is_recurring': is_recurring
+                        'is_recurring': is_recurring,
+                        'rrule': rrule_str,
+                        'ical_data': vevent
                     })
                 except Exception as e:
                     logger.error(f"parse event error: {e}")
@@ -322,74 +313,36 @@ END:VCALENDAR"""
             
             return result
         except Exception as e:
-            logger.error(f"get_events_for_date_range error: {e}")
+            logger.error(f"get_all_events error: {e}")
             return []
 
-    async def get_all_recurring_instances(self, days: int = 30) -> List[Dict]:
-        """Получает все вхождения повторяющихся событий на указанное количество дней"""
+    def expand_recurring_event(self, event: Dict, target_date: date) -> List[datetime]:
+        """Разворачивает повторяющееся событие и возвращает все вхождения до target_date"""
+        if not event.get('is_recurring') or not DATEUTIL_AVAILABLE:
+            return []
+        
         try:
-            cal = self.get_calendar()
-            if not cal:
+            start_time = event['start']
+            rrule_str = event.get('rrule')
+            
+            if not rrule_str:
                 return []
             
-            # Получаем все события без разворачивания
-            try:
-                all_events = cal.search(expand=False)
-            except AttributeError:
-                all_events = cal.date_search(expand=False)
+            # Парсим RRULE
+            rule = rrulestr(rrule_str, dtstart=start_time)
             
-            tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-            now = get_current_time()
-            end_date = now + timedelta(days=days)
-            result = []
+            # Генерируем все вхождения до target_date + 30 дней
+            end_date = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
+            end_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(end_date)
             
-            for ev in all_events:
-                try:
-                    vevent = ev.vobject_instance.vevent
-                    
-                    # Проверяем, есть ли RRULE (повторяющееся событие)
-                    if not hasattr(vevent, 'rrule') or vevent.rrule.value is None:
-                        continue
-                    
-                    # Получаем основное событие
-                    dtstart_raw = vevent.dtstart.value
-                    if isinstance(dtstart_raw, datetime):
-                        if dtstart_raw.tzinfo is None:
-                            dtstart = tz.localize(dtstart_raw)
-                        else:
-                            dtstart = dtstart_raw.astimezone(tz)
-                    else:
-                        continue
-                    
-                    summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия'
-                    event_url = str(ev.url)
-                    
-                    # Парсим RRULE
-                    rrule_str = vevent.rrule.value
-                    if DATEUTIL_AVAILABLE and rrule_str:
-                        try:
-                            # Создаем правило повторения
-                            rule = rrulestr(rrule_str, dtstart=dtstart)
-                            
-                            # Генерируем все вхождения до end_date
-                            for occurrence in rule:
-                                if occurrence > now and occurrence <= end_date:
-                                    result.append({
-                                        'url': event_url,
-                                        'summary': summary,
-                                        'start': occurrence,
-                                        'is_recurring': True
-                                    })
-                        except Exception as e:
-                            logger.error(f"Parse RRULE error for {summary}: {e}")
-                            continue
-                except Exception as e:
-                    logger.error(f"Process recurring event error: {e}")
-                    continue
+            occurrences = []
+            for occurrence in rule:
+                if occurrence > start_time and occurrence <= end_date + timedelta(days=30):
+                    occurrences.append(occurrence)
             
-            return result
+            return occurrences
         except Exception as e:
-            logger.error(f"get_all_recurring_instances error: {e}")
+            logger.error(f"expand_recurring_event error: {e}")
             return []
 
 def get_caldav_available():
@@ -405,49 +358,57 @@ async def check_caldav_connection():
     return False, "Ошибка"
 
 async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
-    """Получает события на сегодня и завтра напрямую из календаря (ВКЛЮЧАЯ ПОВТОРЯЮЩИЕСЯ)"""
+    """Получает события на сегодня и завтра из календаря (ВКЛЮЧАЯ ПОВТОРЯЮЩИЕСЯ)"""
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     
     today = now.date()
     tomorrow = today + timedelta(days=1)
-    day_after_tomorrow = today + timedelta(days=2)
     
-    # Расширяем диапазон до послезавтра, чтобы захватить все повторяющиеся события
-    start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_date = datetime(day_after_tomorrow.year, day_after_tomorrow.month, day_after_tomorrow.day, 23, 59, 59)
-    end_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(end_date)
-    
-    # Получаем события из календаря с разворотом повторяющихся
-    events = await api.get_events_for_date_range(start_date, end_date, force_expand=True)
-    
-    # Дополнительно получаем все повторяющиеся события на ближайшие 7 дней
-    recurring_events = await api.get_all_recurring_instances(days=7)
-    events.extend(recurring_events)
-    
-    # Удаляем дубликаты по (url, start)
-    unique_events = {}
-    for ev in events:
-        key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d%H%M')}"
-        if key not in unique_events:
-            unique_events[key] = ev
-    
-    events = list(unique_events.values())
+    # Получаем все события из календаря
+    all_events = await api.get_all_events()
     
     result = []
-    for ev in events:
-        dt = ev['start']
-        event_date = dt.date()
-        
-        # Показываем события на сегодня и завтра
-        if event_date == today or event_date == tomorrow:
-            result.append((dt, ev))
     
+    for ev in all_events:
+        event_start = ev['start']
+        event_date = event_start.date()
+        
+        # Обычные события на сегодня/завтра
+        if (event_date == today or event_date == tomorrow) and not ev.get('is_recurring'):
+            result.append((event_start, ev))
+        
+        # Для повторяющихся событий - разворачиваем
+        elif ev.get('is_recurring'):
+            # Получаем все вхождения повторяющегося события
+            occurrences = api.expand_recurring_event(ev, tomorrow)
+            
+            for occ in occurrences:
+                occ_date = occ.date()
+                if occ_date == today or occ_date == tomorrow:
+                    # Создаем копию события с новым временем
+                    ev_copy = ev.copy()
+                    ev_copy['start'] = occ
+                    ev_copy['is_recurring'] = True
+                    result.append((occ, ev_copy))
+    
+    # Сортируем по времени
     result.sort(key=lambda x: x[0])
-    logger.info(f"Найдено событий на сегодня/завтра (включая повторяющиеся): {len(result)}")
+    
+    # Удаляем дубликаты
+    unique_result = []
+    seen_keys = set()
     for dt, ev in result:
-        logger.info(f"  - {dt.strftime('%Y-%m-%d %H:%M')}: {ev['summary']} (повтор: {ev.get('is_recurring', False)})")
-    return result
+        key = f"{ev['url']}_{dt.strftime('%Y%m%d%H%M')}"
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_result.append((dt, ev))
+    
+    logger.info(f"Найдено событий на сегодня/завтра (включая повторяющиеся): {len(unique_result)}")
+    for dt, ev in unique_result:
+        logger.info(f"  - {dt.strftime('%Y-%m-%d %H:%M')}: {ev['summary']}")
+    
+    return unique_result
 
 async def get_formatted_calendar_events():
     """Форматирует события календаря для отображения (ВКЛЮЧАЯ ПОВТОРЯЮЩИЕСЯ)"""
@@ -499,28 +460,6 @@ async def get_formatted_calendar_events():
             text += f"   • {time_str} — **{ev['summary']}**{recurring_mark}\n"
         text += "\n"
     
-    # Добавляем предпросмотр на ближайшие дни
-    future_events = {}
-    for dt, ev in events:
-        event_date = dt.date()
-        if event_date > tomorrow and event_date <= today + timedelta(days=5):
-            if event_date not in future_events:
-                future_events[event_date] = []
-            future_events[event_date].append((dt, ev))
-    
-    if future_events:
-        text += f"🔮 **БЛИЖАЙШИЕ ДНИ**\n"
-        for date_key in sorted(future_events.keys())[:3]:
-            weekday = ["пн","вт","ср","чт","пт","сб","вс"][date_key.weekday()]
-            text += f"   📌 {date_key.day:02d}.{date_key.month:02d} ({weekday})\n"
-            for dt, ev in future_events[date_key][:2]:
-                time_str = dt.strftime('%H:%M')
-                recurring_mark = " 🔁" if ev.get('is_recurring', False) else ""
-                text += f"      • {time_str} — {ev['summary']}{recurring_mark}\n"
-            if len(future_events[date_key]) > 2:
-                text += f"      • ... ещё {len(future_events[date_key]) - 2}\n"
-        text += "\n"
-    
     if last_sync_time:
         text += f"\n\n🔄 *Последняя синхронизация:* {last_sync_time.strftime('%d.%m.%Y %H:%M:%S')}"
     return text
@@ -543,95 +482,109 @@ async def get_pending_notifications() -> List[Dict]:
     global pending_events_store
     now = get_current_time()
     
-    # Получаем события напрямую из календаря
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     today = now.date()
-    start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_date = now.replace(hour=23, minute=59, second=59, microsecond=0)
     
-    # Получаем события за сегодня с разворотом повторяющихся
-    events = await api.get_events_for_date_range(start_date, end_date, force_expand=True)
-    
-    # Дополнительно получаем повторяющиеся события на сегодня
-    recurring_today = await api.get_all_recurring_instances(days=1)
-    for rev in recurring_today:
-        if rev['start'].date() == today:
-            events.append(rev)
-    
-    # Удаляем дубликаты
-    unique_events = {}
-    for ev in events:
-        key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d%H%M')}"
-        if key not in unique_events:
-            unique_events[key] = ev
-    events = list(unique_events.values())
+    # Получаем все события из календаря
+    all_events = await api.get_all_events()
     
     pending = []
-    for ev in events:
-        ev_start = ev['start'].replace(microsecond=0)
-        now_clean = now.replace(microsecond=0)
+    
+    for ev in all_events:
+        event_start = ev['start']
+        event_date = event_start.date()
         
-        # Все просроченные события показываются
-        if ev_start <= now_clean:
-            unique_key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d%H%M')}"
-            short_id = hashlib.md5(unique_key.encode()).hexdigest()[:12]
+        # Обычные события на сегодня
+        if event_date == today and not ev.get('is_recurring'):
+            ev_start_clean = event_start.replace(microsecond=0)
+            now_clean = now.replace(microsecond=0)
             
-            event_data = {
-                'url': ev['url'],
-                'short_id': short_id,
-                'text': ev['summary'],
-                'time': ev['start'],
-                'is_recurring': ev.get('is_recurring', False),
-            }
-            pending.append(event_data)
-            pending_events_store[short_id] = event_data
+            if ev_start_clean <= now_clean:
+                unique_key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d%H%M')}"
+                short_id = hashlib.md5(unique_key.encode()).hexdigest()[:12]
+                
+                event_data = {
+                    'url': ev['url'],
+                    'short_id': short_id,
+                    'text': ev['summary'],
+                    'time': ev['start'],
+                    'is_recurring': False,
+                }
+                pending.append(event_data)
+                pending_events_store[short_id] = event_data
+        
+        # Для повторяющихся событий
+        elif ev.get('is_recurring'):
+            occurrences = api.expand_recurring_event(ev, today)
+            
+            for occ in occurrences:
+                occ_date = occ.date()
+                if occ_date == today:
+                    occ_clean = occ.replace(microsecond=0)
+                    now_clean = now.replace(microsecond=0)
+                    
+                    if occ_clean <= now_clean:
+                        unique_key = f"{ev['url']}_{occ.strftime('%Y%m%d%H%M')}"
+                        short_id = hashlib.md5(unique_key.encode()).hexdigest()[:12]
+                        
+                        event_data = {
+                            'url': ev['url'],
+                            'short_id': short_id,
+                            'text': ev['summary'],
+                            'time': occ,
+                            'is_recurring': True,
+                        }
+                        pending.append(event_data)
+                        pending_events_store[short_id] = event_data
     
     pending.sort(key=lambda x: x['time'])
-    logger.info(f"Найдено просроченных событий за сегодня (включая повторяющиеся): {len(pending)}")
+    logger.info(f"Найдено просроченных событий за сегодня: {len(pending)}")
+    for p in pending:
+        logger.info(f"  - {p['time'].strftime('%H:%M')}: {p['text']}")
     
     return pending
 
 async def show_all_events(chat_id, persistent=False):
-    """Показывает все события календаря за последние 7 дней и следующие 30 (ВКЛЮЧАЯ ПОВТОРЯЮЩИЕСЯ)"""
+    """Показывает все события календаря за последние 7 дней и следующие 30"""
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     
-    start_date = now - timedelta(days=7)
-    start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_date = now + timedelta(days=30)
-    end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=0)
+    today = now.date()
+    start_date = today - timedelta(days=7)
+    end_date = today + timedelta(days=30)
     
-    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-    start_date = tz.localize(start_date) if start_date.tzinfo is None else start_date
-    end_date = tz.localize(end_date) if end_date.tzinfo is None else end_date
+    # Получаем все события
+    all_events = await api.get_all_events()
     
-    # Получаем обычные события
-    events = await api.get_events_for_date_range(start_date, end_date, force_expand=True)
+    events_by_date = {}
     
-    # Получаем все повторяющиеся события на 30 дней
-    recurring_events = await api.get_all_recurring_instances(days=30)
-    events.extend(recurring_events)
+    for ev in all_events:
+        event_start = ev['start']
+        event_date = event_start.date()
+        
+        # Обычные события в диапазоне
+        if start_date <= event_date <= end_date and not ev.get('is_recurring'):
+            if event_date not in events_by_date:
+                events_by_date[event_date] = []
+            events_by_date[event_date].append(ev)
+        
+        # Для повторяющихся событий
+        elif ev.get('is_recurring'):
+            occurrences = api.expand_recurring_event(ev, end_date)
+            
+            for occ in occurrences:
+                occ_date = occ.date()
+                if start_date <= occ_date <= end_date:
+                    ev_copy = ev.copy()
+                    ev_copy['start'] = occ
+                    if occ_date not in events_by_date:
+                        events_by_date[occ_date] = []
+                    events_by_date[occ_date].append(ev_copy)
     
-    # Удаляем дубликаты
-    unique_events = {}
-    for ev in events:
-        key = f"{ev['url']}_{ev['start'].strftime('%Y%m%d%H%M')}"
-        if key not in unique_events:
-            unique_events[key] = ev
-    events = list(unique_events.values())
-    
-    if not events:
+    if not events_by_date:
         text = "📅 **В календаре нет событий**"
     else:
-        events_by_date = {}
-        for ev in events:
-            date_key = ev['start'].date()
-            if date_key not in events_by_date:
-                events_by_date[date_key] = []
-            events_by_date[date_key].append(ev)
-        
         text = "📅 **ВСЕ СОБЫТИЯ КАЛЕНДАРЯ**\n\n"
-        today = now.date()
         
         for date_key in sorted(events_by_date.keys()):
             if date_key == today:
