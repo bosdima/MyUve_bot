@@ -56,7 +56,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.2"
+BOT_VERSION = "3.0"
 BOT_VERSION_DATE = "23.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -87,16 +87,6 @@ TIMEZONES = {
 def get_current_time():
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
     return datetime.now(tz)
-
-def get_naive_datetime(year, month, day, hour, minute):
-    """Создаёт naive datetime без часового пояса"""
-    return datetime(year, month, day, hour, minute)
-
-def make_aware(dt: datetime, tz) -> datetime:
-    """Преобразует naive datetime в aware, если нужно"""
-    if dt.tzinfo is None:
-        return tz.localize(dt)
-    return dt.astimezone(tz)
 
 def parse_datetime(date_str: str):
     now = get_current_time()
@@ -195,7 +185,7 @@ END:VCALENDAR"""
             return False
 
     async def add_exception_to_recurring(self, event_url, exception_date):
-        """Добавляет EXDATE к повторяющемуся событию для отмены конкретного вхождения"""
+        """Добавляет EXDATE к повторяющемуся событию"""
         try:
             cal = self.get_calendar()
             if not cal:
@@ -258,16 +248,16 @@ END:VCALENDAR"""
             
             target_event.data = ical_data
             target_event.save()
-            logger.info(f"Добавлено исключение EXDATE для {event_url} на {exdate_str}")
+            logger.info(f"Добавлено исключение для {event_url} на {exdate_str}")
             
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
             return True
         except Exception as e:
             logger.error(f"add_exception_to_recurring error: {e}")
             return False
 
     async def get_events_for_date_range(self, start_date: datetime, end_date: datetime) -> List[Dict]:
-        """Получает события из календаря за указанный диапазон дат с expand=True"""
+        """Получает события из календаря за указанный диапазон дат"""
         try:
             cal = self.get_calendar()
             if not cal:
@@ -277,17 +267,17 @@ END:VCALENDAR"""
             start_utc = start_date.astimezone(pytz.UTC)
             end_utc = end_date.astimezone(pytz.UTC)
             
-            # Используем search
-            results = cal.search(
+            # Получаем события за период
+            events = cal.date_search(
                 start=start_utc,
                 end=end_utc,
-                expand=True
+                expand=True  # Важно! Разворачиваем повторяющиеся события на сервере
             )
             
             tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
             result = []
             
-            for ev in results:
+            for ev in events:
                 try:
                     vevent = ev.vobject_instance.vevent
                     
@@ -304,8 +294,10 @@ END:VCALENDAR"""
                     summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else 'Без названия'
                     event_url = str(ev.url)
                     
-                    # Проверяем, является ли событие повторяющимся
-                    is_recurring = hasattr(vevent, 'rrule') and vevent.rrule.value is not None
+                    # Проверяем, является ли событие повторяющимся (по наличию RRULE в исходных данных)
+                    is_recurring = False
+                    if hasattr(vevent, 'rrule') and vevent.rrule.value is not None:
+                        is_recurring = True
                     
                     result.append({
                         'url': event_url,
@@ -342,14 +334,10 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
     today = now.date()
     tomorrow = today + timedelta(days=1)
     
-    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-    
-    # Создаём naive datetime и затем делаем aware
-    start_naive = datetime(today.year, today.month, today.day, 0, 0, 0)
-    end_naive = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59)
-    
-    start_date = tz.localize(start_naive)
-    end_date = tz.localize(end_naive)
+    # Запрашиваем события с начала сегодняшнего дня до конца завтрашнего
+    start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59)
+    end_date = pytz.timezone(config.get('timezone', 'Europe/Moscow')).localize(end_date)
     
     events = await api.get_events_for_date_range(start_date, end_date)
     
@@ -440,15 +428,8 @@ async def get_pending_notifications() -> List[Dict]:
     # Получаем события напрямую из календаря
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     today = now.date()
-    
-    tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-    
-    # Создаём naive datetime и затем делаем aware
-    start_naive = datetime(today.year, today.month, today.day, 0, 0, 0)
-    end_naive = datetime(today.year, today.month, today.day, 23, 59, 59)
-    
-    start_date = tz.localize(start_naive)
-    end_date = tz.localize(end_naive)
+    start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = now.replace(hour=23, minute=59, second=59, microsecond=0)
     
     events = await api.get_events_for_date_range(start_date, end_date)
     
@@ -466,7 +447,7 @@ async def get_pending_notifications() -> List[Dict]:
                 'short_id': short_id,
                 'text': ev['summary'],
                 'time': ev['start'],
-                'is_recurring': ev.get('is_recurring', False)
+                'is_recurring': ev.get('is_recurring', False),
             }
             pending.append(event_data)
             pending_events_store[short_id] = event_data
@@ -481,13 +462,14 @@ async def show_all_events(chat_id, persistent=False):
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     
+    start_date = now - timedelta(days=7)
+    start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = now + timedelta(days=30)
+    end_date = end_date.replace(hour=23, minute=59, second=59, microsecond=0)
+    
     tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
-    
-    start_naive = datetime(now.year, now.month, now.day, 0, 0, 0) - timedelta(days=7)
-    end_naive = datetime(now.year, now.month, now.day, 23, 59, 59) + timedelta(days=30)
-    
-    start_date = tz.localize(start_naive)
-    end_date = tz.localize(end_naive)
+    start_date = tz.localize(start_date) if start_date.tzinfo is None else start_date
+    end_date = tz.localize(end_date) if end_date.tzinfo is None else end_date
     
     events = await api.get_events_for_date_range(start_date, end_date)
     
@@ -602,20 +584,17 @@ async def check_pending():
     
     while True:
         if notifications_enabled:
-            try:
-                pending = await get_pending_notifications()
-                current_hour = get_current_time().hour
+            pending = await get_pending_notifications()
+            current_hour = get_current_time().hour
+            
+            for p in pending:
+                event_key = f"{p['short_id']}_{p['time'].strftime('%Y%m%d')}"
+                last_hour = last_notification_hour.get(event_key)
                 
-                for p in pending:
-                    event_key = f"{p['short_id']}_{p['time'].strftime('%Y%m%d')}"
-                    last_hour = last_notification_hour.get(event_key)
-                    
-                    if last_hour != current_hour:
-                        await show_pending_actions(ADMIN_ID, p['short_id'], p['text'], p['time'], p['is_recurring'])
-                        last_notification_hour[event_key] = current_hour
-                        logger.info(f"Отправлено уведомление для: {p['text']} (час {current_hour})")
-            except Exception as e:
-                logger.error(f"check_pending error: {e}")
+                if last_hour != current_hour:
+                    await show_pending_actions(ADMIN_ID, p['short_id'], p['text'], p['time'], p['is_recurring'])
+                    last_notification_hour[event_key] = current_hour
+                    logger.info(f"Отправлено уведомление для: {p['text']} (час {current_hour})")
         
         await asyncio.sleep(60)
 
@@ -676,10 +655,8 @@ async def mark_done(short_id):
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         
         if event_data.get('is_recurring'):
-            logger.info(f"Добавление исключения для повторяющегося события: {event_data['text']}")
             result = await api.add_exception_to_recurring(event_data['url'], event_data['time'])
         else:
-            logger.info(f"Удаление обычного события: {event_data['text']}")
             result = await api.delete_event(event_data['url'])
         
         if result:
@@ -741,8 +718,8 @@ async def cmd_start(msg, state):
 
 📌 **Как это работает:**
 • Все уведомления берутся ТОЛЬКО из Яндекс.Календаря
-• При отметке "Выполнено" у повторяющегося события удаляется ТОЛЬКО текущее вхождение
-• Остальные события серии сохраняются"""
+• При отметке "Выполнено" событие удаляется из календаря
+• Для повторяющихся событий удаляется только текущее вхождение"""
     
     await send_persistent_message(msg.chat.id, welcome)
     await send_persistent_message(msg.chat.id, "👋 **Выберите действие:**", reply_markup=get_main_keyboard())
@@ -807,7 +784,6 @@ async def handle_done(cb):
         except:
             pass
         await cb.answer("✅ Событие отмечено как выполненное!")
-        await asyncio.sleep(2)
         await show_calendar_events(cb.from_user.id, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
@@ -861,7 +837,6 @@ async def process_snooze(cb, short_id, hours):
         except:
             pass
         await cb.answer(f"✅ Событие отложено на {hours} час(ов)!")
-        await asyncio.sleep(2)
         await show_calendar_events(cb.from_user.id, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
@@ -989,11 +964,7 @@ async def info(cb):
 🌍 **Часовой пояс:** `{config.get('timezone', 'Europe/Moscow')}`
 🕐 **Текущее время:** `{get_current_time().strftime('%d.%m.%Y %H:%M:%S')}`
 🔔 **Уведомления:** `{'Вкл' if notifications_enabled else 'Выкл'}`
-📧 **CalDAV:** `{caldav_status}`
-
-📌 **Как работает удаление повторяющихся событий:**
-• При отметке "Выполнено" удаляется ТОЛЬКО текущее вхождение
-• Следующие события серии сохраняются"""
+📧 **CalDAV:** `{caldav_status}`"""
     await cb.message.edit_text(info_text)
     await cb.answer()
 
