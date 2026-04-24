@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "3.4"
+BOT_VERSION = "3.5"
 BOT_VERSION_DATE = "24.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -301,8 +301,12 @@ END:VCALENDAR"""
                     
                     # Проверяем наличие EXDATE (исключенных дат)
                     exdates = []
-                    if hasattr(vevent, 'exdate') and vevent.exdate.value_list:
-                        exdates = vevent.exdate.value_list
+                    try:
+                        if hasattr(vevent, 'exdate') and vevent.exdate.value_list:
+                            exdates = vevent.exdate.value_list
+                    except AttributeError:
+                        # Некоторые версии vobject не имеют value_list
+                        pass
                     
                     result.append({
                         'url': event_url,
@@ -310,8 +314,7 @@ END:VCALENDAR"""
                         'start': dtstart,
                         'is_recurring': is_recurring,
                         'rrule': rrule_str,
-                        'exdates': exdates,
-                        'ical_data': vevent
+                        'exdates': exdates
                     })
                 except Exception as e:
                     logger.error(f"parse event error: {e}")
@@ -572,7 +575,8 @@ async def get_pending_notifications() -> List[Dict]:
     pending.sort(key=lambda x: x['time'])
     logger.info(f"Найдено просроченных событий за сегодня: {len(pending)}")
     for p in pending:
-        logger.info(f"  - {p['time'].strftime('%H:%M')}: {p['summary']}")
+        # Исправлено: используем 'text' вместо 'summary'
+        logger.info(f"  - {p['time'].strftime('%H:%M')}: {p['text']}")
     
     return pending
 
