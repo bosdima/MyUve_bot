@@ -57,7 +57,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.5.3"
+BOT_VERSION = "4.5.4"
 BOT_VERSION_DATE = "25.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -136,7 +136,7 @@ class CalDAVCalendarAPI:
 
     def get_calendar(self):
         try:
-            # Сбрасываем клиент, чтобы получить свежие данные
+            # 🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Сбрасываем клиент, чтобы получить СВЕЖИЕ данные с сервера
             self.client = None
             principal = self._get_client().principal()
             calendars = principal.calendars()
@@ -212,7 +212,7 @@ END:VCALENDAR"""
                     return False
 
                 ical_data = target_event.data
-                if not ical_data:
+                if not ical_
                     return False
 
                 # Конвертация в UTC для EXDATE (полный формат)
@@ -709,7 +709,7 @@ async def check_pending():
 
 async def snooze_event(short_id, hours=1):
     event_data = pending_events_store.get(short_id)
-    if not event_data:
+    if not event_
         logger.error(f"Событие не найдено: {short_id}")
         return False
     try:
