@@ -193,7 +193,7 @@ END:VCALENDAR"""
             return False
 
     async def add_exception_to_recurring(self, event_url, exception_date, retry_count=3):
-        """Добавляет EXDATE к повторяющемуся событию (полное время в UTC)"""
+        """🔑 ДОБАВЛЯЕТ EXDATE + СРАЗУ ЧИСТИТ pending_events_store"""
         for attempt in range(retry_count):
             try:
                 cal = self.get_calendar()
@@ -257,6 +257,25 @@ END:VCALENDAR"""
                 target_event.save()
                 
                 logger.info(f"EXDATE добавлен: {exdate_str}")
+                
+                # 🔑 КЛЮЧЕВОЕ: ЧИСТИМ pending_events_store от этого события СРАЗУ
+                keys_to_remove = []
+                for key, val in pending_events_store.items():
+                    if val.get('url') == event_url:
+                        # Сравниваем по дате (без времени) для all-day, или по полному времени
+                        if val.get('all_day'):
+                            if val['time'].date() == exception_date.date():
+                                keys_to_remove.append(key)
+                        else:
+                            occ_utc = val['time'].astimezone(pytz.UTC)
+                            occ_key = occ_utc.strftime('%Y%m%dT%H%M%SZ')
+                            if occ_key == exdate_str:
+                                keys_to_remove.append(key)
+                
+                for key in keys_to_remove:
+                    del pending_events_store[key]
+                    logger.info(f"Удалено из pending: {key}")
+                
                 await asyncio.sleep(1)
                 return True
 
@@ -267,7 +286,7 @@ END:VCALENDAR"""
         return False
 
     async def get_all_events(self) -> List[Dict]:
-        """Получает все события, включая EXDATE — исправлено для всех типов событий"""
+        """Получает все события, включая EXDATE"""
         try:
             cal = self.get_calendar()
             if not cal:
@@ -282,17 +301,14 @@ END:VCALENDAR"""
                     vevent = ev.vobject_instance.vevent
                     dtstart_raw = vevent.dtstart.value
                     
-                    # Обработка всех типов дат: datetime, date, all-day
                     if isinstance(dtstart_raw, datetime):
                         if dtstart_raw.tzinfo is None:
                             dtstart = tz.localize(dtstart_raw)
                         else:
                             dtstart = dtstart_raw.astimezone(tz)
                     elif isinstance(dtstart_raw, date):
-                        # All-day event: создаём начало дня в локальном поясе
                         dtstart = tz.localize(datetime.combine(dtstart_raw, datetime.min.time()))
                     else:
-                        logger.warning(f"Unknown dtstart type: {type(dtstart_raw)}")
                         continue
 
                     summary = str(vevent.summary.value) if hasattr(vevent, 'summary') and vevent.summary.value else 'Без названия'
@@ -336,7 +352,7 @@ END:VCALENDAR"""
             return []
 
     def expand_recurring_event(self, event: Dict, target_date: date, include_today: bool = True) -> List[datetime]:
-        """Разворачивает повторяющееся событие с корректным исключением по полному времени UTC"""
+        """🔑 Разворачивает повторяющееся событие с корректным исключением по ПОЛНОМУ времени UTC"""
         if not event.get('is_recurring') or not DATEUTIL_AVAILABLE:
             return []
 
@@ -351,20 +367,20 @@ END:VCALENDAR"""
             
             end_dt = tz.localize(datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)) + timedelta(days=60)
 
-            # EXDATE хранятся как полный UTC-таймстамп: YYYYMMDDTHHMMSSZ
+            # 🔑 EXDATE хранятся как полный UTC-таймстамп: YYYYMMDDTHHMMSSZ
             excluded_set = set(event.get('exdates', []))
 
             occurrences = []
-            # 🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: используем .between() для корректной итерации
+            # 🔑 Используем .between() для корректной итерации
             for occurrence in rule.between(start_time, end_dt, inc=True):
                 if occurrence.tzinfo is None:
                     occurrence = tz.localize(occurrence)
                 
-                # Конвертируем вхождение в тот же формат, что и EXDATE
+                # 🔑 Конвертируем вхождение в тот же формат, что и EXDATE
                 occ_utc = occurrence.astimezone(pytz.UTC)
                 occ_key = occ_utc.strftime('%Y%m%dT%H%M%SZ')
                 
-                # 🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: сравниваем полный таймстамп, а не только дату!
+                # 🔑 Сравниваем ПОЛНЫЙ таймстамп, а не только дату!
                 if occ_key in excluded_set:
                     logger.debug(f"Пропущено исключённое вхождение: {occ_key}")
                     continue
@@ -491,11 +507,19 @@ async def show_calendar_events(chat_id, persistent=False):
         await send_with_auto_delete(chat_id, text, reply_markup=kb, delay=3600)
 
 async def get_pending_notifications() -> List[Dict]:
-    """Получает просроченные события — исправлено для всех типов"""
+    """🔑 Получает просроченные события — СРАЗУ исключает добавленные EXDATE"""
     global pending_events_store
     now = get_current_time()
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     today = now.date()
+    
+    # 🔑 Сначала очищаем pending_events_store от уже обработанных
+    keys_to_remove = []
+    for key, val in pending_events_store.items():
+        if val.get('processed'):
+            keys_to_remove.append(key)
+    for key in keys_to_remove:
+        del pending_events_store[key]
     
     all_events = await api.get_all_events()
     pending = []
@@ -504,7 +528,6 @@ async def get_pending_notifications() -> List[Dict]:
         event_start = ev['start']
         event_date = event_start.date()
         
-        # Проверяем: событие сегодня И время уже прошло (или all-day событие)
         is_today = (event_date == today)
         is_past = (event_start <= now) or ev.get('all_day', False)
         
@@ -512,28 +535,32 @@ async def get_pending_notifications() -> List[Dict]:
             if not ev.get('is_recurring'):
                 key = f"{ev['url']}_{event_start.strftime('%Y%m%d%H%M')}"
                 short_id = hashlib.md5(key.encode()).hexdigest()[:12]
-                pending_events_store[short_id] = {
-                    'url': ev['url'],
-                    'short_id': short_id,
-                    'text': ev['summary'],
-                    'time': event_start,
-                    'is_recurring': False
-                }
-                pending.append(pending_events_store[short_id])
+                if short_id not in pending_events_store:
+                    pending_events_store[short_id] = {
+                        'url': ev['url'],
+                        'short_id': short_id,
+                        'text': ev['summary'],
+                        'time': event_start,
+                        'is_recurring': False,
+                        'all_day': ev.get('all_day', False)
+                    }
+                    pending.append(pending_events_store[short_id])
             else:
                 occurrences = api.expand_recurring_event(ev, today, include_today=True)
                 for occ in occurrences:
                     if occ.date() == today and (occ <= now or ev.get('all_day', False)):
                         key = f"{ev['url']}_{occ.strftime('%Y%m%d%H%M')}"
                         short_id = hashlib.md5(key.encode()).hexdigest()[:12]
-                        pending_events_store[short_id] = {
-                            'url': ev['url'],
-                            'short_id': short_id,
-                            'text': ev['summary'],
-                            'time': occ,
-                            'is_recurring': True
-                        }
-                        pending.append(pending_events_store[short_id])
+                        if short_id not in pending_events_store:
+                            pending_events_store[short_id] = {
+                                'url': ev['url'],
+                                'short_id': short_id,
+                                'text': ev['summary'],
+                                'time': occ,
+                                'is_recurring': True,
+                                'all_day': ev.get('all_day', False)
+                            }
+                            pending.append(pending_events_store[short_id])
 
     pending.sort(key=lambda x: x['time'])
     logger.info(f"Найдено просроченных событий за сегодня: {len(pending)}")
@@ -721,6 +748,7 @@ END:VCALENDAR"""
         return False
 
 async def mark_done(short_id):
+    """🔑 УДАЛЯЕТ событие + СРАЗУ чистит pending_events_store"""
     event_data = pending_events_store.get(short_id)
     if not event_data:
         logger.error(f"Событие не найдено: {short_id}")
@@ -736,7 +764,9 @@ async def mark_done(short_id):
             result = await api.delete_event(event_data['url'])
             
         if result:
-            del pending_events_store[short_id]
+            # 🔑 Гарантированно удаляем из pending_events_store
+            if short_id in pending_events_store:
+                del pending_events_store[short_id]
             return True
         return False
     except Exception as e:
@@ -856,7 +886,8 @@ async def handle_done(cb):
         except Exception:
             pass
         await bot.send_message(cb.from_user.id, "✅ Событие удалено!")
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
+        # 🔑 СРАЗУ обновляем интерфейс
         await show_calendar_events(cb.from_user.id, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
