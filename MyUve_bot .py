@@ -13,7 +13,6 @@ from uuid import uuid4
 
 try:
     from dateutil.rrule import rrulestr
-    from dateutil.rrule import rrule as rrrule
     DATEUTIL_AVAILABLE = True
 except ImportError:
     DATEUTIL_AVAILABLE = False
@@ -57,7 +56,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.5.3"
+BOT_VERSION = "4.5.4"
 BOT_VERSION_DATE = "25.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -129,16 +128,12 @@ class CalDAVCalendarAPI:
         self.pwd = pwd
         self.client = None
 
-    def _get_client(self):
-        if self.client is None:
-            self.client = caldav.DAVClient(url=YANDEX_CALDAV_URL, username=self.email, password=self.pwd)
-        return self.client
-
     def get_calendar(self):
         try:
-            # Сбрасываем клиент, чтобы получить свежие данные
+            # 🔑 Сбрасываем клиент, чтобы получить СВЕЖИЕ данные с сервера
             self.client = None
-            principal = self._get_client().principal()
+            client = caldav.DAVClient(url=YANDEX_CALDAV_URL, username=self.email, password=self.pwd)
+            principal = client.principal()
             calendars = principal.calendars()
             return calendars[0] if calendars else None
         except Exception as e:
@@ -260,21 +255,10 @@ END:VCALENDAR"""
                 logger.info(f"EXDATE добавлен: {exdate_str}")
                 
                 # Очищаем pending_events_store от этого события
-                keys_to_remove = []
-                for key, val in pending_events_store.items():
-                    if val.get('url') == event_url:
-                        if val.get('all_day'):
-                            if val['time'].date() == exception_date.date():
-                                keys_to_remove.append(key)
-                        else:
-                            occ_utc = val['time'].astimezone(pytz.UTC)
-                            occ_key = occ_utc.strftime('%Y%m%dT%H%M%SZ')
-                            if occ_key == exdate_str:
-                                keys_to_remove.append(key)
-                
-                for key in keys_to_remove:
-                    del pending_events_store[key]
-                    logger.info(f"Удалено из pending: {key}")
+                keys_to_remove = [k for k, v in pending_events_store.items() 
+                                  if v.get('url') == event_url and v['time'].date() == exception_date.date()]
+                for k in keys_to_remove:
+                    del pending_events_store[k]
                 
                 await asyncio.sleep(1)
                 return True
@@ -373,7 +357,7 @@ END:VCALENDAR"""
             excluded_set = set(event.get('exdates', []))
 
             occurrences = []
-            # Используем .between() для корректной итерации
+            # 🔑 Используем .between() для корректной итерации
             for occurrence in rule.between(start_time, end_dt, inc=True):
                 if occurrence.tzinfo is None:
                     occurrence = tz.localize(occurrence)
@@ -382,9 +366,8 @@ END:VCALENDAR"""
                 occ_utc = occurrence.astimezone(pytz.UTC)
                 occ_key = occ_utc.strftime('%Y%m%dT%H%M%SZ')
                 
-                # Сравниваем полный таймстамп, а не только дату!
+                # 🔑 Сравниваем полный таймстамп, а не только дату!
                 if occ_key in excluded_set:
-                    logger.debug(f"Пропущено исключённое вхождение: {occ_key}")
                     continue
                     
                 if occurrence <= end_dt:
@@ -515,13 +498,11 @@ async def get_pending_notifications() -> List[Dict]:
     api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
     today = now.date()
     
-    # Сначала очищаем pending_events_store от уже обработанных
-    keys_to_remove = []
-    for key, val in pending_events_store.items():
-        if val.get('processed'):
-            keys_to_remove.append(key)
-    for key in keys_to_remove:
-        del pending_events_store[key]
+    # Очищаем устаревшие записи (>24ч)
+    cutoff = now - timedelta(hours=24)
+    for k in list(pending_events_store.keys()):
+        if pending_events_store[k]['time'] < cutoff:
+            del pending_events_store[k]
     
     all_events = await api.get_all_events()
     pending = []
@@ -539,28 +520,20 @@ async def get_pending_notifications() -> List[Dict]:
                 short_id = hashlib.md5(key.encode()).hexdigest()[:12]
                 if short_id not in pending_events_store:
                     pending_events_store[short_id] = {
-                        'url': ev['url'],
-                        'short_id': short_id,
-                        'text': ev['summary'],
-                        'time': event_start,
-                        'is_recurring': False,
-                        'all_day': ev.get('all_day', False)
+                        'url': ev['url'], 'short_id': short_id, 'text': ev['summary'],
+                        'time': event_start, 'is_recurring': False
                     }
                     pending.append(pending_events_store[short_id])
             else:
                 occurrences = api.expand_recurring_event(ev, today, include_today=True)
                 for occ in occurrences:
-                    if occ.date() == today and (occ <= now or ev.get('all_day', False)):
+                    if occ.date() == today and occ <= now:
                         key = f"{ev['url']}_{occ.strftime('%Y%m%d%H%M')}"
                         short_id = hashlib.md5(key.encode()).hexdigest()[:12]
                         if short_id not in pending_events_store:
                             pending_events_store[short_id] = {
-                                'url': ev['url'],
-                                'short_id': short_id,
-                                'text': ev['summary'],
-                                'time': occ,
-                                'is_recurring': True,
-                                'all_day': ev.get('all_day', False)
+                                'url': ev['url'], 'short_id': short_id, 'text': ev['summary'],
+                                'time': occ, 'is_recurring': True
                             }
                             pending.append(pending_events_store[short_id])
 
@@ -568,7 +541,6 @@ async def get_pending_notifications() -> List[Dict]:
     logger.info(f"Найдено просроченных событий за сегодня: {len(pending)}")
     for p in pending:
         logger.info(f"  - {p['time'].strftime('%H:%M')}: {p['text']}")
-        
     return pending
 
 async def show_all_events(chat_id, persistent=False):
@@ -599,29 +571,19 @@ async def show_all_events(chat_id, persistent=False):
     else:
         text = "📅 **ВСЕ СОБЫТИЯ КАЛЕНДАРЯ**\n\n"
         for d in sorted(events_by_date.keys()):
-            if d == today:
-                prefix = "🔴 "
-            elif d == today + timedelta(days=1):
-                prefix = "🟠 "
-            else:
-                prefix = "📌 "
-            
+            prefix = "🔴 " if d == today else "🟠 " if d == today + timedelta(days=1) else "📌 "
             weekday = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"][d.weekday()]
             text += f"{prefix}**{d.day:02d}.{d.month:02d}.{d.year}** ({weekday})\n"
-            
             for ev in sorted(events_by_date[d], key=lambda x: x['start']):
-                time_str = ev['start'].strftime('%H:%M')
                 rec = " 🔁" if ev.get('is_recurring') else ""
                 passed = " ⚠️" if ev['start'] < now else ""
-                text += f"   • {time_str} — **{ev['summary']}**{rec}{passed}\n"
+                text += f"   • {ev['start'].strftime('%H:%M')} — **{ev['summary']}**{rec}{passed}\n"
             text += "\n"
-            
         if len(text) > 4000:
             text = text[:3500] + "\n\n... и ещё события"
 
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("◀️ Назад к календарю", callback_data="back_to_calendar"))
-    
     if persistent:
         await send_persistent_message(chat_id, text, reply_markup=kb)
     else:
@@ -633,9 +595,8 @@ class NotificationStates(StatesGroup):
 
 def init_config():
     if not os.path.exists(CONFIG_FILE):
-        default_config = {'notifications_enabled': True, 'timezone': 'Europe/Moscow'}
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(default_config, f)
+            json.dump({'notifications_enabled': True, 'timezone': 'Europe/Moscow'}, f)
 
 def load_config():
     global config, notifications_enabled
@@ -643,8 +604,7 @@ def load_config():
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             config = json.load(f)
         notifications_enabled = config.get('notifications_enabled', True)
-    except Exception as e:
-        logger.error(f"Error loading config: {e}")
+    except Exception:
         config = {'notifications_enabled': True, 'timezone': 'Europe/Moscow'}
         notifications_enabled = True
 
@@ -678,18 +638,12 @@ async def show_pending_actions(chat_id, short_id, text, event_time, is_recurring
         InlineKeyboardButton("❌ Отложить на час", callback_data=f"hour_{short_id}")
     )
     rec_text = " 🔁" if is_recurring else ""
-    now_time = get_current_time()
-    minutes_late = int((now_time - event_time).total_seconds() / 60)
+    minutes_late = int((get_current_time() - event_time).total_seconds() / 60)
     late = f"\n⚠️ Просрочено на {minutes_late} мин." if minutes_late > 0 else ""
-    
     await bot.send_message(
         chat_id,
-        f"🔔 ПРОСРОЧЕННОЕ НАПОМИНАНИЕ!{rec_text}\n\n"
-        f"📝 {text}\n"
-        f"⏰ {event_time.strftime('%d.%m.%Y %H:%M')}{late}\n\n"
-        f"❗️ Время истекло! Выберите действие:",
-        reply_markup=kb,
-        parse_mode='Markdown'
+        f"🔔 ПРОСРОЧЕННОЕ НАПОМИНАНИЕ!{rec_text}\n\n📝 {text}\n⏰ {event_time.strftime('%d.%m.%Y %H:%M')}{late}\n\n❗️ Время истекло! Выберите действие:",
+        reply_markup=kb, parse_mode='Markdown'
     )
 
 async def check_pending():
@@ -710,38 +664,21 @@ async def check_pending():
 async def snooze_event(short_id, hours=1):
     event_data = pending_events_store.get(short_id)
     if not event_data:
-        logger.error(f"Событие не найдено: {short_id}")
         return False
     try:
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
         new_start = event_data['time'] + timedelta(hours=hours)
         new_end = new_start + timedelta(hours=1)
         tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
+        if new_start.tzinfo is None: new_start = tz.localize(new_start)
+        if new_end.tzinfo is None: new_end = tz.localize(new_end)
         
-        if new_start.tzinfo is None:
-            new_start = tz.localize(new_start)
-        if new_end.tzinfo is None:
-            new_end = tz.localize(new_end)
-            
         tzid = config.get('timezone', 'Europe/Moscow')
         uid = f"{uuid4()}@myuved.bot"
-        
-        ical = f"""BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//MyUveBot//NONSGML v1.0//EN
-BEGIN:VEVENT
-UID:{uid}
-DTSTAMP:{datetime.now(pytz.UTC).strftime('%Y%m%dT%H%M%SZ')}
-DTSTART;TZID={tzid}:{new_start.strftime('%Y%m%dT%H%M%S')}
-DTEND;TZID={tzid}:{new_end.strftime('%Y%m%dT%H%M%S')}
-SUMMARY:{event_data['text'][:255]}
-END:VEVENT
-END:VCALENDAR"""
-        
+        ical = f"""BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//MyUveBot//NONSGML v1.0//EN\nBEGIN:VEVENT\nUID:{uid}\nDTSTAMP:{datetime.now(pytz.UTC).strftime('%Y%m%dT%H%M%SZ')}\nDTSTART;TZID={tzid}:{new_start.strftime('%Y%m%dT%H%M%S')}\nDTEND;TZID={tzid}:{new_end.strftime('%Y%m%dT%H%M%S')}\nSUMMARY:{event_data['text'][:255]}\nEND:VEVENT\nEND:VCALENDAR"""
         cal = api.get_calendar()
         if cal:
             cal.save_event(ical)
-            logger.info(f"Событие отложено на {hours} час(ов): {event_data['text']}")
             del pending_events_store[short_id]
             return True
         return False
@@ -753,24 +690,16 @@ async def mark_done(short_id):
     """УДАЛЯЕТ событие + СРАЗУ чистит pending_events_store"""
     event_data = pending_events_store.get(short_id)
     if not event_data:
-        logger.error(f"Событие не найдено: {short_id}")
         return False
     try:
         api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
-        
         if event_data.get('is_recurring'):
-            logger.info(f"Удаление вхождения повторяющегося события: {event_data['url']} на {event_data['time']}")
             result = await api.add_exception_to_recurring(event_data['url'], event_data['time'], retry_count=3)
         else:
-            logger.info(f"Удаление обычного события: {event_data['url']}")
             result = await api.delete_event(event_data['url'])
-            
-        if result:
-            # Гарантированно удаляем из pending_events_store
-            if short_id in pending_events_store:
-                del pending_events_store[short_id]
-            return True
-        return False
+        if result and short_id in pending_events_store:
+            del pending_events_store[short_id]
+        return result
     except Exception as e:
         logger.error(f"mark_done error: {e}", exc_info=True)
         return False
@@ -778,10 +707,8 @@ async def mark_done(short_id):
 def get_main_keyboard():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
-        KeyboardButton("➕ Добавить"),
-        KeyboardButton("📅 Календарь"),
-        KeyboardButton("⚠️ Просроченные"),
-        KeyboardButton("⚙️ Настройки")
+        KeyboardButton("➕ Добавить"), KeyboardButton("📅 Календарь"),
+        KeyboardButton("⚠️ Просроченные"), KeyboardButton("⚙️ Настройки")
     )
     return kb
 
@@ -790,7 +717,6 @@ async def show_pending_list(chat_id, persistent=False):
     if not pending:
         await send_persistent_message(chat_id, "✅ Нет просроченных уведомлений!")
         return
-    
     await send_persistent_message(chat_id, f"⚠️ ПРОСРОЧЕННЫЕ УВЕДОМЛЕНИЯ ({len(pending)} шт.)\n")
     for idx, p in enumerate(pending, 1):
         rec_mark = " 🔁" if p['is_recurring'] else ""
@@ -807,23 +733,11 @@ async def show_pending_list(chat_id, persistent=False):
 
 @dp.message_handler(commands=['start'])
 async def cmd_start(msg, state):
-    await delete_user_message(msg)
-    await state.finish()
+    await delete_user_message(msg); await state.finish()
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
         return await msg.reply("❌ Нет доступа")
-    
     ok, _ = await check_caldav_connection()
-    welcome = f"""👋 Добро пожаловать!
-🤖 Версия v{BOT_VERSION}
-📧 CalDAV: {'✅ Доступен' if ok else '❌ Ошибка'}
-🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}
-
-📌 Как это работает:
-• Все уведомления берутся ТОЛЬКО из Яндекс.Календаря
-• При отметке "Выполнено" событие удаляется из календаря
-• Для повторяющихся событий удаляется только текущее вхождение"""
-    
-    await send_persistent_message(msg.chat.id, welcome)
+    await send_persistent_message(msg.chat.id, f"👋 Добро пожаловать!\n🤖 Версия v{BOT_VERSION}\n📧 CalDAV: {'✅' if ok else '❌'}\n🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}")
     await send_persistent_message(msg.chat.id, "👋 Выберите действие:", reply_markup=get_main_keyboard())
     await show_calendar_events(msg.chat.id, persistent=True)
     await show_pending_list(msg.chat.id, persistent=True)
@@ -837,17 +751,13 @@ async def show_menu(msg):
 
 @dp.message_handler(lambda m: m.text == "➕ Добавить", state='*')
 async def add_start(msg, state):
-    await delete_user_message(msg)
-    await state.finish()
+    await delete_user_message(msg); await state.finish()
     await send_with_auto_delete(msg.chat.id, "✏️ Введите текст уведомления:\n\n💡 Для отмены /cancel", delay=3600)
     await NotificationStates.waiting_for_text.set()
 
 @dp.message_handler(state=NotificationStates.waiting_for_text)
 async def get_text(msg, state):
     await delete_user_message(msg)
-    if not msg.text:
-        return await send_with_auto_delete(msg.chat.id, "❌ Введите текст.", delay=3600)
-    
     await state.update_data(text=msg.text)
     await send_with_auto_delete(msg.chat.id, "🗓️ Введите дату и время\n📝 Форматы:\n• `21.04 14:00`\n• `31.12.2025 23:59`", delay=3600)
     await NotificationStates.waiting_for_specific_date.set()
@@ -858,129 +768,91 @@ async def set_specific_date(msg, state):
     dt = parse_datetime(msg.text)
     if dt is None or dt <= get_current_time():
         return await send_with_auto_delete(msg.chat.id, "❌ Неверный формат или дата в прошлом!", delay=3600)
-    
     data = await state.get_data()
-    api = CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD)
-    ev_id = await api.create_event(data['text'], dt)
-    
+    ev_id = await CalDAVCalendarAPI(YANDEX_EMAIL, YANDEX_APP_PASSWORD).create_event(data['text'], dt)
     if ev_id:
         await send_with_auto_delete(msg.chat.id, f"✅ Уведомление создано!\n📝 {data['text']}\n⏰ {dt.strftime('%d.%m.%Y %H:%M')}", delay=3600)
-        await show_calendar_events(msg.chat.id, persistent=True)
-        await show_pending_list(msg.chat.id, persistent=True)
-    else:
-        await send_with_auto_delete(msg.chat.id, "❌ Ошибка при создании уведомления!", delay=3600)
-    
+    await show_calendar_events(msg.chat.id, persistent=True); await show_pending_list(msg.chat.id, persistent=True)
     await state.finish()
-
-# ---------- ОБРАБОТЧИКИ ДЛЯ ПРОСРОЧЕННЫХ ----------
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('done_'), state='*')
 async def handle_done(cb):
     short_id = cb.data.replace('done_', '')
-    logger.info(f"Обработка done для short_id: {short_id}")
-    
     await cb.answer("Удаляю событие...")
-    
     success = await mark_done(short_id)
     if success:
-        try:
-            await cb.message.delete()
-        except Exception:
-            pass
+        try: await cb.message.delete()
+        except: pass
         await bot.send_message(cb.from_user.id, "✅ Событие удалено!")
         await asyncio.sleep(1)
-        # СРАЗУ обновляем интерфейс
         await show_calendar_events(cb.from_user.id, persistent=True)
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
-        await bot.send_message(cb.from_user.id, "❌ Не удалось удалить событие. Попробуйте позже.")
+        await bot.send_message(cb.from_user.id, "❌ Не удалось удалить событие.")
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
+async def process_snooze(cb, short_id, hours):
+    await cb.answer("Откладываю...")
+    success = await snooze_event(short_id, hours)
+    if success:
+        try: await cb.message.delete()
+        except: pass
+        await bot.send_message(cb.from_user.id, f"✅ Отложено на {hours} ч!")
+        await show_calendar_events(cb.from_user.id, persistent=True)
+        await show_pending_list(cb.from_user.id, persistent=True)
+    else:
+        await bot.send_message(cb.from_user.id, "❌ Ошибка!")
+
+@dp.callback_query_handler(lambda c: c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
 async def handle_snooze(cb):
     short_id = cb.data.replace('snooze_', '')
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("1 час", callback_data=f"snooze_1h_{short_id}"),
-        InlineKeyboardButton("3 часа", callback_data=f"snooze_3h_{short_id}"),
-        InlineKeyboardButton("1 день", callback_data=f"snooze_1d_{short_id}"),
-        InlineKeyboardButton("7 дней", callback_data=f"snooze_7d_{short_id}"),
-        InlineKeyboardButton("◀️ Назад", callback_data="back_to_pending")
-    )
+    kb.add(InlineKeyboardButton("1 час", callback_data=f"snooze_1h_{short_id}"),
+           InlineKeyboardButton("3 часа", callback_data=f"snooze_3h_{short_id}"),
+           InlineKeyboardButton("1 день", callback_data=f"snooze_1d_{short_id}"),
+           InlineKeyboardButton("7 дней", callback_data=f"snooze_7d_{short_id}"),
+           InlineKeyboardButton("◀️ Назад", callback_data="back_to_pending"))
     await cb.message.edit_text("⏰ На сколько отложить?", reply_markup=kb)
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith('snooze_1h_'), state='*')
-async def snooze_1h(cb):
-    short_id = cb.data.replace('snooze_1h_', '')
-    await process_snooze(cb, short_id, 1)
-
-@dp.callback_query_handler(lambda c: c.data.startswith('snooze_3h_'), state='*')
-async def snooze_3h(cb):
-    short_id = cb.data.replace('snooze_3h_', '')
-    await process_snooze(cb, short_id, 3)
-
-@dp.callback_query_handler(lambda c: c.data.startswith('snooze_1d_'), state='*')
-async def snooze_1d(cb):
-    short_id = cb.data.replace('snooze_1d_', '')
-    await process_snooze(cb, short_id, 24)
-
-@dp.callback_query_handler(lambda c: c.data.startswith('snooze_7d_'), state='*')
-async def snooze_7d(cb):
-    short_id = cb.data.replace('snooze_7d_', '')
-    await process_snooze(cb, short_id, 168)
+@dp.callback_query_handler(lambda c: c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
+async def snooze_direct(cb):
+    parts = cb.data.split('_')
+    hours = int(parts[1].replace('h', '').replace('d', ''))
+    short_id = cb.data.replace(f"snooze_{parts[1]}_", '')
+    await process_snooze(cb, short_id, hours)
 
 @dp.callback_query_handler(lambda c: c.data == "back_to_pending", state='*')
 async def back_to_pending(cb):
     await show_pending_list(cb.from_user.id, persistent=True)
     await cb.answer()
 
-async def process_snooze(cb, short_id, hours):
-    await cb.answer("Откладываю...")
-    success = await snooze_event(short_id, hours)
-    if success:
-        try:
-            await cb.message.delete()
-        except Exception:
-            pass
-        await bot.send_message(cb.from_user.id, f"✅ Событие отложено на {hours} час(ов)!")
-        await show_calendar_events(cb.from_user.id, persistent=True)
-        await show_pending_list(cb.from_user.id, persistent=True)
-    else:
-        await bot.send_message(cb.from_user.id, "❌ Ошибка при откладывании! Попробуйте позже.")
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('hour_'), state='*')
+@dp.callback_query_handler(lambda c: c.data.startswith('hour_'), state='*')
 async def handle_hour(cb):
     short_id = cb.data.replace('hour_', '')
     await process_snooze(cb, short_id, 1)
 
 @dp.message_handler(lambda m: m.text == "⚠️ Просроченные", state='*')
 async def view_pending(msg, state):
-    await delete_user_message(msg)
-    await state.finish()
+    await delete_user_message(msg); await state.finish()
     await show_pending_list(msg.chat.id, persistent=True)
-
-# ---------- ОБРАБОТЧИКИ КАЛЕНДАРЯ ----------
 
 @dp.message_handler(lambda m: m.text == "📅 Календарь", state='*')
 async def view_calendar(msg, state):
-    await delete_user_message(msg)
-    await state.finish()
+    await delete_user_message(msg); await state.finish()
     await show_calendar_events(msg.chat.id, persistent=True)
 
 @dp.callback_query_handler(lambda c: c.data == "refresh_calendar", state='*')
 async def refresh_calendar(cb):
-    # Принудительно очищаем pending_events_store при обновлении
     pending_events_store.clear()
     await show_calendar_events(cb.from_user.id, persistent=True)
-    await cb.answer("✅ Календарь обновлён")
+    await cb.answer("✅ Обновлено")
 
 @dp.callback_query_handler(lambda c: c.data == "sync_calendar", state='*')
 async def sync_calendar(cb):
-    await cb.message.edit_text("🔄 Синхронизация с календарём...")
-    # Принудительно очищаем pending_events_store при синхронизации
+    await cb.message.edit_text("🔄 Синхронизация...")
     pending_events_store.clear()
     await show_calendar_events(cb.from_user.id, persistent=True)
-    await cb.answer("✅ Синхронизация завершена")
+    await cb.answer("✅ Синхронизировано")
 
 @dp.callback_query_handler(lambda c: c.data == "all_events", state='*')
 async def handle_all_events(cb):
@@ -992,46 +864,23 @@ async def back_to_calendar(cb):
     await show_calendar_events(cb.from_user.id, persistent=True)
     await cb.answer()
 
-# ---------- НАСТРОЙКИ ----------
-
 @dp.message_handler(lambda m: m.text == "⚙️ Настройки", state='*')
 async def settings_menu(msg, state):
-    await delete_user_message(msg)
-    await state.finish()
-    await settings_menu_handler(msg)
-
-async def settings_menu_handler(msg):
-    global notifications_enabled
+    await delete_user_message(msg); await state.finish()
     status = "🔔 Вкл" if notifications_enabled else "🔕 Выкл"
-    
-    if get_caldav_available():
-        ok, _ = await check_caldav_connection()
-        caldav_status = "✅ Доступен" if ok else "❌ Ошибка"
-    else:
-        caldav_status = "❌ Не настроен"
-        
+    caldav_status = "✅ Доступен" if get_caldav_available() else "❌ Не настроен"
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton(f"Уведомления: {status}", callback_data="toggle_notify"),
-        InlineKeyboardButton("🌍 Часовой пояс", callback_data="set_timezone"),
-        InlineKeyboardButton("🔍 Проверить календарь", callback_data="check_cal"),
-        InlineKeyboardButton("ℹ️ Информация", callback_data="info")
-    )
-    
-    await send_with_auto_delete(msg.chat.id, f"⚙️ НАСТРОЙКИ\n\n📧 CalDAV: {caldav_status}\n🌍 Часовой пояс: {config.get('timezone', 'Europe/Moscow')}", reply_markup=kb, delay=3600)
+    kb.add(InlineKeyboardButton(f"Уведомления: {status}", callback_data="toggle_notify"),
+           InlineKeyboardButton("🌍 Часовой пояс", callback_data="set_timezone"),
+           InlineKeyboardButton("🔍 Проверить календарь", callback_data="check_cal"),
+           InlineKeyboardButton("ℹ️ Информация", callback_data="info"))
+    await send_with_auto_delete(msg.chat.id, f"⚙️ НАСТРОЙКИ\n📧 CalDAV: {caldav_status}\n🌍 TZ: {config.get('timezone', 'Europe/Moscow')}", reply_markup=kb, delay=3600)
 
 @dp.callback_query_handler(lambda c: c.data == "check_cal", state='*')
 async def check_cal(cb):
-    if not get_caldav_available():
-        return await cb.message.edit_text("❌ CalDAV не настроен!")
-    
-    await cb.message.edit_text("🔍 Проверка подключения...")
+    await cb.message.edit_text("🔍 Проверка...")
     ok, msg = await check_caldav_connection()
-    if ok:
-        await cb.message.edit_text(f"✅ {msg}")
-        await show_calendar_events(cb.from_user.id, persistent=True)
-    else:
-        await cb.message.edit_text(f"❌ {msg}\n\n🔧 Получите новый пароль приложения: https://id.yandex.ru/security/app-passwords")
+    await cb.message.edit_text(f"{'✅' if ok else '❌'} {msg}")
     await cb.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "toggle_notify", state='*')
@@ -1042,24 +891,21 @@ async def toggle_notify(cb, state):
     save_config()
     await cb.message.edit_text(f"✅ Уведомления {'включены' if notifications_enabled else 'выключены'}!")
     await settings_menu_handler(cb.message)
-    await cb.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "set_timezone", state='*')
 async def set_timezone(cb):
     kb = InlineKeyboardMarkup(row_width=2)
-    for name in TIMEZONES:
-        kb.add(InlineKeyboardButton(name, callback_data=f"tz_{name}"))
+    for name in TIMEZONES: kb.add(InlineKeyboardButton(name, callback_data=f"tz_{name}"))
     kb.add(InlineKeyboardButton("❌ Отмена", callback_data="cancel_tz"))
-    await cb.message.edit_text(f"🌍 Выберите часовой пояс\n\nТекущий: {config.get('timezone', 'Europe/Moscow')}", reply_markup=kb)
+    await cb.message.edit_text(f"🌍 Выберите часовой пояс\nТекущий: {config.get('timezone', 'Europe/Moscow')}", reply_markup=kb)
     await cb.answer()
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("tz_"), state='*')
+@dp.callback_query_handler(lambda c: c.data.startswith("tz_"), state='*')
 async def save_tz(cb, state):
     name = cb.data.replace("tz_", "")
-    tz = TIMEZONES.get(name, 'Europe/Moscow')
-    config['timezone'] = tz
+    config['timezone'] = TIMEZONES.get(name, 'Europe/Moscow')
     save_config()
-    await cb.message.edit_text(f"✅ Часовой пояс установлен: {name}\n🕐 {get_current_time().strftime('%d.%m.%Y %H:%M:%S')}")
+    await cb.message.edit_text(f"✅ Установлен: {name}")
     await settings_menu_handler(cb.message)
     await cb.answer()
 
@@ -1070,23 +916,13 @@ async def cancel_tz(cb, state):
 
 @dp.callback_query_handler(lambda c: c.data == "info", state='*')
 async def info(cb):
-    ok, _ = await check_caldav_connection() if get_caldav_available() else (False, "")
-    caldav_status = "✅ Доступен" if ok else "❌ Ошибка" if get_caldav_available() else "❌ Не настроен"
-    
-    info_text = f"""📊 СТАТИСТИКА
-🤖 Версия: v{BOT_VERSION} ({BOT_VERSION_DATE})
-🌍 Часовой пояс:`{config.get('timezone', 'Europe/Moscow')}`
-🕐 Текущее время:`{get_current_time().strftime('%d.%m.%Y %H:%M:%S')}`
-🔔 Уведомления:`{'Вкл' if notifications_enabled else 'Выкл'}`
-📧 CalDAV:`{caldav_status}`"""
-    
-    await cb.message.edit_text(info_text)
+    await cb.message.edit_text(f"📊 СТАТИСТИКА\n🤖 v{BOT_VERSION} ({BOT_VERSION_DATE})\n🌍 `{config.get('timezone', 'Europe/Moscow')}`\n🕐 `{get_current_time().strftime('%d.%m.%Y %H:%M:%S')}`\n🔔 `{'Вкл' if notifications_enabled else 'Выкл'}`")
     await cb.answer()
 
 @dp.message_handler(commands=['version'])
 async def show_version(msg):
     await delete_user_message(msg)
-    await send_with_auto_delete(msg.chat.id, f"🤖 Версия: v{BOT_VERSION}\n📅 Дата: {BOT_VERSION_DATE}", delay=3600)
+    await send_with_auto_delete(msg.chat.id, f"🤖 v{BOT_VERSION}\n📅 {BOT_VERSION_DATE}", delay=3600)
 
 @dp.message_handler(commands=['cancel'], state='*')
 async def cancel(msg, state):
@@ -1094,7 +930,7 @@ async def cancel(msg, state):
     if await state.get_state() is None:
         return await send_with_auto_delete(msg.chat.id, "❌ Нет активных операций", delay=3600)
     await state.finish()
-    await send_with_auto_delete(msg.chat.id, "✅ Операция отменена!", delay=3600)
+    await send_with_auto_delete(msg.chat.id, "✅ Отменено!", delay=3600)
 
 async def auto_update():
     while True:
@@ -1108,26 +944,29 @@ async def update_sync_time():
         await asyncio.sleep(60)
 
 async def on_startup(dp):
-    init_config()
-    load_config()
+    init_config(); load_config()
     old_file = 'notifications.json'
-    if os.path.exists(old_file):
-        os.remove(old_file)
-    
+    if os.path.exists(old_file): os.remove(old_file)
     logger.info(f"\n{'='*50}\n🤖 БОТ v{BOT_VERSION} ЗАПУЩЕН\n{'='*50}")
-    
-    if get_caldav_available():
-        ok, msg = await check_caldav_connection()
-        logger.info(f"CalDAV: {'✅' if ok else '❌'} {msg}")
-    
+    ok, msg = await check_caldav_connection() if get_caldav_available() else (False, "Не настроен")
+    logger.info(f"CalDAV: {'✅' if ok else '❌'} {msg}")
     logger.info(f"Часовой пояс: {config.get('timezone', 'Europe/Moscow')}")
     logger.info(f"Текущее время: {get_current_time().strftime('%d.%m.%Y %H:%M:%S')}")
     logger.info(f"{'='*50}\n")
-    
     asyncio.create_task(check_pending())
     asyncio.create_task(auto_update())
     asyncio.create_task(update_sync_time())
     logger.info("✅ Бот готов")
+
+async def settings_menu_handler(msg):
+    status = "🔔 Вкл" if notifications_enabled else "🔕 Выкл"
+    caldav_status = "✅ Доступен" if get_caldav_available() else "❌ Не настроен"
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton(f"Уведомления: {status}", callback_data="toggle_notify"),
+           InlineKeyboardButton("🌍 Часовой пояс", callback_data="set_timezone"),
+           InlineKeyboardButton("🔍 Проверить календарь", callback_data="check_cal"),
+           InlineKeyboardButton("ℹ️ Информация", callback_data="info"))
+    await send_with_auto_delete(msg.chat.id, f"⚙️ НАСТРОЙКИ\n📧 CalDAV: {caldav_status}\n🌍 TZ: {config.get('timezone', 'Europe/Moscow')}", reply_markup=kb, delay=3600)
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
