@@ -56,7 +56,7 @@ YANDEX_EMAIL = os.getenv('YANDEX_EMAIL')
 YANDEX_APP_PASSWORD = os.getenv('YANDEX_APP_PASSWORD')
 YANDEX_CALDAV_URL = "https://caldav.yandex.ru"
 
-BOT_VERSION = "4.5.1"
+BOT_VERSION = "4.5.2"
 BOT_VERSION_DATE = "25.04.2026"
 
 bot = Bot(token=BOT_TOKEN)
@@ -165,6 +165,7 @@ DTEND;TZID={tzid}:{end_time.strftime('%Y%m%dT%H%M%S')}
 SUMMARY:{summary[:255]}
 END:VEVENT
 END:VCALENDAR"""
+            
             event = cal.save_event(ical)
             return str(event.url) if event else None
         except Exception as e:
@@ -187,7 +188,7 @@ END:VCALENDAR"""
             return False
 
     async def add_exception_to_recurring(self, event_url, exception_date, retry_count=3):
-        """Добавляет EXDATE к повторяющемуся событию (полный UTC)"""
+        """🔑 Добавляет EXDATE к повторяющемуся событию (полное UTC время)"""
         for attempt in range(retry_count):
             try:
                 cal = self.get_calendar()
@@ -248,7 +249,7 @@ END:VCALENDAR"""
                 target_event.data = '\n'.join(new_lines)
                 target_event.save()
                 
-                # 🔑 Сразу очищаем кеш просроченных от этого вхождения
+                # Очищаем кеш от этого вхождения
                 keys_to_remove = [k for k, v in pending_events_store.items() 
                                   if v.get('url') == event_url and v['time'].date() == exception_date.date()]
                 for k in keys_to_remove:
@@ -263,6 +264,7 @@ END:VCALENDAR"""
         return False
 
     async def get_all_events(self) -> List[Dict]:
+        """🔑 Получает ВСЕ события СВЕЖИЕ из CalDAV"""
         try:
             cal = self.get_calendar()
             if not cal:
@@ -334,11 +336,11 @@ END:VCALENDAR"""
             tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
             end_dt = tz.localize(datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)) + timedelta(days=60)
 
-            # 🔑 Храним EXDATE как есть (полные UTC строки)
+            # Храним EXDATE как полные UTC строки
             excluded_set = set(event.get('exdates', []))
 
             occurrences = []
-            # 🔑 Используем .between() вместо итерации по rule
+            # 🔑 Используем .between() вместо прямой итерации
             for occurrence in rule.between(start_time, end_dt, inc=True):
                 if occurrence.tzinfo is None:
                     occurrence = tz.localize(occurrence)
@@ -346,7 +348,7 @@ END:VCALENDAR"""
                 occ_utc = occurrence.astimezone(pytz.UTC)
                 occ_key = occ_utc.strftime('%Y%m%dT%H%M%SZ')
                 
-                # 🔑 Сравниваем полный таймстамп
+                # 🔑 Сравниваем полный таймстамп, а не только дату
                 if occ_key in excluded_set:
                     continue
                     
@@ -464,12 +466,12 @@ async def show_calendar_events(chat_id, persistent=False):
         await send_with_auto_delete(chat_id, text, reply_markup=kb, delay=3600)
 
 async def get_pending_notifications() -> List[Dict]:
-    """🔑 Получает просроченные события. Гарантированно синхронизировано с календарём."""
+    """🔑 Гарантированно синхронизировано с календарём. Показывает ВСЕ просроченные."""
     global pending_events_store
     now = get_current_time()
     today = now.date()
     
-    # 🔑 Очистка старых записей (старше 24 часов)
+    # Очистка устаревших записей (>24ч)
     cutoff = now - timedelta(hours=24)
     pending_events_store = {k: v for k, v in pending_events_store.items() if v['time'] > cutoff}
 
@@ -489,7 +491,7 @@ async def get_pending_notifications() -> List[Dict]:
                     }
                     pending.append(pending_events_store[short_id])
         else:
-            # 🔑 Используем ТОЧНУЮ функцию разворачивания
+            # Используем ТОЧНУЮ функцию разворачивания (как в календаре)
             occurrences = api.expand_recurring_event(ev, today, include_today=True)
             for occ in occurrences:
                 if occ.date() == today and occ <= now:
@@ -696,8 +698,7 @@ async def show_pending_list(chat_id, persistent=False):
 
 @dp.message_handler(commands=['start'])
 async def cmd_start(msg, state):
-    await delete_user_message(msg)
-    await state.finish()
+    await delete_user_message(msg); await state.finish()
     if ADMIN_ID and msg.from_user.id != ADMIN_ID:
         return await msg.reply("❌ Нет доступа")
     ok, _ = await check_caldav_connection()
@@ -754,18 +755,6 @@ async def handle_done(cb):
     else:
         await bot.send_message(cb.from_user.id, "❌ Не удалось удалить событие.")
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
-async def handle_snooze(cb):
-    short_id = cb.data.replace('snooze_', '')
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(InlineKeyboardButton("1 час", callback_data=f"snooze_1h_{short_id}"),
-           InlineKeyboardButton("3 часа", callback_data=f"snooze_3h_{short_id}"),
-           InlineKeyboardButton("1 день", callback_data=f"snooze_1d_{short_id}"),
-           InlineKeyboardButton("7 дней", callback_data=f"snooze_7d_{short_id}"),
-           InlineKeyboardButton("◀️ Назад", callback_data="back_to_pending"))
-    await cb.message.edit_text("⏰ На сколько отложить?", reply_markup=kb)
-    await cb.answer()
-
 async def process_snooze(cb, short_id, hours):
     await cb.answer("Откладываю...")
     success = await snooze_event(short_id, hours)
@@ -777,6 +766,18 @@ async def process_snooze(cb, short_id, hours):
         await show_pending_list(cb.from_user.id, persistent=True)
     else:
         await bot.send_message(cb.from_user.id, "❌ Ошибка!")
+
+@dp.callback_query_handler(lambda c: c.data.startswith('snooze_') and not c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
+async def handle_snooze(cb):
+    short_id = cb.data.replace('snooze_', '')
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("1 час", callback_data=f"snooze_1h_{short_id}"),
+           InlineKeyboardButton("3 часа", callback_data=f"snooze_3h_{short_id}"),
+           InlineKeyboardButton("1 день", callback_data=f"snooze_1d_{short_id}"),
+           InlineKeyboardButton("7 дней", callback_data=f"snooze_7d_{short_id}"),
+           InlineKeyboardButton("◀️ Назад", callback_data="back_to_pending"))
+    await cb.message.edit_text("⏰ На сколько отложить?", reply_markup=kb)
+    await cb.answer()
 
 @dp.callback_query_handler(lambda c: c.data.startswith(('snooze_1h_', 'snooze_3h_', 'snooze_1d_', 'snooze_7d_')), state='*')
 async def snooze_direct(cb):
