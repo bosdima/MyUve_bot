@@ -193,7 +193,7 @@ END:VCALENDAR"""
             return False
 
     async def add_exception_to_recurring(self, event_url, exception_date, retry_count=3):
-        """🔑 ДОБАВЛЯЕТ EXDATE + СРАЗУ ЧИСТИТ pending_events_store"""
+        """Добавляет EXDATE к повторяющемуся событию"""
         for attempt in range(retry_count):
             try:
                 cal = self.get_calendar()
@@ -214,7 +214,7 @@ END:VCALENDAR"""
                 if not ical_data:
                     return False
 
-                # Конвертация в UTC для EXDATE (полный формат)
+                # Конвертация в UTC для EXDATE
                 tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
                 if exception_date.tzinfo is None:
                     exception_date = tz.localize(exception_date)
@@ -258,11 +258,10 @@ END:VCALENDAR"""
                 
                 logger.info(f"EXDATE добавлен: {exdate_str}")
                 
-                # 🔑 КЛЮЧЕВОЕ: ЧИСТИМ pending_events_store от этого события СРАЗУ
+                # Очищаем pending_events_store от этого события
                 keys_to_remove = []
                 for key, val in pending_events_store.items():
                     if val.get('url') == event_url:
-                        # Сравниваем по дате (без времени) для all-day, или по полному времени
                         if val.get('all_day'):
                             if val['time'].date() == exception_date.date():
                                 keys_to_remove.append(key)
@@ -286,12 +285,13 @@ END:VCALENDAR"""
         return False
 
     async def get_all_events(self) -> List[Dict]:
-        """Получает все события, включая EXDATE"""
+        """🔑 Получает ВСЕ события СВЕЖИЕ из CalDAV каждый раз"""
         try:
             cal = self.get_calendar()
             if not cal:
                 return []
 
+            # 🔑 Принудительно получаем свежие данные
             events = cal.events()
             tz = pytz.timezone(config.get('timezone', 'Europe/Moscow'))
             result = []
@@ -321,7 +321,7 @@ END:VCALENDAR"""
                     elif is_recurring:
                         rrule_str = str(vevent.rrule.value)
 
-                    # Парсим EXDATE (полный формат!)
+                    # 🔑 Парсим EXDATE (полный формат!)
                     exdates = []
                     if ev.data:
                         for line in ev.data.split('\n'):
@@ -411,6 +411,7 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
     today = now.date()
     tomorrow = today + timedelta(days=1)
 
+    # 🔑 Каждый раз получаем свежие данные
     all_events = await api.get_all_events()
 
     result = []
@@ -431,6 +432,7 @@ async def get_today_tomorrow_events() -> List[Tuple[datetime, Dict]]:
 
     result.sort(key=lambda x: x[0])
     
+    # Удаление дубликатов
     unique = {}
     for dt, ev in result:
         key = f"{ev['url']}_{dt.strftime('%Y%m%d%H%M')}"
@@ -521,6 +523,7 @@ async def get_pending_notifications() -> List[Dict]:
     for key in keys_to_remove:
         del pending_events_store[key]
     
+    # 🔑 Получаем свежие данные каждый раз
     all_events = await api.get_all_events()
     pending = []
     
@@ -576,6 +579,7 @@ async def show_all_events(chat_id, persistent=False):
     start_date = today - timedelta(days=7)
     end_date = today + timedelta(days=30)
     
+    # 🔑 Получаем свежие данные
     all_events = await api.get_all_events()
     events_by_date = {}
     
@@ -967,12 +971,16 @@ async def view_calendar(msg, state):
 
 @dp.callback_query_handler(lambda c: c.data == "refresh_calendar", state='*')
 async def refresh_calendar(cb):
+    # 🔑 Принудительно очищаем pending_events_store при обновлении
+    pending_events_store.clear()
     await show_calendar_events(cb.from_user.id, persistent=True)
     await cb.answer("✅ Календарь обновлён")
 
 @dp.callback_query_handler(lambda c: c.data == "sync_calendar", state='*')
 async def sync_calendar(cb):
     await cb.message.edit_text("🔄 Синхронизация с календарём...")
+    # 🔑 Принудительно очищаем pending_events_store при синхронизации
+    pending_events_store.clear()
     await show_calendar_events(cb.from_user.id, persistent=True)
     await cb.answer("✅ Синхронизация завершена")
 
