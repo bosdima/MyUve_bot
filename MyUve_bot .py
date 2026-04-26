@@ -7,14 +7,14 @@ from dotenv import load_dotenv
 import caldav
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ParseMode
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.1.0"  # Измените версию здесь при обновлении
+BOT_VERSION = "1.1.1"  # Обновленная версия
 
 load_dotenv()
 
@@ -24,10 +24,16 @@ YANDEX_LOGIN = os.getenv("YANDEX_LOGIN")
 YANDEX_PASSWORD = os.getenv("YANDEX_APP_PASSWORD")
 CALDAV_URL = os.getenv("CALDAV_URL", "https://caldav.yandex.ru/")
 
-if not all([BOT_TOKEN, ADMIN_ID, YANDEX_LOGIN, YANDEX_PASSWORD]):
-    raise ValueError("Ошибка: Проверьте .env. Убедитесь, что заполнен YANDEX_LOGIN (ваш email)!")
+# Чтение интервала из .env (по умолчанию 15)
+try:
+    CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", 15))
+except ValueError:
+    CHECK_INTERVAL_MINUTES = 15
 
-# --- ЛОГИРОВАНИЕ (Макс 300 КБ) ---
+if not all([BOT_TOKEN, ADMIN_ID, YANDEX_LOGIN, YANDEX_PASSWORD]):
+    raise ValueError("Ошибка: Проверьте .env. Убедитесь, что заполнен YANDEX_LOGIN!")
+
+# --- ЛОГИРОВАНИЕ ---
 LOG_FILE = "bot.log"
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -43,7 +49,7 @@ logger.addHandler(console_handler)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- МАШИНА СОСТОЯНИЙ ДЛЯ ДОБАВЛЕНИЯ ЗАМЕТКИ ---
+# --- МАШИНА СОСТОЯНИЙ ---
 class AddNoteState(StatesGroup):
     waiting_for_text = State()
     waiting_for_time = State()
@@ -68,12 +74,16 @@ def get_events_range(start_date, end_date):
         result = []
         for event in events:
             dt_start = event.instance.vevent.dtstart.value
+            # Корректная обработка даты и времени
             if hasattr(dt_start, 'date'):
+                # Если это дата без времени, ставим 00:00
                 dt_start = datetime.combine(dt_start, datetime.min.time())
             
             summary = event.instance.vevent.summary.value if event.instance.vevent.summary else "Без названия"
             uid = event.instance.vevent.uid.value
             result.append({"summary": summary, "time": dt_start, "uid": uid})
+        # Сортировка по времени
+        result.sort(key=lambda x: x['time'])
         return result
     except Exception as e:
         logger.error(f"Error fetching events: {e}")
@@ -96,7 +106,6 @@ def create_event_in_yandex(summary, start_dt, duration_hours=1):
     if not calendar: return False
     try:
         end_dt = start_dt + timedelta(hours=duration_hours)
-        # Формат iCal для CalDAV
         dt_str_start = start_dt.strftime('%Y%m%dT%H%M%SZ')
         dt_str_end = end_dt.strftime('%Y%m%dT%H%M%SZ')
         
@@ -112,17 +121,18 @@ END:VEVENT"""
         return False
 
 # --- КЛАВИАТУРЫ ---
-def get_main_kb():
-    builder = InlineKeyboardBuilder()
-    builder.button(text=" Добавить новую заметку", callback_data="add_note_start")
-    builder.button(text="✏️ Редактировать / Удалить", callback_data="edit_notes")
-    return builder.as_markup()
 
+# Reply-клавиатура (всегда внизу)
+def get_reply_keyboard():
+    builder = ReplyKeyboardBuilder()
+    builder.row(KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="️ Настройки"))
+    return builder.as_markup(resize_keyboard=True)
+
+# Inline для выбора времени
 def get_time_options_kb():
     builder = InlineKeyboardBuilder()
     now = datetime.now()
     
-    # Варианты
     t1 = now + timedelta(hours=1)
     t2 = (now + timedelta(days=1)).replace(hour=9, minute=0)
     t3 = (now + timedelta(days=1)).replace(hour=18, minute=0)
@@ -134,9 +144,20 @@ def get_time_options_kb():
     builder.adjust(1)
     return builder.as_markup()
 
+# Inline для удаления
 def get_done_kb(uid):
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Выполнено (Удалить)", callback_data=f"done_{uid}")
+    return builder.as_markup()
+
+# Inline для настроек
+def get_settings_kb(current_interval):
+    builder = InlineKeyboardBuilder()
+    intervals = [5, 15, 30, 60]
+    for mins in intervals:
+        text = f"{mins} мин" + (" ✅" if mins == current_interval else "")
+        builder.button(text=text, callback_data=f"set_interval_{mins}")
+    builder.adjust(2)
     return builder.as_markup()
 
 # --- ОБРАБОТЧИКИ ---
@@ -148,6 +169,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     await state.clear()
     now = datetime.now()
+    
+    # Границы времени
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = now.replace(hour=23, minute=59, second=59, microsecond=0)
     tomorrow_start = today_end + timedelta(seconds=1)
@@ -161,41 +184,50 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     msg = f"🤖 **Бот запущен! Версия: {BOT_VERSION}**\n\n"
     
-    # Просроченные
+    # 1. Просроченные
     if overdue:
-        msg += "🔴 **ПРОСРОЧЕНО:**\n"
+        msg += " **ПРОСРОЧЕНО:**\n"
         for ev in overdue:
-            msg += f"• {ev['summary']} ({ev['time'].strftime('%d.%m %H:%M')})\n"
-            # Отправляем отдельное сообщение с кнопкой удаления для каждого просроченного
-            await message.answer(f"🔴 **ПРОСРОЧЕНО:** {ev['summary']}\nБыло: {ev['time'].strftime('%d.%m %H:%M')}", 
+            # Формат: День недели, Дата, Время
+            date_str = ev['time'].strftime("%A, %d.%m в %H:%M").replace("Monday", "Понедельник").replace("Tuesday", "Вторник").replace("Wednesday", "Среда").replace("Thursday", "Четверг").replace("Friday", "Пятница").replace("Saturday", "Суббота").replace("Sunday", "Воскресенье")
+            msg += f"• {ev['summary']} ({date_str})\n"
+            
+            # Отправляем отдельное сообщение с кнопкой удаления
+            await message.answer(f"🔴 **ПРОСРОЧЕНО:** {ev['summary']}\n⏰ Было: {date_str}", 
                                  reply_markup=get_done_kb(ev['uid']), parse_mode=ParseMode.MARKDOWN)
         msg += "\n"
     else:
         msg += " Просроченных задач нет.\n\n"
 
-    # Сегодня
-    msg += " **СЕГОДНЯ:**\n"
+    # 2. Сегодня
+    day_name_today = today_start.strftime("%A").replace("Monday", "Понедельник").replace("Tuesday", "Вторник").replace("Wednesday", "Среда").replace("Thursday", "Четверг").replace("Friday", "Пятница").replace("Saturday", "Суббота").replace("Sunday", "Воскресенье")
+    msg += f" **СЕГОДНЯ ({day_name_today}, {today_start.strftime('%d.%m')}):**\n"
     if today:
         for ev in today:
-            msg += f"• {ev['summary']} в {ev['time'].strftime('%H:%M')}\n"
+            time_str = ev['time'].strftime("%H:%M")
+            msg += f"• {ev['summary']} в {time_str}\n"
     else:
         msg += "На сегодня нет заметок.\n"
     
-    msg += "\n📆 **ЗАВТРА:**\n"
+    msg += "\n"
+
+    # 3. Завтра
+    day_name_tomorrow = tomorrow_start.strftime("%A").replace("Monday", "Понедельник").replace("Tuesday", "Вторник").replace("Wednesday", "Среда").replace("Thursday", "Четверг").replace("Friday", "Пятница").replace("Saturday", "Суббота").replace("Sunday", "Воскресенье")
+    msg += f" **ЗАВТРА ({day_name_tomorrow}, {tomorrow_start.strftime('%d.%m')}):**\n"
     if tomorrow:
         for ev in tomorrow:
-            msg += f"• {ev['summary']} в {ev['time'].strftime('%H:%M')}\n"
+            time_str = ev['time'].strftime("%H:%M")
+            msg += f"• {ev['summary']} в {time_str}\n"
     else:
         msg += "На завтра нет заметок."
 
-    await message.answer(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_kb())
+    await message.answer(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_reply_keyboard())
     logger.info(f"Start command processed. Version: {BOT_VERSION}")
 
-@dp.callback_query(F.data == "add_note_start")
-async def start_add_note(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("✍️ **Введите текст вашей новой заметки:**", parse_mode=ParseMode.MARKDOWN)
+@dp.message(F.text == "➕ Добавить заметку")
+async def start_add_note(message: types.Message, state: FSMContext):
+    await message.answer("✍️ **Введите текст вашей новой заметки:**", parse_mode=ParseMode.MARKDOWN)
     await state.set_state(AddNoteState.waiting_for_text)
-    await callback.answer()
 
 @dp.message(AddNoteState.waiting_for_text)
 async def process_note_text(message: types.Message, state: FSMContext):
@@ -213,49 +245,72 @@ async def process_time_selection(callback: types.CallbackQuery, state: FSMContex
     text = data.get("note_text")
     
     if callback.data == "time_manual":
-        await callback.message.answer("Напишите дату и время в формате: ДД.ММ ГГ:ММ (например: 25.12 15:30)")
-        # Здесь можно добавить еще одно состояние для ручного ввода даты, 
-        # но для простоты пока оставим предустановленные кнопки как основные.
-        await callback.answer("Функция ручного ввода в разработке, выберите готовый вариант.", show_alert=True)
+        await callback.message.answer("Функция ручного ввода даты пока в разработке. Пожалуйста, выберите один из предложенных вариантов выше.", show_alert=True)
         return
 
     timestamp = int(callback.data.split("_")[1])
     event_time = datetime.fromtimestamp(timestamp)
     
     if create_event_in_yandex(text, event_time):
+        date_str = event_time.strftime("%A, %d.%m в %H:%M").replace("Monday", "Понедельник").replace("Tuesday", "Вторник").replace("Wednesday", "Среда").replace("Thursday", "Четверг").replace("Friday", "Пятница").replace("Saturday", "Суббота").replace("Sunday", "Воскресенье")
+        
         await callback.message.edit_text(
-            f"✅ **Заметка добавлена!**\n📝 {text}\n⏰ На {event_time.strftime('%d.%m в %H:%M')}",
-            reply_markup=get_main_kb(),
+            f"✅ **Заметка добавлена!**\n {text}\n⏰ На: {date_str}",
+            reply_markup=get_reply_keyboard(),
             parse_mode=ParseMode.MARKDOWN
         )
         logger.info(f"New event created: {text} at {event_time}")
     else:
-        await callback.message.answer("❌ Ошибка при добавлении в календарь.")
+        await callback.message.answer("❌ Ошибка при добавлении в календарь.", reply_markup=get_reply_keyboard())
     
     await state.clear()
 
+@dp.message(F.text == "⚙️ Настройки")
+async def open_settings(message: types.Message):
+    global CHECK_INTERVAL_MINUTES
+    text = f"⚙️ **Настройки бота**\n\nТекущий интервал обновления: **{CHECK_INTERVAL_MINUTES} мин**\nВыберите новый интервал:"
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES))
+
+@dp.callback_query(F.data.startswith("set_interval_"))
+async def change_interval(callback: types.CallbackQuery):
+    global CHECK_INTERVAL_MINUTES
+    new_interval = int(callback.data.split("_")[2])
+    CHECK_INTERVAL_MINUTES = new_interval
+    
+    # Сохраняем в .env файл (опционально, чтобы перезапуск сохранял настройку)
+    # Для простоты меняем только в памяти, но логируем
+    logger.info(f"Интервал изменен на {new_interval} мин")
+    
+    await callback.message.edit_text(
+        f"✅ Интервал обновлен: **{new_interval} мин**\nБот будет проверять календарь чаще.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=get_reply_keyboard()
+    )
+    await callback.answer()
+
 @dp.callback_query(F.data == "edit_notes")
-async def edit_notes(callback: types.CallbackQuery):
-    await callback.message.answer("Для редактирования используйте кнопку 'Выполнено' у старых задач или создайте новую с правильным временем.", reply_markup=get_main_kb())
+async def edit_notes_placeholder(callback: types.CallbackQuery):
+    await callback.message.answer("Для редактирования удалите старую задачу (кнопка 'Выполнено') и создайте новую.", reply_markup=get_reply_keyboard())
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("done_"))
 async def mark_done(callback: types.CallbackQuery):
     uid = callback.data.split("_")[1]
     if delete_event(uid):
-        await callback.message.edit_text("✅ Задача выполнена и удалена из календаря.", reply_markup=get_main_kb())
+        await callback.message.edit_text("✅ Задача выполнена и удалена из календаря.", reply_markup=get_reply_keyboard())
         await callback.answer("Удалено!")
     else:
         await callback.answer("Не удалось удалить.", show_alert=True)
 
-# --- ПЛАНИРОВЩИК (ФОНОВЫЙ) ---
+# --- ПЛАНИРОВЩИК (ДИНАМИЧЕСКИЙ ИНТЕРВАЛ) ---
 async def background_scheduler():
     while True:
-        await asyncio.sleep(900) # 15 минут
+        interval_seconds = CHECK_INTERVAL_MINUTES * 60
+        logger.info(f"Sleeping for {CHECK_INTERVAL_MINUTES} minutes...")
+        await asyncio.sleep(interval_seconds)
         logger.info("Running scheduled check...")
-        # Можно добавить логику отправки уведомлений, если бот был закрыт, 
-        # но основной функционал теперь доступен по команде /start
-        pass
+        # Здесь можно добавить логику автоматической отправки уведомлений без команды /start
+        # Но основной функционал сейчас работает по запросу /start
 
 async def main():
     logger.info(f"Bot started v{BOT_VERSION}")
