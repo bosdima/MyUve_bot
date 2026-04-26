@@ -14,7 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ParseMode
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.3.1"
+BOT_VERSION = "1.3.2"
 
 load_dotenv()
 
@@ -162,11 +162,13 @@ END:VEVENT"""
 # --- КЛАВИАТУРЫ ---
 
 def get_reply_keyboard():
+    """Создает Reply-клавиатуру (кнопки внизу экрана)"""
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки"))
-    return builder.as_markup(resize_keyboard=True)
+    return builder.as_markup(resize_keyboard=True, one_time_keyboard=False)
 
 def get_main_nav_keyboard(week_start):
+    """Создает Inline-клавиатуру для главного сообщения"""
     week_end = week_start + timedelta(days=6)
     builder = InlineKeyboardBuilder()
     
@@ -177,9 +179,8 @@ def get_main_nav_keyboard(week_start):
     builder.button(text=f"📅 {week_start.strftime('%d.%m')} - {week_end.strftime('%d.%m')}", callback_data="current_week")
     builder.button(text="Вперед ➡️", callback_data=f"nav_next_{int(next_week.timestamp())}")
     
-    # Убраны кнопки "Добавить" и "Настройки", так как они есть в Reply-клавиатуре
-    builder.row(InlineKeyboardButton(text="️ Управление (Удалить)", callback_data="manage_list"))
-    builder.row(InlineKeyboardButton(text=" Обновить", callback_data="force_refresh"))
+    builder.row(InlineKeyboardButton(text="✏️ Управление (Удалить)", callback_data="manage_list"))
+    builder.row(InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"))
     
     return builder.as_markup()
 
@@ -239,10 +240,9 @@ async def build_week_report(week_start):
     events = get_events_for_week(week_start, week_end)
     
     now = get_local_time()
-    # Исправлено время синхронизации на локальное
     sync_time = now.strftime("%d.%m.%Y %H:%M:%S")
     
-    text = f"🤖 **Бот запущен! Версия: {BOT_VERSION}**\n"
+    text = f" **Бот запущен! Версия: {BOT_VERSION}**\n"
     text += f"_Период: {format_date_full(week_start)} — {format_date_full(week_end)}_\n\n"
     
     if not events:
@@ -280,13 +280,19 @@ async def send_or_edit_main_message(message=None):
     
     try:
         if MAIN_MESSAGE_ID is None:
+            # Создаем новое сообщение с Inline-клавиатурой
             if message:
-                sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard, reply_markup=get_reply_keyboard())
+                sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
+                # Сразу после этого устанавливаем Reply-клавиатуру отдельным действием или в следующем сообщении
+                # Но лучше отправить Reply-клавиатуру как отдельное короткое сообщение-приветствие или просто установить её здесь
+                await message.answer("Используйте кнопки внизу для быстрого доступа.", reply_markup=get_reply_keyboard())
             else:
-                sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard, reply_markup=get_reply_keyboard())
+                sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
+                await bot.send_message(ADMIN_ID, "Меню управления:", reply_markup=get_reply_keyboard())
         else:
+            # Редактируем только текст и Inline-клавиатуру главного сообщения
             await bot.edit_message_text(
                 chat_id=ADMIN_ID,
                 message_id=MAIN_MESSAGE_ID,
@@ -294,16 +300,14 @@ async def send_or_edit_main_message(message=None):
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard
             )
-            # Обновляем Reply-клавиатуру отдельно, если нужно
-            await bot.edit_message_reply_markup(
-                chat_id=ADMIN_ID,
-                message_id=MAIN_MESSAGE_ID,
-                reply_markup=get_reply_keyboard()
-            )
+            # Reply-клавиатура остается активной, так как она была установлена ранее
+            # Если нужно её обновить, можно отправить новое сообщение с ней, но обычно это не требуется
+            
     except Exception as e:
         logger.error(f"Edit error: {e}")
         if "message to edit not found" in str(e):
             MAIN_MESSAGE_ID = None
+            # Если сообщение удалено, пробуем создать заново при следующем вызове
 
 # --- ОБРАБОТЧИКИ ---
 
