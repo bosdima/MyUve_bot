@@ -14,7 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ParseMode
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.3.0"
+BOT_VERSION = "1.3.1"
 
 load_dotenv()
 
@@ -30,7 +30,7 @@ except ValueError:
     CHECK_INTERVAL_MINUTES = 15
 
 if not all([BOT_TOKEN, ADMIN_ID, YANDEX_LOGIN, YANDEX_PASSWORD]):
-    raise ValueError("Ошибка: Проверьте .env!")
+    raise ValueError("Ошибка: Проверьте .env! Убедитесь, что заполнены BOT_TOKEN, ADMIN_ID, YANDEX_LOGIN и пароль.")
 
 # --- ЛОГИРОВАНИЕ ---
 LOG_FILE = "bot.log"
@@ -50,7 +50,7 @@ dp = Dispatcher()
 
 # Глобальные переменные состояния
 MAIN_MESSAGE_ID = None
-CURRENT_WEEK_START = None  # Дата начала отображаемой недели
+CURRENT_WEEK_START = None
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -58,7 +58,6 @@ def get_local_time():
     return datetime.now().astimezone()
 
 def get_week_start(date_obj):
-    # Возвращает понедельник текущей недели для date_obj
     return date_obj - timedelta(days=date_obj.weekday())
 
 def format_date_full(dt_obj):
@@ -162,6 +161,11 @@ END:VEVENT"""
 
 # --- КЛАВИАТУРЫ ---
 
+def get_reply_keyboard():
+    builder = ReplyKeyboardBuilder()
+    builder.row(KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки"))
+    return builder.as_markup(resize_keyboard=True)
+
 def get_main_nav_keyboard(week_start):
     week_end = week_start + timedelta(days=6)
     builder = InlineKeyboardBuilder()
@@ -173,17 +177,16 @@ def get_main_nav_keyboard(week_start):
     builder.button(text=f"📅 {week_start.strftime('%d.%m')} - {week_end.strftime('%d.%m')}", callback_data="current_week")
     builder.button(text="Вперед ➡️", callback_data=f"nav_next_{int(next_week.timestamp())}")
     
-    builder.row(InlineKeyboardButton(text="➕ Добавить", callback_data="add_note_start"))
-    builder.row(InlineKeyboardButton(text="✏️ Управление (Удалить)", callback_data="manage_list"))
-    builder.row(InlineKeyboardButton(text="️ Настройки", callback_data="open_settings"))
-    builder.row(InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"))
+    # Убраны кнопки "Добавить" и "Настройки", так как они есть в Reply-клавиатуре
+    builder.row(InlineKeyboardButton(text="️ Управление (Удалить)", callback_data="manage_list"))
+    builder.row(InlineKeyboardButton(text=" Обновить", callback_data="force_refresh"))
     
     return builder.as_markup()
 
 def get_manage_list_keyboard(events):
     if not events:
         builder = InlineKeyboardBuilder()
-        builder.button(text=" Назад", callback_data="close_manage")
+        builder.button(text="🔙 Закрыть", callback_data="close_manage")
         return builder.as_markup()
 
     builder = InlineKeyboardBuilder()
@@ -236,6 +239,7 @@ async def build_week_report(week_start):
     events = get_events_for_week(week_start, week_end)
     
     now = get_local_time()
+    # Исправлено время синхронизации на локальное
     sync_time = now.strftime("%d.%m.%Y %H:%M:%S")
     
     text = f"🤖 **Бот запущен! Версия: {BOT_VERSION}**\n"
@@ -244,8 +248,6 @@ async def build_week_report(week_start):
     if not events:
         text += "Нет событий на эту неделю."
     else:
-        # Группировка по дням для удобства, но можно и списком
-        # Для простоты выводим списком с цветом статуса
         for ev in events:
             date_str = format_date_full(ev['time'])
             time_str = format_time_only(ev['time'])
@@ -255,13 +257,13 @@ async def build_week_report(week_start):
             
             if ev['time'] < now:
                 status_icon = " ⚠️"
-                color_mark = "🔴" # Просрочено
+                color_mark = "" 
             elif ev['time'].date() == now.date():
                 status_icon = " 🔁"
-                color_mark = "🟢" # Сегодня
+                color_mark = "" 
             else:
                 status_icon = ""
-                color_mark = "🟡" # Будущее (на этой неделе)
+                color_mark = "" 
             
             text += f"{color_mark} {time_str} — {ev['summary']} ({date_str}){status_icon}\n"
     
@@ -279,10 +281,10 @@ async def send_or_edit_main_message(message=None):
     try:
         if MAIN_MESSAGE_ID is None:
             if message:
-                sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+                sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard, reply_markup=get_reply_keyboard())
                 MAIN_MESSAGE_ID = sent_msg.message_id
             else:
-                sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+                sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard, reply_markup=get_reply_keyboard())
                 MAIN_MESSAGE_ID = sent_msg.message_id
         else:
             await bot.edit_message_text(
@@ -291,6 +293,12 @@ async def send_or_edit_main_message(message=None):
                 text=text,
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard
+            )
+            # Обновляем Reply-клавиатуру отдельно, если нужно
+            await bot.edit_message_reply_markup(
+                chat_id=ADMIN_ID,
+                message_id=MAIN_MESSAGE_ID,
+                reply_markup=get_reply_keyboard()
             )
     except Exception as e:
         logger.error(f"Edit error: {e}")
@@ -332,7 +340,10 @@ async def force_refresh(callback: types.CallbackQuery):
 async def show_manage_list(callback: types.CallbackQuery):
     events = get_events_for_week(CURRENT_WEEK_START, CURRENT_WEEK_START + timedelta(days=6))
     kb = get_manage_list_keyboard(events)
-    await callback.message.answer("Выберите задачу для удаления:", reply_markup=kb)
+    if events:
+        await callback.message.answer("Выберите задачу для удаления:", reply_markup=kb)
+    else:
+        await callback.message.answer("Нет задач для удаления в этой неделе.", reply_markup=kb)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("del_"))
@@ -340,7 +351,7 @@ async def delete_from_list(callback: types.CallbackQuery):
     uid = callback.data.split("_")[1]
     if delete_event(uid):
         await callback.message.edit_text("✅ Задача удалена.", reply_markup=None)
-        await send_or_edit_main_message() # Обновляем главное окно
+        await send_or_edit_main_message()
     else:
         await callback.answer("Ошибка удаления", show_alert=True)
 
@@ -349,11 +360,10 @@ async def close_manage(callback: types.CallbackQuery):
     await callback.message.delete()
     await callback.answer()
 
-@dp.callback_query(F.data == "add_note_start")
-async def start_add_note(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("✍️ Введите текст заметки:", parse_mode=ParseMode.MARKDOWN)
+@dp.message(F.text == "➕ Добавить заметку")
+async def start_add_note(message: types.Message, state: FSMContext):
+    await message.answer("✍️ Введите текст новой заметки:", parse_mode=ParseMode.MARKDOWN)
     await state.set_state(AddNoteState.waiting_for_text)
-    await callback.answer()
 
 class AddNoteState(StatesGroup):
     waiting_for_text = State()
@@ -384,33 +394,28 @@ async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.delete()
 
-@dp.callback_query(F.data == "open_settings")
-async def open_settings(callback: types.CallbackQuery):
-    await callback.message.answer(f"Интервал: {CHECK_INTERVAL_MINUTES} мин", reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES))
+@dp.message(F.text == "⚙️ Настройки")
+async def open_settings(message: types.Message):
+    await message.answer(f"Интервал проверки: {CHECK_INTERVAL_MINUTES} мин", reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES))
 
 @dp.callback_query(F.data.startswith("set_interval_"))
 async def set_interval(callback: types.CallbackQuery):
     global CHECK_INTERVAL_MINUTES
     CHECK_INTERVAL_MINUTES = int(callback.data.split("_")[2])
-    await callback.message.edit_text(f"✅ Интервал: {CHECK_INTERVAL_MINUTES} мин", reply_markup=None)
+    await callback.message.edit_text(f"✅ Интервал установлен: {CHECK_INTERVAL_MINUTES} мин", reply_markup=None)
     await send_or_edit_main_message()
 
 @dp.callback_query(F.data == "close_settings")
 async def close_settings(callback: types.CallbackQuery):
     await callback.message.delete()
 
-# --- СИСТЕМА УВЕДОМЛЕНИЙ И НАПОМИНАНИЙ ---
-
-# Хранилище отправленных уведомлений, чтобы не спамить одинаковыми
-# Структура: { uid: last_notify_time }
+# --- СИСТЕМА УВЕДОМЛЕНИЙ ---
 active_notifications = {}
 
 async def notification_scheduler():
     while True:
-        await asyncio.sleep(60) # Проверка каждую минуту
+        await asyncio.sleep(60)
         now = get_local_time()
-        
-        # Получаем события на сегодня и завтра для проверки наступления времени
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         tomorrow_end = (today_start + timedelta(days=2))
         
@@ -420,27 +425,21 @@ async def notification_scheduler():
             uid = ev['uid']
             event_time = ev['time']
             
-            # Логика: если время наступило (или прошло менее часа) и мы еще не отправили уведомление или пора напомнить
             if event_time <= now:
-                # Проверяем, не удалили ли уже задачу (если она есть в календаре, значит не удалили)
-                # Но get_events_for_week уже фильтрует актуальные.
-                
                 last_notify = active_notifications.get(uid)
                 
                 should_notify = False
                 if last_notify is None:
-                    # Первое уведомление сразу при наступлении времени (или если прошло < 1 часа с момента наступления)
                     if (now - event_time).total_seconds() < 3600: 
                         should_notify = True
                 else:
-                    # Повторное уведомление каждый час
                     if (now - last_notify).total_seconds() >= 3600:
                         should_notify = True
                 
                 if should_notify:
                     try:
                         kb = get_notification_keyboard(uid)
-                        text = f"⏰ **Напоминание:** {ev['summary']}\nВремя: {format_time_only(event_time)}"
+                        text = f" **Напоминание:** {ev['summary']}\nВремя: {format_time_only(event_time)}"
                         await bot.send_message(ADMIN_ID, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
                         active_notifications[uid] = now
                         logger.info(f"Sent notification for {uid}")
@@ -461,18 +460,14 @@ async def done_notify(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("snooze_"))
 async def snooze_notify(callback: types.CallbackQuery):
     await callback.answer("Напомню через час.")
-    # Просто ничего не делаем, логика scheduler сама напомнит через час
 
 # --- ЗАПУСК ---
-
 async def main():
     logger.info(f"Bot started v{BOT_VERSION}")
     await asyncio.sleep(2)
     
-    # Запускаем два фоновых процесса
     asyncio.create_task(notification_scheduler())
     
-    # Планировщик обновления главного окна
     async def refresh_loop():
         while True:
             await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
