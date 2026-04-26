@@ -1,261 +1,486 @@
-import telebot
-from telebot import types
-import sqlite3
 import os
-from datetime import datetime, timedelta
-import pytz
+import asyncio
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+import caldav
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.enums import ParseMode
 
-# --- КОНФИГУРАЦИЯ ---
-BOT_TOKEN = 'ВАШ_ТОКЕН_ЗДЕСЬ'  # Вставьте токен от @BotFather
-DB_NAME = 'tasks.db'
-TIMEZONE_MOSCOW = pytz.timezone('Europe/Moscow')
+# --- НАСТРОЙКИ И ВЕРСИЯ ---
+BOT_VERSION = "1.3.0"
 
-# Инициализация бота
-bot = telebot.TeleBot(BOT_TOKEN)
+load_dotenv()
 
-# --- РАБОТА С БАЗОЙ ДАННЫХ ---
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            due_date TEXT NOT NULL,
-            due_time TEXT NOT NULL,
-            status TEXT DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+YANDEX_LOGIN = os.getenv("YANDEX_LOGIN")
+YANDEX_PASSWORD = os.getenv("YANDEX_APP_PASSWORD")
+CALDAV_URL = os.getenv("CALDAV_URL", "https://caldav.yandex.ru/")
 
-def add_task(title, due_date, due_time):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO tasks (title, due_date, due_time)
-        VALUES (?, ?, ?)
-    ''', (title, due_date, due_time))
-    conn.commit()
-    task_id = cursor.lastrowid
-    conn.close()
-    return task_id
+try:
+    CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", 15))
+except ValueError:
+    CHECK_INTERVAL_MINUTES = 15
 
-def get_all_tasks():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('SELECT id, title, due_date, due_time FROM tasks WHERE status="active" ORDER BY due_date, due_time')
-    tasks = cursor.fetchall()
-    conn.close()
-    return tasks
+if not all([BOT_TOKEN, ADMIN_ID, YANDEX_LOGIN, YANDEX_PASSWORD]):
+    raise ValueError("Ошибка: Проверьте .env!")
 
-def delete_task(task_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('UPDATE tasks SET status="deleted" WHERE id=?', (task_id,))
-    conn.commit()
-    conn.close()
+# --- ЛОГИРОВАНИЕ ---
+LOG_FILE = "bot.log"
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=300*1024, backupCount=5, encoding='utf-8')
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Глобальные переменные состояния
+MAIN_MESSAGE_ID = None
+CURRENT_WEEK_START = None  # Дата начала отображаемой недели
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def get_moscow_time_str():
-    """Возвращает текущее время в Москве в формате ДД.ММ.ГГГГ ЧЧ:ММ:СС"""
-    now_msk = datetime.now(TIMEZONE_MOSCOW)
-    return now_msk.strftime('%d.%m.%Y %H:%M:%S')
 
-def get_week_range():
-    """Возвращает строку с диапазоном текущей недели (Пн - Вс)"""
-    now = datetime.now(TIMEZONE_MOSCOW)
-    start_of_week = now - timedelta(days=now.weekday()) # Понедельник
-    end_of_week = start_of_week + timedelta(days=6)     # Воскресенье
-    
-    start_str = start_of_week.strftime('%d.%m')
-    end_str = end_of_week.strftime('%d.%m')
-    
-    # Определяем названия дней недели
-    days_ru = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
-    day_name_start = days_ru[start_of_week.weekday()]
-    day_name_end = days_ru[end_of_week.weekday()]
-    
-    return f"{day_name_start}, {start_str} — {day_name_end}, {end_str}"
+def get_local_time():
+    return datetime.now().astimezone()
 
-def format_task_for_display(task):
-    """Форматирует задачу для красивого вывода"""
-    task_id, title, due_date, due_time = task
-    
-    # Парсим дату для определения дня недели
+def get_week_start(date_obj):
+    # Возвращает понедельник текущей недели для date_obj
+    return date_obj - timedelta(days=date_obj.weekday())
+
+def format_date_full(dt_obj):
+    if dt_obj is None: return ""
+    local_dt = dt_obj.astimezone() if hasattr(dt_obj, 'tzinfo') else dt_obj
+    day_name = local_dt.strftime("%A").replace("Monday", "Пн").replace("Tuesday", "Вт").replace("Wednesday", "Ср").replace("Thursday", "Чт").replace("Friday", "Пт").replace("Saturday", "Сб").replace("Sunday", "Вс")
+    return f"{day_name}, {local_dt.strftime('%d.%m')}"
+
+def format_time_only(dt_obj):
+    if dt_obj is None: return "--:--"
+    local_dt = dt_obj.astimezone() if hasattr(dt_obj, 'tzinfo') else dt_obj
+    return local_dt.strftime("%H:%M")
+
+# --- РАБОТА С CALDAV ---
+def get_calendar():
     try:
-        date_obj = datetime.strptime(due_date, '%Y-%m-%d')
-        days_ru = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
-        day_name = days_ru[date_obj.weekday()]
-        date_display = date_obj.strftime('%d.%m')
-    except ValueError:
-        day_name = ""
-        date_display = due_date
-
-    # Определение цвета/статуса (упрощенно)
-    # Если задача на сегодня или просрочена - красный, иначе зеленый/желтый
-    today = datetime.now(TIMEZONE_MOSCOW).date()
-    if date_obj.date() < today:
-        icon = "🔴" # Просрочено
-    elif date_obj.date() == today:
-        icon = "🟡" # Сегодня
-    else:
-        icon = "🟢" # Будущее
-
-    return f"{icon} {due_time} — {title} ({day_name}, {date_display})"
-
-# --- КЛАВИАТУРЫ ---
-def create_main_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    # Убрали дублирующие кнопки "+ Добавить" и "Настройки", оставили только уникальные действия
-    btn_add = types.KeyboardButton('+ Добавить заметку')
-    btn_settings = types.KeyboardButton('⚙️ Настройки')
-    btn_delete_mode = types.KeyboardButton('🗑 Управление (Удалить)')
-    btn_refresh = types.KeyboardButton('🔄 Обновить')
-    
-    markup.add(btn_add, btn_settings)
-    markup.add(btn_delete_mode, btn_refresh)
-    return markup
-
-def create_inline_task_list(tasks):
-    """Создает инлайн-клавиатуру со списком задач для удаления"""
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    
-    if not tasks:
+        client = caldav.DAVClient(url=CALDAV_URL, username=YANDEX_LOGIN, password=YANDEX_PASSWORD)
+        principal = client.principal()
+        calendars = principal.calendars()
+        return calendars[0] if calendars else None
+    except Exception as e:
+        logger.error(f"CalDAV Error: {e}")
         return None
 
-    for task in tasks:
-        task_id, title, due_date, due_time = task
-        # Отображаем короткую версию задачи в кнопке
-        button_text = f"❌ {title} ({due_time})"
-        callback_data = f"delete_{task_id}"
-        markup.add(types.InlineKeyboardButton(text=button_text, callback_data=callback_data))
-        
-    # Кнопка отмены
-    markup.add(types.InlineKeyboardButton(text="↩️ Отмена", callback_data="cancel_delete"))
+def get_events_for_week(start_date, end_date):
+    calendar = get_calendar()
+    if not calendar:
+        return []
     
-    return markup
-
-# --- ОБРАБОТЧИКИ КОМАНД И СООБЩЕНИЙ ---
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    init_db()
-    show_main_menu(message.chat.id)
-
-@bot.message_handler(func=lambda message: message.text == '+ Добавить заметку')
-def start_add_task(message):
-    msg = bot.send_message(message.chat.id, "✍️ Введите название новой задачи:")
-    bot.register_next_step_handler(msg, process_add_task_title)
-
-def process_add_task_title(message):
-    title = message.text
-    if not title:
-        bot.send_message(message.chat.id, "❌ Название не может быть пустым.")
-        return
-        
-    msg = bot.send_message(message.chat.id, "📅 Введите дату выполнения (в формате ДД.ММ.ГГГГ или просто 'завтра', 'послезавтра'):")
-    bot.register_next_step_handler(msg, process_add_task_date, title)
-
-def process_add_task_date(message, title):
-    date_input = message.text.lower().strip()
-    today = datetime.now(TIMEZONE_MOSCOW).date()
-    
+    logger.info(f"Загрузка событий с {start_date} по {end_date}")
     try:
-        if date_input == 'завтра':
-            due_date = (today + timedelta(days=1)).strftime('%Y-%m-%d')
-        elif date_input == 'послезавтра':
-            due_date = (today + timedelta(days=2)).strftime('%Y-%m-%d')
+        events = calendar.date_search(start=start_date, end=end_date, expand=True)
+        result = []
+        
+        for event in events:
+            try:
+                dt_start = event.instance.vevent.dtstart.value
+                summary = event.instance.vevent.summary.value if event.instance.vevent.summary else "Без названия"
+                uid = event.instance.vevent.uid.value
+                
+                # Нормализация времени
+                if hasattr(dt_start, 'date') and not hasattr(dt_start, 'hour'):
+                    dt_start = datetime.combine(dt_start, datetime.min.time()).replace(tzinfo=timezone.utc)
+                elif hasattr(dt_start, 'tzinfo') and dt_start.tzinfo is None:
+                    dt_start = dt_start.replace(tzinfo=timezone.utc)
+                
+                local_dt = dt_start.astimezone()
+                
+                result.append({
+                    "summary": summary,
+                    "time": local_dt,
+                    "uid": uid,
+                    "is_overdue": local_dt < get_local_time()
+                })
+            except Exception as e:
+                logger.warning(f"Ошибка парсинга: {e}")
+                continue
+        
+        result.sort(key=lambda x: x['time'])
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching events: {e}")
+        return []
+
+def delete_event(uid):
+    calendar = get_calendar()
+    if not calendar: return False
+    try:
+        ev = calendar.event_by_uid(uid)
+        if ev:
+            ev.delete()
+            logger.info(f"Deleted: {uid}")
+            return True
+    except Exception as e:
+        logger.error(f"Delete error: {e}")
+    return False
+
+def create_event_in_yandex(summary, start_dt, duration_hours=1):
+    calendar = get_calendar()
+    if not calendar: return False
+    try:
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
         else:
-            # Пробуем парсить формат ДД.ММ.ГГГГ
-            due_date_obj = datetime.strptime(date_input, '%d.%m.%Y')
-            due_date = due_date_obj.strftime('%Y-%m-%d')
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ или слова 'завтра'/'послезавтра'.")
-        return
-
-    msg = bot.send_message(message.chat.id, "⏰ Введите время выполнения (в формате ЧЧ:ММ):")
-    bot.register_next_step_handler(msg, process_add_task_time, title, due_date)
-
-def process_add_task_time(message, title, due_date):
-    time_input = message.text.strip()
-    try:
-        # Проверка формата времени
-        datetime.strptime(time_input, '%H:%M')
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Неверный формат времени. Используйте ЧЧ:ММ (например, 18:30).")
-        return
-
-    add_task(title, due_date, time_input)
-    bot.send_message(message.chat.id, "✅ Задача успешно добавлена!")
-    show_main_menu(message.chat.id)
-
-@bot.message_handler(func=lambda message: message.text == '🗑 Управление (Удалить)')
-def start_delete_process(message):
-    tasks = get_all_tasks()
-    
-    if not tasks:
-        bot.send_message(message.chat.id, "📭 Список задач пуст. Нечего удалять.")
-        return
-
-    bot.send_message(message.chat.id, "Выберите задачу для удаления:", reply_markup=create_inline_task_list(tasks))
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-    if call.data.startswith('delete_'):
-        task_id = int(call.data.split('_')[1])
-        delete_task(task_id)
-        bot.answer_callback_query(call.id, "Задача удалена")
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text="✅ Задача удалена.",
-            reply_markup=None
-        )
-        # Показываем обновленное главное меню
-        show_main_menu(call.message.chat.id)
+            start_dt = start_dt.astimezone(timezone.utc)
+            
+        end_dt = start_dt + timedelta(hours=duration_hours)
+        dt_str_start = start_dt.strftime('%Y%m%dT%H%M%SZ')
+        dt_str_end = end_dt.strftime('%Y%m%dT%H%M%SZ')
         
-    elif call.data == 'cancel_delete':
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text="❌ Удаление отменено.",
-            reply_markup=None
-        )
-        show_main_menu(call.message.chat.id)
+        event_data = f"""BEGIN:VEVENT
+SUMMARY:{summary}
+DTSTART:{dt_str_start}
+DTEND:{dt_str_end}
+END:VEVENT"""
+        calendar.save_event(event_data)
+        return True
+    except Exception as e:
+        logger.error(f"Create error: {e}")
+        return False
 
-@bot.message_handler(func=lambda message: message.text == '🔄 Обновить')
-def refresh_view(message):
-    show_main_menu(message.chat.id)
+# --- КЛАВИАТУРЫ ---
 
-@bot.message_handler(func=lambda message: message.text == '⚙️ Настройки')
-def open_settings(message):
-    bot.send_message(message.chat.id, "⚙️ Раздел настроек в разработке.\nЗдесь можно будет настроить уведомления и часовой пояс.")
-
-# --- ГЛАВНОЕ МЕНЮ ---
-def show_main_menu(chat_id):
-    tasks = get_all_tasks()
-    week_range = get_week_range()
-    current_time_msk = get_moscow_time_str()
+def get_main_nav_keyboard(week_start):
+    week_end = week_start + timedelta(days=6)
+    builder = InlineKeyboardBuilder()
     
-    # Формируем текст списка задач
-    if tasks:
-        tasks_list = "\n".join([format_task_for_display(task) for task in tasks])
+    prev_week = week_start - timedelta(days=7)
+    next_week = week_start + timedelta(days=7)
+    
+    builder.button(text="️ Назад", callback_data=f"nav_prev_{int(prev_week.timestamp())}")
+    builder.button(text=f"📅 {week_start.strftime('%d.%m')} - {week_end.strftime('%d.%m')}", callback_data="current_week")
+    builder.button(text="Вперед ➡️", callback_data=f"nav_next_{int(next_week.timestamp())}")
+    
+    builder.row(InlineKeyboardButton(text="➕ Добавить", callback_data="add_note_start"))
+    builder.row(InlineKeyboardButton(text="✏️ Управление (Удалить)", callback_data="manage_list"))
+    builder.row(InlineKeyboardButton(text="️ Настройки", callback_data="open_settings"))
+    builder.row(InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"))
+    
+    return builder.as_markup()
+
+def get_manage_list_keyboard(events):
+    if not events:
+        builder = InlineKeyboardBuilder()
+        builder.button(text=" Назад", callback_data="close_manage")
+        return builder.as_markup()
+
+    builder = InlineKeyboardBuilder()
+    for ev in events:
+        date_str = format_date_full(ev['time'])
+        time_str = format_time_only(ev['time'])
+        btn_text = f"❌ {ev['summary']} ({date_str} {time_str})"
+        builder.button(text=btn_text, callback_data=f"del_{ev['uid']}")
+    
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="🔙 Закрыть список", callback_data="close_manage"))
+    return builder.as_markup()
+
+def get_notification_keyboard(uid):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Выполнено (Удалить)", callback_data=f"done_notify_{uid}")
+    builder.button(text="Напомнить позже", callback_data=f"snooze_{uid}")
+    return builder.as_markup()
+
+def get_time_options_kb():
+    builder = InlineKeyboardBuilder()
+    now = get_local_time()
+    t1 = now + timedelta(hours=1)
+    t2 = (now + timedelta(days=1)).replace(hour=9, minute=0)
+    t3 = (now + timedelta(days=1)).replace(hour=18, minute=0)
+    
+    builder.button(text=f"Через 1 час ({t1.strftime('%H:%M')})", callback_data=f"time_{int(t1.timestamp())}")
+    builder.button(text=f"Завтра утром ({t2.strftime('%d.%m %H:%M')})", callback_data=f"time_{int(t2.timestamp())}")
+    builder.button(text=f"Завтра вечером ({t3.strftime('%d.%m %H:%M')})", callback_data=f"time_{int(t3.timestamp())}")
+    builder.button(text="Отмена", callback_data="cancel_add")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_settings_kb(current_interval):
+    builder = InlineKeyboardBuilder()
+    for mins in [5, 15, 30, 60]:
+        text = f"{mins} мин" + (" ✅" if mins == current_interval else "")
+        builder.button(text=text, callback_data=f"set_interval_{mins}")
+    builder.button(text="🔙 Назад", callback_data="close_settings")
+    builder.adjust(2)
+    return builder.as_markup()
+
+# --- ОСНОВНАЯ ЛОГИКА ОТОБРАЖЕНИЯ ---
+
+async def build_week_report(week_start):
+    global CURRENT_WEEK_START
+    CURRENT_WEEK_START = week_start
+    
+    week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
+    events = get_events_for_week(week_start, week_end)
+    
+    now = get_local_time()
+    sync_time = now.strftime("%d.%m.%Y %H:%M:%S")
+    
+    text = f"🤖 **Бот запущен! Версия: {BOT_VERSION}**\n"
+    text += f"_Период: {format_date_full(week_start)} — {format_date_full(week_end)}_\n\n"
+    
+    if not events:
+        text += "Нет событий на эту неделю."
     else:
-        tasks_list = "📭 Нет активных задач."
-
-    full_text = (
-        f"🤖 *Бот запущен! Версия: 1.3.1*\n"
-        f"📅 Период: {week_range}\n\n"
-        f"{tasks_list}\n\n"
-        f"🕒 Последняя синхронизация: {current_time_msk}"
-    )
+        # Группировка по дням для удобства, но можно и списком
+        # Для простоты выводим списком с цветом статуса
+        for ev in events:
+            date_str = format_date_full(ev['time'])
+            time_str = format_time_only(ev['time'])
+            
+            status_icon = ""
+            color_mark = ""
+            
+            if ev['time'] < now:
+                status_icon = " ⚠️"
+                color_mark = "🔴" # Просрочено
+            elif ev['time'].date() == now.date():
+                status_icon = " 🔁"
+                color_mark = "🟢" # Сегодня
+            else:
+                status_icon = ""
+                color_mark = "🟡" # Будущее (на этой неделе)
+            
+            text += f"{color_mark} {time_str} — {ev['summary']} ({date_str}){status_icon}\n"
     
-    bot.send_message(chat_id, full_text, parse_mode='Markdown', reply_markup=create_main_keyboard())
+    text += f"\n_Последняя синхронизация: {sync_time}_"
+    return text, get_main_nav_keyboard(week_start)
+
+async def send_or_edit_main_message(message=None):
+    global MAIN_MESSAGE_ID, CURRENT_WEEK_START
+    
+    if CURRENT_WEEK_START is None:
+        CURRENT_WEEK_START = get_week_start(get_local_time())
+    
+    text, keyboard = await build_week_report(CURRENT_WEEK_START)
+    
+    try:
+        if MAIN_MESSAGE_ID is None:
+            if message:
+                sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+                MAIN_MESSAGE_ID = sent_msg.message_id
+            else:
+                sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+                MAIN_MESSAGE_ID = sent_msg.message_id
+        else:
+            await bot.edit_message_text(
+                chat_id=ADMIN_ID,
+                message_id=MAIN_MESSAGE_ID,
+                text=text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard
+            )
+    except Exception as e:
+        logger.error(f"Edit error: {e}")
+        if "message to edit not found" in str(e):
+            MAIN_MESSAGE_ID = None
+
+# --- ОБРАБОТЧИКИ ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    await state.clear()
+    await send_or_edit_main_message(message)
+
+@dp.callback_query(F.data.startswith("nav_prev_"))
+async def nav_prev(callback: types.CallbackQuery):
+    ts = int(callback.data.split("_")[2])
+    new_start = datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).astimezone()
+    await callback.answer()
+    global CURRENT_WEEK_START
+    CURRENT_WEEK_START = new_start
+    await send_or_edit_main_message()
+
+@dp.callback_query(F.data.startswith("nav_next_"))
+async def nav_next(callback: types.CallbackQuery):
+    ts = int(callback.data.split("_")[2])
+    new_start = datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).astimezone()
+    await callback.answer()
+    global CURRENT_WEEK_START
+    CURRENT_WEEK_START = new_start
+    await send_or_edit_main_message()
+
+@dp.callback_query(F.data == "force_refresh")
+async def force_refresh(callback: types.CallbackQuery):
+    await callback.answer("Обновление...")
+    await send_or_edit_main_message()
+
+@dp.callback_query(F.data == "manage_list")
+async def show_manage_list(callback: types.CallbackQuery):
+    events = get_events_for_week(CURRENT_WEEK_START, CURRENT_WEEK_START + timedelta(days=6))
+    kb = get_manage_list_keyboard(events)
+    await callback.message.answer("Выберите задачу для удаления:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("del_"))
+async def delete_from_list(callback: types.CallbackQuery):
+    uid = callback.data.split("_")[1]
+    if delete_event(uid):
+        await callback.message.edit_text("✅ Задача удалена.", reply_markup=None)
+        await send_or_edit_main_message() # Обновляем главное окно
+    else:
+        await callback.answer("Ошибка удаления", show_alert=True)
+
+@dp.callback_query(F.data == "close_manage")
+async def close_manage(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await callback.answer()
+
+@dp.callback_query(F.data == "add_note_start")
+async def start_add_note(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("✍️ Введите текст заметки:", parse_mode=ParseMode.MARKDOWN)
+    await state.set_state(AddNoteState.waiting_for_text)
+    await callback.answer()
+
+class AddNoteState(StatesGroup):
+    waiting_for_text = State()
+    waiting_for_time = State()
+
+@dp.message(AddNoteState.waiting_for_text)
+async def process_note_text(message: types.Message, state: FSMContext):
+    await state.update_data(note_text=message.text)
+    await message.answer(f" Текст: {message.text}\nКогда добавить?", reply_markup=get_time_options_kb())
+    await state.set_state(AddNoteState.waiting_for_time)
+
+@dp.callback_query(AddNoteState.waiting_for_time, F.data.startswith("time_"))
+async def process_time_selection(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    text = data.get("note_text")
+    ts = int(callback.data.split("_")[1])
+    event_time = datetime.fromtimestamp(ts, tz=timezone.utc)
+    
+    if create_event_in_yandex(text, event_time):
+        await callback.message.answer("✅ Добавлено!", reply_markup=None)
+        await send_or_edit_main_message()
+    else:
+        await callback.message.answer("❌ Ошибка", reply_markup=None)
+    await state.clear()
+
+@dp.callback_query(F.data == "cancel_add")
+async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.delete()
+
+@dp.callback_query(F.data == "open_settings")
+async def open_settings(callback: types.CallbackQuery):
+    await callback.message.answer(f"Интервал: {CHECK_INTERVAL_MINUTES} мин", reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES))
+
+@dp.callback_query(F.data.startswith("set_interval_"))
+async def set_interval(callback: types.CallbackQuery):
+    global CHECK_INTERVAL_MINUTES
+    CHECK_INTERVAL_MINUTES = int(callback.data.split("_")[2])
+    await callback.message.edit_text(f"✅ Интервал: {CHECK_INTERVAL_MINUTES} мин", reply_markup=None)
+    await send_or_edit_main_message()
+
+@dp.callback_query(F.data == "close_settings")
+async def close_settings(callback: types.CallbackQuery):
+    await callback.message.delete()
+
+# --- СИСТЕМА УВЕДОМЛЕНИЙ И НАПОМИНАНИЙ ---
+
+# Хранилище отправленных уведомлений, чтобы не спамить одинаковыми
+# Структура: { uid: last_notify_time }
+active_notifications = {}
+
+async def notification_scheduler():
+    while True:
+        await asyncio.sleep(60) # Проверка каждую минуту
+        now = get_local_time()
+        
+        # Получаем события на сегодня и завтра для проверки наступления времени
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_end = (today_start + timedelta(days=2))
+        
+        events = get_events_for_week(today_start, tomorrow_end)
+        
+        for ev in events:
+            uid = ev['uid']
+            event_time = ev['time']
+            
+            # Логика: если время наступило (или прошло менее часа) и мы еще не отправили уведомление или пора напомнить
+            if event_time <= now:
+                # Проверяем, не удалили ли уже задачу (если она есть в календаре, значит не удалили)
+                # Но get_events_for_week уже фильтрует актуальные.
+                
+                last_notify = active_notifications.get(uid)
+                
+                should_notify = False
+                if last_notify is None:
+                    # Первое уведомление сразу при наступлении времени (или если прошло < 1 часа с момента наступления)
+                    if (now - event_time).total_seconds() < 3600: 
+                        should_notify = True
+                else:
+                    # Повторное уведомление каждый час
+                    if (now - last_notify).total_seconds() >= 3600:
+                        should_notify = True
+                
+                if should_notify:
+                    try:
+                        kb = get_notification_keyboard(uid)
+                        text = f"⏰ **Напоминание:** {ev['summary']}\nВремя: {format_time_only(event_time)}"
+                        await bot.send_message(ADMIN_ID, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+                        active_notifications[uid] = now
+                        logger.info(f"Sent notification for {uid}")
+                    except Exception as e:
+                        logger.error(f"Notify error: {e}")
+
+@dp.callback_query(F.data.startswith("done_notify_"))
+async def done_notify(callback: types.CallbackQuery):
+    uid = callback.data.split("_")[2]
+    if delete_event(uid):
+        await callback.message.edit_text("✅ Задача выполнена и удалена.")
+        if uid in active_notifications:
+            del active_notifications[uid]
+        await send_or_edit_main_message()
+    else:
+        await callback.answer("Не удалось удалить", show_alert=True)
+
+@dp.callback_query(F.data.startswith("snooze_"))
+async def snooze_notify(callback: types.CallbackQuery):
+    await callback.answer("Напомню через час.")
+    # Просто ничего не делаем, логика scheduler сама напомнит через час
 
 # --- ЗАПУСК ---
-if __name__ == '__main__':
-    init_db()
-    print("Бот запущен...")
-    bot.polling(none_stop=True)
+
+async def main():
+    logger.info(f"Bot started v{BOT_VERSION}")
+    await asyncio.sleep(2)
+    
+    # Запускаем два фоновых процесса
+    asyncio.create_task(notification_scheduler())
+    
+    # Планировщик обновления главного окна
+    async def refresh_loop():
+        while True:
+            await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
+            await send_or_edit_main_message()
+    
+    asyncio.create_task(refresh_loop())
+    
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
