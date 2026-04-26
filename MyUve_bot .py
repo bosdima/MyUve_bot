@@ -12,9 +12,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ParseMode
+import pytz
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.3.2"
+BOT_VERSION = "1.3.3"
 
 load_dotenv()
 
@@ -55,21 +56,35 @@ CURRENT_WEEK_START = None
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def get_local_time():
-    return datetime.now().astimezone()
+    """Получает текущее время в московском часовом поясе"""
+    moscow_tz = pytz.timezone('Europe/Moscow')
+    return datetime.now(moscow_tz)
 
 def get_week_start(date_obj):
     return date_obj - timedelta(days=date_obj.weekday())
 
 def format_date_full(dt_obj):
     if dt_obj is None: return ""
-    local_dt = dt_obj.astimezone() if hasattr(dt_obj, 'tzinfo') else dt_obj
-    day_name = local_dt.strftime("%A").replace("Monday", "Пн").replace("Tuesday", "Вт").replace("Wednesday", "Ср").replace("Thursday", "Чт").replace("Friday", "Пт").replace("Saturday", "Сб").replace("Sunday", "Вс")
-    return f"{day_name}, {local_dt.strftime('%d.%m')}"
+    # Если у объекта нет timezone info, добавляем московский часовой пояс
+    if dt_obj.tzinfo is None:
+        moscow_tz = pytz.timezone('Europe/Moscow')
+        dt_obj = moscow_tz.localize(dt_obj)
+    else:
+        dt_obj = dt_obj.astimezone(pytz.timezone('Europe/Moscow'))
+    
+    day_name = dt_obj.strftime("%A").replace("Monday", "Пн").replace("Tuesday", "Вт").replace("Wednesday", "Ср").replace("Thursday", "Чт").replace("Friday", "Пт").replace("Saturday", "Сб").replace("Sunday", "Вс")
+    return f"{day_name}, {dt_obj.strftime('%d.%m')}"
 
 def format_time_only(dt_obj):
     if dt_obj is None: return "--:--"
-    local_dt = dt_obj.astimezone() if hasattr(dt_obj, 'tzinfo') else dt_obj
-    return local_dt.strftime("%H:%M")
+    # Если у объекта нет timezone info, добавляем московский часовой пояс
+    if dt_obj.tzinfo is None:
+        moscow_tz = pytz.timezone('Europe/Moscow')
+        dt_obj = moscow_tz.localize(dt_obj)
+    else:
+        dt_obj = dt_obj.astimezone(pytz.timezone('Europe/Moscow'))
+    
+    return dt_obj.strftime("%H:%M")
 
 # --- РАБОТА С CALDAV ---
 def get_calendar():
@@ -98,13 +113,15 @@ def get_events_for_week(start_date, end_date):
                 summary = event.instance.vevent.summary.value if event.instance.vevent.summary else "Без названия"
                 uid = event.instance.vevent.uid.value
                 
-                # Нормализация времени
+                # Нормализация времени - конвертируем в московский часовой пояс
                 if hasattr(dt_start, 'date') and not hasattr(dt_start, 'hour'):
                     dt_start = datetime.combine(dt_start, datetime.min.time()).replace(tzinfo=timezone.utc)
                 elif hasattr(dt_start, 'tzinfo') and dt_start.tzinfo is None:
                     dt_start = dt_start.replace(tzinfo=timezone.utc)
                 
-                local_dt = dt_start.astimezone()
+                # Конвертируем в московское время
+                moscow_tz = pytz.timezone('Europe/Moscow')
+                local_dt = dt_start.astimezone(moscow_tz)
                 
                 result.append({
                     "summary": summary,
@@ -139,13 +156,17 @@ def create_event_in_yandex(summary, start_dt, duration_hours=1):
     calendar = get_calendar()
     if not calendar: return False
     try:
+        # Конвертируем в UTC для отправки в Яндекс Календарь
+        moscow_tz = pytz.timezone('Europe/Moscow')
         if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=timezone.utc)
+            start_dt = moscow_tz.localize(start_dt)
         else:
-            start_dt = start_dt.astimezone(timezone.utc)
-            
-        end_dt = start_dt + timedelta(hours=duration_hours)
-        dt_str_start = start_dt.strftime('%Y%m%dT%H%M%SZ')
+            start_dt = start_dt.astimezone(moscow_tz)
+        
+        utc_dt = start_dt.astimezone(timezone.utc)
+        end_dt = utc_dt + timedelta(hours=duration_hours)
+        
+        dt_str_start = utc_dt.strftime('%Y%m%dT%H%M%SZ')
         dt_str_end = end_dt.strftime('%Y%m%dT%H%M%SZ')
         
         event_data = f"""BEGIN:VEVENT
@@ -285,7 +306,6 @@ async def send_or_edit_main_message(message=None):
                 sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
                 # Сразу после этого устанавливаем Reply-клавиатуру отдельным действием или в следующем сообщении
-                # Но лучше отправить Reply-клавиатуру как отдельное короткое сообщение-приветствие или просто установить её здесь
                 await message.answer("Используйте кнопки внизу для быстрого доступа.", reply_markup=get_reply_keyboard())
             else:
                 sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
@@ -300,14 +320,11 @@ async def send_or_edit_main_message(message=None):
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard
             )
-            # Reply-клавиатура остается активной, так как она была установлена ранее
-            # Если нужно её обновить, можно отправить новое сообщение с ней, но обычно это не требуется
             
     except Exception as e:
         logger.error(f"Edit error: {e}")
         if "message to edit not found" in str(e):
             MAIN_MESSAGE_ID = None
-            # Если сообщение удалено, пробуем создать заново при следующем вызове
 
 # --- ОБРАБОТЧИКИ ---
 
@@ -320,7 +337,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("nav_prev_"))
 async def nav_prev(callback: types.CallbackQuery):
     ts = int(callback.data.split("_")[2])
-    new_start = datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).astimezone()
+    new_start = datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).astimezone(pytz.timezone('Europe/Moscow'))
     await callback.answer()
     global CURRENT_WEEK_START
     CURRENT_WEEK_START = new_start
@@ -329,7 +346,7 @@ async def nav_prev(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("nav_next_"))
 async def nav_next(callback: types.CallbackQuery):
     ts = int(callback.data.split("_")[2])
-    new_start = datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).astimezone()
+    new_start = datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).astimezone(pytz.timezone('Europe/Moscow'))
     await callback.answer()
     global CURRENT_WEEK_START
     CURRENT_WEEK_START = new_start
@@ -366,7 +383,7 @@ async def close_manage(callback: types.CallbackQuery):
 
 @dp.message(F.text == "➕ Добавить заметку")
 async def start_add_note(message: types.Message, state: FSMContext):
-    await message.answer("✍️ Введите текст новой заметки:", parse_mode=ParseMode.MARKDOWN)
+    await message.answer("️ Введите текст новой заметки:", parse_mode=ParseMode.MARKDOWN)
     await state.set_state(AddNoteState.waiting_for_text)
 
 class AddNoteState(StatesGroup):
@@ -384,7 +401,7 @@ async def process_time_selection(callback: types.CallbackQuery, state: FSMContex
     data = await state.get_data()
     text = data.get("note_text")
     ts = int(callback.data.split("_")[1])
-    event_time = datetime.fromtimestamp(ts, tz=timezone.utc)
+    event_time = datetime.fromtimestamp(ts, tz=pytz.timezone('Europe/Moscow'))
     
     if create_event_in_yandex(text, event_time):
         await callback.message.answer("✅ Добавлено!", reply_markup=None)
@@ -398,7 +415,7 @@ async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.delete()
 
-@dp.message(F.text == "⚙️ Настройки")
+@dp.message(F.text == "️ Настройки")
 async def open_settings(message: types.Message):
     await message.answer(f"Интервал проверки: {CHECK_INTERVAL_MINUTES} мин", reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES))
 
