@@ -15,7 +15,7 @@ from aiogram.enums import ParseMode
 import pytz
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.3.3"
+BOT_VERSION = "1.3.4"
 
 load_dotenv()
 
@@ -52,6 +52,7 @@ dp = Dispatcher()
 # Глобальные переменные состояния
 MAIN_MESSAGE_ID = None
 CURRENT_WEEK_START = None
+TEMP_MESSAGES = []  # Список временных сообщений для автоудаления
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -61,6 +62,7 @@ def get_local_time():
     return datetime.now(moscow_tz)
 
 def get_week_start(date_obj):
+    """Возвращает понедельник текущей недели для date_obj"""
     return date_obj - timedelta(days=date_obj.weekday())
 
 def format_date_full(dt_obj):
@@ -85,6 +87,20 @@ def format_time_only(dt_obj):
         dt_obj = dt_obj.astimezone(pytz.timezone('Europe/Moscow'))
     
     return dt_obj.strftime("%H:%M")
+
+async def delete_temp_messages():
+    """Автоматическое удаление временных сообщений через 5 минут"""
+    while True:
+        await asyncio.sleep(300)  # 5 минут
+        for msg_id in TEMP_MESSAGES[:]:
+            try:
+                await bot.delete_message(ADMIN_ID, msg_id)
+                TEMP_MESSAGES.remove(msg_id)
+                logger.info(f"Временное сообщение {msg_id} удалено")
+            except Exception as e:
+                logger.warning(f"Не удалось удалить сообщение {msg_id}: {e}")
+                if msg_id in TEMP_MESSAGES:
+                    TEMP_MESSAGES.remove(msg_id)
 
 # --- РАБОТА С CALDAV ---
 def get_calendar():
@@ -193,15 +209,25 @@ def get_main_nav_keyboard(week_start):
     week_end = week_start + timedelta(days=6)
     builder = InlineKeyboardBuilder()
     
+    # Кнопка Обновить сверху
+    builder.row(InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"))
+    
+    # Навигация по неделям
     prev_week = week_start - timedelta(days=7)
     next_week = week_start + timedelta(days=7)
     
-    builder.button(text="️ Назад", callback_data=f"nav_prev_{int(prev_week.timestamp())}")
-    builder.button(text=f"📅 {week_start.strftime('%d.%m')} - {week_end.strftime('%d.%m')}", callback_data="current_week")
-    builder.button(text="Вперед ➡️", callback_data=f"nav_next_{int(next_week.timestamp())}")
+    builder.row(
+        InlineKeyboardButton(text="️ Назад", callback_data=f"nav_prev_{int(prev_week.timestamp())}"),
+        InlineKeyboardButton(text=f"📅 {week_start.strftime('%d.%m')} - {week_end.strftime('%d.%m')}", callback_data="current_week"),
+        InlineKeyboardButton(text="Вперед ➡️", callback_data=f"nav_next_{int(next_week.timestamp())}")
+    )
+    
+    # Кнопка Сегодня/Завтра
+    today = get_local_time().replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow = today + timedelta(days=1)
+    builder.row(InlineKeyboardButton(text="📅 Сегодня/Завтра", callback_data=f"nav_today_{int(today.timestamp())}"))
     
     builder.row(InlineKeyboardButton(text="✏️ Управление (Удалить)", callback_data="manage_list"))
-    builder.row(InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"))
     
     return builder.as_markup()
 
@@ -219,7 +245,7 @@ def get_manage_list_keyboard(events):
         builder.button(text=btn_text, callback_data=f"del_{ev['uid']}")
     
     builder.adjust(1)
-    builder.row(InlineKeyboardButton(text="🔙 Закрыть список", callback_data="close_manage"))
+    builder.row(InlineKeyboardButton(text=" Закрыть список", callback_data="close_manage"))
     return builder.as_markup()
 
 def get_notification_keyboard(uid):
@@ -247,7 +273,7 @@ def get_settings_kb(current_interval):
     for mins in [5, 15, 30, 60]:
         text = f"{mins} мин" + (" ✅" if mins == current_interval else "")
         builder.button(text=text, callback_data=f"set_interval_{mins}")
-    builder.button(text="🔙 Назад", callback_data="close_settings")
+    builder.button(text=" Назад", callback_data="close_settings")
     builder.adjust(2)
     return builder.as_markup()
 
@@ -291,10 +317,10 @@ async def build_week_report(week_start):
     text += f"\n_Последняя синхронизация: {sync_time}_"
     return text, get_main_nav_keyboard(week_start)
 
-async def send_or_edit_main_message(message=None):
+async def send_or_edit_main_message(message=None, force_current_week=False):
     global MAIN_MESSAGE_ID, CURRENT_WEEK_START
     
-    if CURRENT_WEEK_START is None:
+    if force_current_week or CURRENT_WEEK_START is None:
         CURRENT_WEEK_START = get_week_start(get_local_time())
     
     text, keyboard = await build_week_report(CURRENT_WEEK_START)
@@ -306,11 +332,13 @@ async def send_or_edit_main_message(message=None):
                 sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
                 # Сразу после этого устанавливаем Reply-клавиатуру отдельным действием или в следующем сообщении
-                await message.answer("Используйте кнопки внизу для быстрого доступа.", reply_markup=get_reply_keyboard())
+                temp_msg = await message.answer("Используйте кнопки внизу для быстрого доступа.", reply_markup=get_reply_keyboard())
+                TEMP_MESSAGES.append(temp_msg.message_id)
             else:
                 sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
-                await bot.send_message(ADMIN_ID, "Меню управления:", reply_markup=get_reply_keyboard())
+                temp_msg = await bot.send_message(ADMIN_ID, "Меню управления:", reply_markup=get_reply_keyboard())
+                TEMP_MESSAGES.append(temp_msg.message_id)
         else:
             # Редактируем только текст и Inline-клавиатуру главного сообщения
             await bot.edit_message_text(
@@ -326,13 +354,24 @@ async def send_or_edit_main_message(message=None):
         if "message to edit not found" in str(e):
             MAIN_MESSAGE_ID = None
 
+async def send_temp_message(text, reply_markup=None):
+    """Отправляет временное сообщение, которое удалится через 5 минут"""
+    try:
+        msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        TEMP_MESSAGES.append(msg.message_id)
+        logger.info(f"Временное сообщение отправлено: {msg.message_id}")
+        return msg
+    except Exception as e:
+        logger.error(f"Ошибка отправки временного сообщения: {e}")
+        return None
+
 # --- ОБРАБОТЧИКИ ---
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
     await state.clear()
-    await send_or_edit_main_message(message)
+    await send_or_edit_main_message(message, force_current_week=True)
 
 @dp.callback_query(F.data.startswith("nav_prev_"))
 async def nav_prev(callback: types.CallbackQuery):
@@ -352,19 +391,28 @@ async def nav_next(callback: types.CallbackQuery):
     CURRENT_WEEK_START = new_start
     await send_or_edit_main_message()
 
+@dp.callback_query(F.data.startswith("nav_today_"))
+async def nav_today(callback: types.CallbackQuery):
+    ts = int(callback.data.split("_")[2])
+    new_start = get_week_start(datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).astimezone(pytz.timezone('Europe/Moscow')))
+    await callback.answer()
+    global CURRENT_WEEK_START
+    CURRENT_WEEK_START = new_start
+    await send_or_edit_main_message()
+
 @dp.callback_query(F.data == "force_refresh")
 async def force_refresh(callback: types.CallbackQuery):
     await callback.answer("Обновление...")
-    await send_or_edit_main_message()
+    await send_or_edit_main_message(force_current_week=True)
 
 @dp.callback_query(F.data == "manage_list")
 async def show_manage_list(callback: types.CallbackQuery):
     events = get_events_for_week(CURRENT_WEEK_START, CURRENT_WEEK_START + timedelta(days=6))
     kb = get_manage_list_keyboard(events)
     if events:
-        await callback.message.answer("Выберите задачу для удаления:", reply_markup=kb)
+        temp_msg = await send_temp_message("Выберите задачу для удаления:", reply_markup=kb)
     else:
-        await callback.message.answer("Нет задач для удаления в этой неделе.", reply_markup=kb)
+        temp_msg = await send_temp_message("Нет задач для удаления в этой неделе.", reply_markup=kb)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("del_"))
@@ -383,7 +431,7 @@ async def close_manage(callback: types.CallbackQuery):
 
 @dp.message(F.text == "➕ Добавить заметку")
 async def start_add_note(message: types.Message, state: FSMContext):
-    await message.answer("️ Введите текст новой заметки:", parse_mode=ParseMode.MARKDOWN)
+    await message.answer("✍️ Введите текст новой заметки:", parse_mode=ParseMode.MARKDOWN)
     await state.set_state(AddNoteState.waiting_for_text)
 
 class AddNoteState(StatesGroup):
@@ -415,7 +463,7 @@ async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.delete()
 
-@dp.message(F.text == "️ Настройки")
+@dp.message(F.text == "⚙️ Настройки")
 async def open_settings(message: types.Message):
     await message.answer(f"Интервал проверки: {CHECK_INTERVAL_MINUTES} мин", reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES))
 
@@ -487,12 +535,14 @@ async def main():
     logger.info(f"Bot started v{BOT_VERSION}")
     await asyncio.sleep(2)
     
+    # Запускаем фоновые задачи
     asyncio.create_task(notification_scheduler())
+    asyncio.create_task(delete_temp_messages())
     
     async def refresh_loop():
         while True:
             await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
-            await send_or_edit_main_message()
+            await send_or_edit_main_message(force_current_week=True)
     
     asyncio.create_task(refresh_loop())
     
