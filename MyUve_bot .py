@@ -15,7 +15,7 @@ from aiogram.enums import ParseMode
 import pytz
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.3.4"
+BOT_VERSION = "1.3.5"
 
 load_dotenv()
 
@@ -52,7 +52,7 @@ dp = Dispatcher()
 # Глобальные переменные состояния
 MAIN_MESSAGE_ID = None
 CURRENT_WEEK_START = None
-TEMP_MESSAGES = []  # Список временных сообщений для автоудаления
+TEMP_MESSAGES = []  # Список ID сообщений для автоудаления (и бота, и пользователя)
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -67,7 +67,6 @@ def get_week_start(date_obj):
 
 def format_date_full(dt_obj):
     if dt_obj is None: return ""
-    # Если у объекта нет timezone info, добавляем московский часовой пояс
     if dt_obj.tzinfo is None:
         moscow_tz = pytz.timezone('Europe/Moscow')
         dt_obj = moscow_tz.localize(dt_obj)
@@ -79,7 +78,6 @@ def format_date_full(dt_obj):
 
 def format_time_only(dt_obj):
     if dt_obj is None: return "--:--"
-    # Если у объекта нет timezone info, добавляем московский часовой пояс
     if dt_obj.tzinfo is None:
         moscow_tz = pytz.timezone('Europe/Moscow')
         dt_obj = moscow_tz.localize(dt_obj)
@@ -89,18 +87,28 @@ def format_time_only(dt_obj):
     return dt_obj.strftime("%H:%M")
 
 async def delete_temp_messages():
-    """Автоматическое удаление временных сообщений через 5 минут"""
+    """Автоматическое удаление временных сообщений (бота и пользователя) через 5 минут"""
     while True:
         await asyncio.sleep(300)  # 5 минут
+        # Копируем список, чтобы безопасно итерироваться при удалении
         for msg_id in TEMP_MESSAGES[:]:
             try:
                 await bot.delete_message(ADMIN_ID, msg_id)
                 TEMP_MESSAGES.remove(msg_id)
                 logger.info(f"Временное сообщение {msg_id} удалено")
             except Exception as e:
-                logger.warning(f"Не удалось удалить сообщение {msg_id}: {e}")
-                if msg_id in TEMP_MESSAGES:
-                    TEMP_MESSAGES.remove(msg_id)
+                # Если сообщение уже удалено или не найдено, просто убираем из списка
+                if "message to delete not found" in str(e) or msg_id in TEMP_MESSAGES:
+                    if msg_id in TEMP_MESSAGES:
+                        TEMP_MESSAGES.remove(msg_id)
+                else:
+                    logger.warning(f"Не удалось удалить сообщение {msg_id}: {e}")
+
+def add_to_delete_list(message_obj):
+    """Добавляет ID сообщения в список на удаление"""
+    if message_obj and message_obj.message_id not in TEMP_MESSAGES:
+        TEMP_MESSAGES.append(message_obj.message_id)
+        logger.debug(f"Сообщение {message_obj.message_id} добавлено в очередь удаления")
 
 # --- РАБОТА С CALDAV ---
 def get_calendar():
@@ -129,13 +137,11 @@ def get_events_for_week(start_date, end_date):
                 summary = event.instance.vevent.summary.value if event.instance.vevent.summary else "Без названия"
                 uid = event.instance.vevent.uid.value
                 
-                # Нормализация времени - конвертируем в московский часовой пояс
                 if hasattr(dt_start, 'date') and not hasattr(dt_start, 'hour'):
                     dt_start = datetime.combine(dt_start, datetime.min.time()).replace(tzinfo=timezone.utc)
                 elif hasattr(dt_start, 'tzinfo') and dt_start.tzinfo is None:
                     dt_start = dt_start.replace(tzinfo=timezone.utc)
                 
-                # Конвертируем в московское время
                 moscow_tz = pytz.timezone('Europe/Moscow')
                 local_dt = dt_start.astimezone(moscow_tz)
                 
@@ -172,7 +178,6 @@ def create_event_in_yandex(summary, start_dt, duration_hours=1):
     calendar = get_calendar()
     if not calendar: return False
     try:
-        # Конвертируем в UTC для отправки в Яндекс Календарь
         moscow_tz = pytz.timezone('Europe/Moscow')
         if start_dt.tzinfo is None:
             start_dt = moscow_tz.localize(start_dt)
@@ -199,20 +204,22 @@ END:VEVENT"""
 # --- КЛАВИАТУРЫ ---
 
 def get_reply_keyboard():
-    """Создает Reply-клавиатуру (кнопки внизу экрана)"""
     builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки"))
+    builder.row(KeyboardButton(text=" Добавить заметку"), KeyboardButton(text="️ Настройки"))
     return builder.as_markup(resize_keyboard=True, one_time_keyboard=False)
 
 def get_main_nav_keyboard(week_start):
-    """Создает Inline-клавиатуру для главного сообщения"""
     week_end = week_start + timedelta(days=6)
     builder = InlineKeyboardBuilder()
     
-    # Кнопка Обновить сверху
-    builder.row(InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"))
+    # СТРОКА 1: Обновить и Сегодня/Завтра (в одной строке)
+    today = get_local_time().replace(hour=0, minute=0, second=0, microsecond=0)
+    builder.row(
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"),
+        InlineKeyboardButton(text="📅 Сегодня/Завтра", callback_data=f"nav_today_{int(today.timestamp())}")
+    )
     
-    # Навигация по неделям
+    # СТРОКА 2: Навигация по неделям
     prev_week = week_start - timedelta(days=7)
     next_week = week_start + timedelta(days=7)
     
@@ -222,11 +229,7 @@ def get_main_nav_keyboard(week_start):
         InlineKeyboardButton(text="Вперед ➡️", callback_data=f"nav_next_{int(next_week.timestamp())}")
     )
     
-    # Кнопка Сегодня/Завтра
-    today = get_local_time().replace(hour=0, minute=0, second=0, microsecond=0)
-    tomorrow = today + timedelta(days=1)
-    builder.row(InlineKeyboardButton(text="📅 Сегодня/Завтра", callback_data=f"nav_today_{int(today.timestamp())}"))
-    
+    # СТРОКА 3: Управление
     builder.row(InlineKeyboardButton(text="✏️ Управление (Удалить)", callback_data="manage_list"))
     
     return builder.as_markup()
@@ -245,7 +248,7 @@ def get_manage_list_keyboard(events):
         builder.button(text=btn_text, callback_data=f"del_{ev['uid']}")
     
     builder.adjust(1)
-    builder.row(InlineKeyboardButton(text=" Закрыть список", callback_data="close_manage"))
+    builder.row(InlineKeyboardButton(text="🔙 Закрыть список", callback_data="close_manage"))
     return builder.as_markup()
 
 def get_notification_keyboard(uid):
@@ -273,7 +276,7 @@ def get_settings_kb(current_interval):
     for mins in [5, 15, 30, 60]:
         text = f"{mins} мин" + (" ✅" if mins == current_interval else "")
         builder.button(text=text, callback_data=f"set_interval_{mins}")
-    builder.button(text=" Назад", callback_data="close_settings")
+    builder.button(text="🔙 Назад", callback_data="close_settings")
     builder.adjust(2)
     return builder.as_markup()
 
@@ -303,14 +306,9 @@ async def build_week_report(week_start):
             color_mark = ""
             
             if ev['time'] < now:
-                status_icon = " ⚠️"
-                color_mark = "" 
+                status_icon = " ️"
             elif ev['time'].date() == now.date():
-                status_icon = " 🔁"
-                color_mark = "" 
-            else:
-                status_icon = ""
-                color_mark = "" 
+                status_icon = " "
             
             text += f"{color_mark} {time_str} — {ev['summary']} ({date_str}){status_icon}\n"
     
@@ -327,20 +325,18 @@ async def send_or_edit_main_message(message=None, force_current_week=False):
     
     try:
         if MAIN_MESSAGE_ID is None:
-            # Создаем новое сообщение с Inline-клавиатурой
             if message:
                 sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
-                # Сразу после этого устанавливаем Reply-клавиатуру отдельным действием или в следующем сообщении
+                # Приветственное сообщение тоже временное
                 temp_msg = await message.answer("Используйте кнопки внизу для быстрого доступа.", reply_markup=get_reply_keyboard())
-                TEMP_MESSAGES.append(temp_msg.message_id)
+                add_to_delete_list(temp_msg)
             else:
                 sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
                 temp_msg = await bot.send_message(ADMIN_ID, "Меню управления:", reply_markup=get_reply_keyboard())
-                TEMP_MESSAGES.append(temp_msg.message_id)
+                add_to_delete_list(temp_msg)
         else:
-            # Редактируем только текст и Inline-клавиатуру главного сообщения
             await bot.edit_message_text(
                 chat_id=ADMIN_ID,
                 message_id=MAIN_MESSAGE_ID,
@@ -355,15 +351,9 @@ async def send_or_edit_main_message(message=None, force_current_week=False):
             MAIN_MESSAGE_ID = None
 
 async def send_temp_message(text, reply_markup=None):
-    """Отправляет временное сообщение, которое удалится через 5 минут"""
-    try:
-        msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
-        TEMP_MESSAGES.append(msg.message_id)
-        logger.info(f"Временное сообщение отправлено: {msg.message_id}")
-        return msg
-    except Exception as e:
-        logger.error(f"Ошибка отправки временного сообщения: {e}")
-        return None
+    msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+    add_to_delete_list(msg)
+    return msg
 
 # --- ОБРАБОТЧИКИ ---
 
@@ -371,6 +361,8 @@ async def send_temp_message(text, reply_markup=None):
 async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
     await state.clear()
+    # Сообщение /start тоже добавляем в список на удаление
+    add_to_delete_list(message)
     await send_or_edit_main_message(message, force_current_week=True)
 
 @dp.callback_query(F.data.startswith("nav_prev_"))
@@ -410,15 +402,16 @@ async def show_manage_list(callback: types.CallbackQuery):
     events = get_events_for_week(CURRENT_WEEK_START, CURRENT_WEEK_START + timedelta(days=6))
     kb = get_manage_list_keyboard(events)
     if events:
-        temp_msg = await send_temp_message("Выберите задачу для удаления:", reply_markup=kb)
+        await send_temp_message("Выберите задачу для удаления:", reply_markup=kb)
     else:
-        temp_msg = await send_temp_message("Нет задач для удаления в этой неделе.", reply_markup=kb)
+        await send_temp_message("Нет задач для удаления в этой неделе.", reply_markup=kb)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_from_list(callback: types.CallbackQuery):
     uid = callback.data.split("_")[1]
     if delete_event(uid):
+        # Сообщение со списком удаляется автоматически через 5 мин, но мы можем обновить его текст сразу
         await callback.message.edit_text("✅ Задача удалена.", reply_markup=None)
         await send_or_edit_main_message()
     else:
@@ -431,7 +424,10 @@ async def close_manage(callback: types.CallbackQuery):
 
 @dp.message(F.text == "➕ Добавить заметку")
 async def start_add_note(message: types.Message, state: FSMContext):
-    await message.answer("✍️ Введите текст новой заметки:", parse_mode=ParseMode.MARKDOWN)
+    # Добавляем сообщение пользователя в список на удаление
+    add_to_delete_list(message)
+    prompt = await message.answer("✍️ Введите текст новой заметки:", parse_mode=ParseMode.MARKDOWN)
+    add_to_delete_list(prompt)
     await state.set_state(AddNoteState.waiting_for_text)
 
 class AddNoteState(StatesGroup):
@@ -440,8 +436,11 @@ class AddNoteState(StatesGroup):
 
 @dp.message(AddNoteState.waiting_for_text)
 async def process_note_text(message: types.Message, state: FSMContext):
+    # Текст заметки от пользователя тоже удалим
+    add_to_delete_list(message)
     await state.update_data(note_text=message.text)
-    await message.answer(f" Текст: {message.text}\nКогда добавить?", reply_markup=get_time_options_kb())
+    prompt = await message.answer(f" Текст: {message.text}\nКогда добавить?", reply_markup=get_time_options_kb())
+    add_to_delete_list(prompt)
     await state.set_state(AddNoteState.waiting_for_time)
 
 @dp.callback_query(AddNoteState.waiting_for_time, F.data.startswith("time_"))
@@ -452,20 +451,25 @@ async def process_time_selection(callback: types.CallbackQuery, state: FSMContex
     event_time = datetime.fromtimestamp(ts, tz=pytz.timezone('Europe/Moscow'))
     
     if create_event_in_yandex(text, event_time):
-        await callback.message.answer("✅ Добавлено!", reply_markup=None)
+        confirm_msg = await callback.message.answer("✅ Добавлено!", reply_markup=None)
+        add_to_delete_list(confirm_msg)
         await send_or_edit_main_message()
     else:
-        await callback.message.answer("❌ Ошибка", reply_markup=None)
+        err_msg = await callback.message.answer("❌ Ошибка", reply_markup=None)
+        add_to_delete_list(err_msg)
     await state.clear()
 
 @dp.callback_query(F.data == "cancel_add")
 async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.delete()
+    await callback.answer()
 
-@dp.message(F.text == "⚙️ Настройки")
+@dp.message(F.text == "️ Настройки")
 async def open_settings(message: types.Message):
-    await message.answer(f"Интервал проверки: {CHECK_INTERVAL_MINUTES} мин", reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES))
+    add_to_delete_list(message)
+    settings_msg = await message.answer(f"Интервал проверки: {CHECK_INTERVAL_MINUTES} мин", reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES))
+    add_to_delete_list(settings_msg)
 
 @dp.callback_query(F.data.startswith("set_interval_"))
 async def set_interval(callback: types.CallbackQuery):
@@ -509,7 +513,15 @@ async def notification_scheduler():
                     try:
                         kb = get_notification_keyboard(uid)
                         text = f" **Напоминание:** {ev['summary']}\nВремя: {format_time_only(event_time)}"
-                        await bot.send_message(ADMIN_ID, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+                        notify_msg = await bot.send_message(ADMIN_ID, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+                        # Уведомления тоже удаляем через 5 минут, если не нажали кнопку
+                        # Но лучше оставить их, пока пользователь не реагирует? 
+                        # По ТЗ: "все сообщения... удалялись через 5 минут". 
+                        # Если уведомление удалится, кнопка перестанет работать.
+                        # Поэтому уведомления НЕ добавляем в TEMP_MESSAGES, они живут отдельно.
+                        # Или можно добавить логику: если нажали - удаляем сразу, если нет - висят.
+                        # Оставим уведомления без автоудаления для функциональности кнопки.
+                        
                         active_notifications[uid] = now
                         logger.info(f"Sent notification for {uid}")
                     except Exception as e:
@@ -520,6 +532,8 @@ async def done_notify(callback: types.CallbackQuery):
     uid = callback.data.split("_")[2]
     if delete_event(uid):
         await callback.message.edit_text("✅ Задача выполнена и удалена.")
+        # Это сообщение тоже добавим в список удаления, если нужно
+        add_to_delete_list(callback.message)
         if uid in active_notifications:
             del active_notifications[uid]
         await send_or_edit_main_message()
@@ -535,7 +549,6 @@ async def main():
     logger.info(f"Bot started v{BOT_VERSION}")
     await asyncio.sleep(2)
     
-    # Запускаем фоновые задачи
     asyncio.create_task(notification_scheduler())
     asyncio.create_task(delete_temp_messages())
     
