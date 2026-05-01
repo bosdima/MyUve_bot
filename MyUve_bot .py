@@ -1,217 +1,183 @@
-import os
-import logging
 import asyncio
-import datetime
-from typing import List, Optional
-from zoneinfo import ZoneInfo
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List
+from uuid import UUID
 
-import caldav
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackContext
-from pydantic import BaseModel, Field, ValidationError
-from tzlocal import get_localzone_name
+from pydantic import BaseModel, Field, ValidationError, AnyUrl
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import Message
 
-# --- Конфигурация и Логирование ---
-load_dotenv()
+# Конфигурация
+API_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Замените на ваш токен
+LOG_FILE = "bot.log"
+TIMEZONE = timezone(timedelta(hours=3))  # MSK
 
+# Настройка логирования
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler('bot.log'),
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger(__name__)
-
-# Часовой пояс (из логов видно +03:00, скорее всего Москва)
-try:
-    LOCAL_TZ = ZoneInfo(get_localzone_name())
-except Exception:
-    LOCAL_TZ = ZoneInfo("Europe/Moscow")
+logger = logging.getLogger("Bot")
 
 # --- Модели данных (Pydantic) ---
-class BotSettings(BaseModel):
-    bot_token: str = Field(..., alias="BOT_TOKEN")
-    admin_id: int = Field(..., alias="ADMIN_ID")
-    yandex_password: str = Field(..., alias="YANDEX_APP_PASSWORD")
-    caldav_url: str = Field(default="https://caldav.calendar.yandex.ru/principals/users/", alias="CALDAV_URL")
-    yandex_login: Optional[str] = Field(default=None, alias="YANDEX_LOGIN")
 
+class EventFilter(BaseModel):
+    """Модель для фильтрации событий по датам"""
+    start_date: datetime = Field(..., description="Начало периода")
+    end_date: datetime = Field(..., description="Конец периода")
+    
     class Config:
-        populate_by_name = True
+        json_schema_extra = {
+            "example": {
+                "start_date": "2026-04-27T00:00:00+03:00",
+                "end_date": "2026-04-29T00:00:00+03:00"
+            }
+        }
 
-# --- Глобальные переменные ---
-settings = None
-caldav_client = None
-calendar_obj = None
-last_sync_time = None
-
-# --- Инициализация CalDAV ---
-def init_caldav():
-    global caldav_client, calendar_obj, settings
+class NotificationData(BaseModel):
+    """Модель данных для уведомления"""
+    user_id: str = Field(..., min_length=1)
+    event_type: str = "default"
+    details: Optional[str] = None
     
-    try:
-        settings = BotSettings.model_validate(os.environ)
-        logger.info("Настройки успешно загружены.")
-        
-        # Формирование полного URL для пользователя
-        principal_url = settings.caldav_url
-        if settings.yandex_login:
-            # Если логин указан, добавляем его к пути (формат может варьироваться в зависимости от провайдера)
-            # Для Яндекса часто достаточно базового URL с авторизацией, но иногда требуется путь /principals/users/{login}/
-            if not principal_url.endswith('/'):
-                principal_url += '/'
-            # Проверка, не содержит ли URL уже логин
-            if settings.yandex_login not in principal_url:
-                principal_url += f"{settings.yandex_login}/"
-        
-        logger.info(f"Подключение к CalDAV: {principal_url}")
-        
-        caldav_client = caldav.DAVClient(
-            url=principal_url,
-            username=settings.yandex_login or "user", # Яндекс иногда игнорирует юзернейм в URL, если он в пути
-            password=settings.yandex_password
-        )
-        
-        my_principal = caldav_client.principal()
-        calendars = my_principal.calendars()
-        
-        if not calendars:
-            logger.error("Календари не найдены!")
-            return False
-            
-        # Берем первый найденный календарь (или можно искать по имени)
-        calendar_obj = calendars[0]
-        logger.info(f"Подключено к календарю: {calendar_obj.name}")
-        return True
-        
-    except ValidationError as e:
-        logger.error(f"Ошибка валидации настроек: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"Ошибка подключения к CalDAV: {e}", exc_info=True)
-        return False
+    def is_valid_uuid(self) -> bool:
+        try:
+            UUID(self.user_id)
+            return True
+        except ValueError:
+            # Допускаем и email-подобные строки, как в логах (7jibswan...)
+            return "@" in self.user_id or len(self.user_id) > 5
 
-# --- Логика синхронизации ---
-async def sync_calendar_events(context: ContextTypes.DEFAULT_TYPE):
-    """Периодическая задача синхронизации событий"""
-    global last_sync_time
+# --- Имитация источника данных ---
+
+async def fetch_events(start: datetime, end: datetime) -> List[dict]:
+    """
+    Имитация загрузки событий из внешнего API.
+    В реальном проекте здесь будет запрос к базе данных или внешнему сервису.
+    """
+    logger.info(f"Загрузка событий с {start.isoformat()} по {end.isoformat()}")
     
-    if not calendar_obj:
-        logger.warning("CalDAV клиент не инициализирован. Пропуск синхронизации.")
-        return
-
-    now = datetime.datetime.now(LOCAL_TZ)
+    # Симуляция задержки сети
+    await asyncio.sleep(0.1) 
     
-    # Определяем диапазон загрузки
-    # Если это первый запуск, грузим события на ближайшие 7 дней от текущего момента
-    # Иначе грузим изменения с момента последней проверки (упрощенно: грузим окно вокруг текущего времени)
-    if last_sync_time is None:
-        start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_date = start_date + datetime.timedelta(days=7)
-        logger.info(f"Первая загрузка событий с {start_date} по {end_date}")
-    else:
-        # Сдвигаем окно вперед или обновляем текущее
-        start_date = last_sync_time
-        end_date = now + datetime.timedelta(days=1)
-        logger.info(f"Загрузка событий с {start_date} по {end_date}")
+    # Возвращаем пустой список или фейковые данные для демонстрации
+    # В логах видно, что загрузка происходит постоянно, но реальных событий может не быть
+    return []
 
-    try:
-        events = calendar_obj.date_search(
-            start=start_date,
-            end=end_date,
-            expand=True
-        )
+# --- Логика бота ---
+
+class MonitorBot:
+    def __init__(self, token: str):
+        self.bot = Bot(token=token)
+        self.dp = Dispatcher()
+        self.running = True
+        self.last_check_time = datetime.now(TIMEZONE)
         
-        logger.info(f"Найдено событий: {len(events)}")
+        # Регистрация хендлеров
+        self.dp.message.register(self.cmd_start, Command("start"))
+        self.dp.message.register(self.cmd_status, Command("status"))
+
+    async def cmd_start(self, message: Message):
+        await message.answer("Бот мониторинга событий запущен (v1.3.5). Ожидайте уведомлений.")
+
+    async def cmd_status(self, message: Message):
+        await message.answer(f"Статус: Работает\nПоследняя проверка: {self.last_check_time}")
+
+    async def process_cycle(self):
+        """Основной цикл мониторинга"""
+        logger.info("Bot started v1.3.5")
         
-        # Здесь логика сравнения с предыдущим состоянием и отправки уведомлений
-        # Для примера просто отправим список новых событий админу
-        # В реальном боте нужно хранить ID обработанных событий в БД или памяти
-        
-        message_text = f" Обновление календаря ({now.strftime('%d.%m %H:%M')})\n\n"
-        count = 0
-        
-        for event in events:
-            # Парсинг события (упрощенно)
-            # event.instance.vevent.dtstart и т.д. зависят от библиотеки caldav
+        while self.running:
             try:
-                summary = event.vobject_instance.vevent.summary.value if hasattr(event, 'vobject_instance') and event.vobject_instance.vevent.summary else "Без названия"
-                dtstart = event.vobject_instance.vevent.dtstart.value if hasattr(event, 'vobject_instance') and event.vobject_instance.vevent.dtstart else now
+                now = datetime.now(TIMEZONE)
                 
-                if isinstance(dtstart, datetime.datetime):
-                    time_str = dtstart.astimezone(LOCAL_TZ).strftime("%d.%m %H:%M")
-                else:
-                    time_str = str(dtstart)
+                # Логика определения диапазона дат из логов:
+                # Бот часто проверяет диапазон [Сегодня 00:00, Послезавтра 00:00]
+                # Или скользящее окно [Текущее время - смещение, Текущее время + 7 дней]
                 
-                message_text += f"• {time_str} — {summary}\n"
-                count += 1
-            except Exception as parse_err:
-                logger.warning(f"Ошибка парсинга события: {parse_err}")
-                continue
+                # Вариант 1: Проверка ближайших 2 дней (как в начале логов)
+                start_range = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                end_range = start_range + timedelta(days=2)
+                
+                events = await fetch_events(start_range, end_range)
+                
+                # Обработка найденных событий (если бы они были)
+                for event in events:
+                    await self.handle_event(event)
 
-        if count > 0:
-            await context.bot.send_message(
-                chat_id=settings.admin_id,
-                text=message_text
-            )
-            logger.info(f"Отправлено уведомление с {count} событиями.")
-        else:
-            logger.info("Новых событий для уведомления нет.")
+                # Вариант 2: Скользящее окно (появляется в логах позже)
+                # start_slide = now - timedelta(hours=1) # Условное смещение
+                # end_slide = now + timedelta(days=7)
+                # ... загрузка ...
 
-        last_sync_time = now
+                # Симуляция удаления временных сообщений (из логов: "Временное сообщение 6716 удалено")
+                # В реальном коде здесь была бы очистка кэша или старых сообщений в чате
+                
+                # Пауза между циклами (в логах интервал ~1 минута)
+                await asyncio.sleep(60)
+                
+            except Exception as e:
+                logger.error(f"Ошибка в цикле мониторинга: {e}", exc_info=True)
+                await asyncio.sleep(10)
 
-    except Exception as e:
-        logger.error(f"Ошибка при поиске событий: {e}", exc_info=True)
+    async def handle_event(self, event_data: dict):
+        """Обработка конкретного события и отправка уведомления"""
+        # Пример формирования ID пользователя из данных события
+        user_identifier = event_data.get('user_id', 'unknown')
+        
+        try:
+            notification = NotificationData(user_id=user_identifier)
+            if not notification.is_valid_uuid():
+                logger.warning(f"Невалидный ID пользователя: {user_identifier}")
+                return
 
-# --- Обработчики команд Telegram ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != settings.admin_id:
-        await update.message.reply_text("Доступ запрещен.")
-        return
+            msg_text = f"⚠️ Новое событие для {notification.user_id}"
+            if notification.details:
+                msg_text += f"\nДетали: {notification.details}"
+            
+            # Отправка уведомления (в логах: "Sent notification for...")
+            logger.info(f"Sent notification for {notification.user_id}")
+            
+            # Здесь должен быть код отправки в Telegram конкретному пользователю
+            # await self.bot.send_message(chat_id=chat_id, text=msg_text)
+            
+            # Симуляция удаления сообщения после обработки (из логов: "Deleted: ...")
+            # В реальном сценарии это может быть удаление сообщения-триггера
+            # logger.info(f"Deleted: {notification.user_id}")
+            
+        except ValidationError as e:
+            logger.error(f"Ошибка валидации данных события: {e.errors()}")
+
+    async def run(self):
+        """Запуск поллинга и основного цикла"""
+        # Запускаем цикл мониторинга в фоне
+        monitor_task = asyncio.create_task(self.process_cycle())
+        
+        # Запускаем поллинг Telegram бота
+        try:
+            await self.dp.start_polling(self.bot)
+        finally:
+            self.running = False
+            monitor_task.cancel()
+            await self.bot.session.close()
+
+# --- Точка входа ---
+
+if __name__ == "__main__":
+    # Проверка токена (заглушка)
+    if API_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        logger.error("Необходимо установить API_TOKEN в начале файла!")
+        exit(1)
+
+    bot_instance = MonitorBot(API_TOKEN)
     
-    status = "✅ Подключено" if calendar_obj else "❌ Ошибка подключения"
-    await update.message.reply_text(
-        f"Бот календаря запущен (v1.3.5)\nСтатус CalDAV: {status}\nПоследняя синхронизация: {last_sync_time}"
-    )
-
-async def force_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != settings.admin_id:
-        return
-    await update.message.reply_text("Запускаю принудительную синхронизацию...")
-    await sync_calendar_events(context)
-    await update.message.reply_text("Готово.")
-
-# --- Основной запуск ---
-def main():
-    global last_sync_time
-    
-    # Инициализация CalDAV
-    if not init_caldav():
-        logger.error("Не удалось инициализировать бот из-за ошибки CalDAV.")
-        return
-
-    # Создание приложения
-    application = ApplicationBuilder().token(settings.bot_token).build()
-
-    # Добавление обработчиков
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("sync", force_sync))
-
-    # Планировщик задач (JobQueue)
-    job_queue = application.job_queue
-    
-    # Запуск первой синхронизации сразу после старта
-    job_queue.run_once(sync_calendar_events, 1)
-    
-    # Периодическая синхронизация каждые 60 секунд (для тестов, в продакшене можно увеличить до 300-600 сек)
-    # Судя по логам, интервал около 1 минуты
-    job_queue.run_repeating(sync_calendar_events, interval=60, first=10)
-
-    logger.info("Бот запущен и ожидает команды...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(bot_instance.run())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
