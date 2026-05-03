@@ -16,7 +16,7 @@ import pytz
 import re
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.4.5"
+BOT_VERSION = "1.4.6"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -36,10 +36,10 @@ if not all([BOT_TOKEN, ADMIN_ID, YANDEX_LOGIN, YANDEX_PASSWORD]):
 # --- ЛОГИРОВАНИЕ ---
 LOG_FILE = "bot.log"
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)  # Включаем DEBUG для подробных логов
 
-file_handler = RotatingFileHandler(LOG_FILE, maxBytes=300*1024, backupCount=5, encoding='utf-8')
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 
 console_handler = logging.StreamHandler()
@@ -145,7 +145,7 @@ def get_events_for_range(start_date, end_date):
     start_utc = start_date.astimezone(pytz.utc)
     end_utc = end_date.astimezone(pytz.utc)
 
-    logger.info(f"Загрузка событий с {start_date} (MSK) по {end_date} (MSK)")
+    logger.debug(f"CalDAV Query: {start_utc} - {end_utc}")
 
     try:
         events = calendar.date_search(start=start_utc, end=end_utc, expand=True)
@@ -526,6 +526,7 @@ async def show_manage_list(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("edit_") & ~F.data.startswith("act_edit_"))
 async def ask_edit_action(callback: types.CallbackQuery):
     uid = callback.data.split("_")[1]
+    logger.debug(f"User clicked edit for UID: {uid}")
     kb = get_edit_action_keyboard(uid)
     await callback.message.edit_text(f"Что сделать с задачей?", reply_markup=kb)
     await callback.answer()
@@ -544,6 +545,7 @@ async def delete_from_list(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("act_edit_text_"))
 async def start_edit_text(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.data.split("_")[3]
+    logger.debug(f"Start editing text for UID: {uid}")
     
     now = get_local_time()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -557,6 +559,7 @@ async def start_edit_text(callback: types.CallbackQuery, state: FSMContext):
             break
             
     if not target_event:
+        logger.error(f"Event not found for UID: {uid}")
         await callback.answer("Ошибка: Событие не найдено", show_alert=True)
         return
 
@@ -571,6 +574,8 @@ async def process_new_text_final(message: types.Message, state: FSMContext):
     data = await state.get_data()
     uid = data.get('original_uid')
     old_time = data.get('original_time')
+    
+    logger.debug(f"Received new text: {new_text} for UID: {uid}")
     
     if uid and old_time:
         delete_event(uid)
@@ -588,6 +593,7 @@ async def process_new_text_final(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("act_edit_date_"))
 async def start_edit_date(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.data.split("_")[3]
+    logger.debug(f"Start editing date for UID: {uid}")
     
     now = get_local_time()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -601,6 +607,7 @@ async def start_edit_date(callback: types.CallbackQuery, state: FSMContext):
             break
             
     if not target_event:
+        logger.error(f"Event not found for UID: {uid}")
         await callback.answer("Ошибка: Событие не найдено", show_alert=True)
         return
 
@@ -619,6 +626,8 @@ async def process_new_time(callback: types.CallbackQuery, state: FSMContext):
     ts = int(callback.data.split("_")[1])
     new_time = datetime.fromtimestamp(ts, tz=pytz.timezone('Europe/Moscow'))
     
+    logger.debug(f"Selected preset time: {new_time} for UID: {uid}")
+    
     if uid and summary:
         delete_event(uid)
         if create_event_in_yandex(summary, new_time):
@@ -634,6 +643,7 @@ async def process_new_time(callback: types.CallbackQuery, state: FSMContext):
 # Обработка кнопки "Ввести свое время" при редактировании
 @dp.callback_query(EditNoteState.waiting_for_new_time, F.data == "time_custom")
 async def request_custom_time_edit(callback: types.CallbackQuery, state: FSMContext):
+    logger.debug("User requested custom time input")
     await callback.message.edit_text("✍️ Введите дату и время в формате:\n`ДД.ММ ЧЧ:ММ`\nили `ДД.ММ.ГГГГ ЧЧ:ММ`\nПример: `05.05 14:30`", parse_mode=ParseMode.MARKDOWN, reply_markup=None)
     await state.set_state(EditNoteState.waiting_for_custom_time)
     await callback.answer()
@@ -642,6 +652,8 @@ async def request_custom_time_edit(callback: types.CallbackQuery, state: FSMCont
 @dp.message(EditNoteState.waiting_for_custom_time)
 async def process_custom_time_edit(message: types.Message, state: FSMContext):
     text = message.text.strip()
+    logger.debug(f"Received custom time input: '{text}'")
+    
     data = await state.get_data()
     uid = data.get('original_uid')
     summary = data.get('original_summary')
@@ -649,14 +661,19 @@ async def process_custom_time_edit(message: types.Message, state: FSMContext):
     # Парсинг времени
     new_time = parse_custom_time(text)
     
-    if new_time and uid and summary:
-        delete_event(uid)
-        if create_event_in_yandex(summary, new_time):
-            await message.answer("✅ Дата и время изменены!")
-            await send_or_edit_main_message()
+    if new_time:
+        logger.debug(f"Parsed time: {new_time}")
+        if uid and summary:
+            delete_event(uid)
+            if create_event_in_yandex(summary, new_time):
+                await message.answer("✅ Дата и время изменены!")
+                await send_or_edit_main_message()
+            else:
+                await message.answer("❌ Ошибка при создании события.")
         else:
-            await message.answer("❌ Ошибка при создании события.")
+            await message.answer("❌ Ошибка данных (UID или Summary отсутствуют).")
     else:
+        logger.warning(f"Failed to parse time: '{text}'")
         await message.answer("❌ Неверный формат. Попробуйте еще раз (например: 05.05 14:30)")
         return # Не сбрасываем состояние, даем попробовать снова
         
@@ -710,19 +727,26 @@ async def request_custom_time_add(callback: types.CallbackQuery, state: FSMConte
 @dp.message(AddNoteState.waiting_for_custom_time)
 async def process_custom_time_add(message: types.Message, state: FSMContext):
     text = message.text.strip()
+    logger.debug(f"Received custom time input for new event: '{text}'")
+    
     data = await state.get_data()
     note_text = data.get("note_text")
     
     # Парсинг времени
     new_time = parse_custom_time(text)
     
-    if new_time and note_text:
-        if create_event_in_yandex(note_text, new_time):
-            await message.answer("✅ Добавлено!")
-            await send_or_edit_main_message()
+    if new_time:
+        logger.debug(f"Parsed time: {new_time}")
+        if note_text:
+            if create_event_in_yandex(note_text, new_time):
+                await message.answer("✅ Добавлено!")
+                await send_or_edit_main_message()
+            else:
+                await message.answer("❌ Ошибка при создании события.")
         else:
-            await message.answer("❌ Ошибка при создании события.")
+            await message.answer("❌ Ошибка данных (текст заметки отсутствует).")
     else:
+        logger.warning(f"Failed to parse time: '{text}'")
         await message.answer("❌ Неверный формат. Попробуйте еще раз (например: 05.05 14:30)")
         return # Не сбрасываем состояние
         
@@ -759,13 +783,16 @@ def parse_custom_time(text: str) -> datetime:
     """
     moscow_tz = pytz.timezone('Europe/Moscow')
     
+    # Удаляем лишние пробелы
+    text = text.strip()
+    
     # Паттерны
     # ДД.ММ ЧЧ:ММ
-    pattern1 = r'^(\d{2})\.(\d{2})\s+(\d{2}):(\d{2})$'
+    pattern1 = r'^(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})$'
     # ДД.ММ.ГГ ЧЧ:ММ
-    pattern2 = r'^(\d{2})\.(\d{2})\.(\d{2})\s+(\d{2}):(\d{2})$'
+    pattern2 = r'^(\d{1,2})\.(\d{1,2})\.(\d{2})\s+(\d{1,2}):(\d{2})$'
     # ДД.ММ.ГГГГ ЧЧ:ММ
-    pattern3 = r'^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})$'
+    pattern3 = r'^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})$'
     
     now = get_local_time()
     
@@ -776,7 +803,8 @@ def parse_custom_time(text: str) -> datetime:
         try:
             dt = datetime(year, month, day, hour, minute)
             return moscow_tz.localize(dt)
-        except ValueError:
+        except ValueError as e:
+            logger.warning(f"Date validation error (pattern1): {e}")
             return None
             
     match = re.match(pattern2, text)
@@ -786,7 +814,8 @@ def parse_custom_time(text: str) -> datetime:
         try:
             dt = datetime(year, month, day, hour, minute)
             return moscow_tz.localize(dt)
-        except ValueError:
+        except ValueError as e:
+            logger.warning(f"Date validation error (pattern2): {e}")
             return None
             
     match = re.match(pattern3, text)
@@ -795,9 +824,11 @@ def parse_custom_time(text: str) -> datetime:
         try:
             dt = datetime(year, month, day, hour, minute)
             return moscow_tz.localize(dt)
-        except ValueError:
+        except ValueError as e:
+            logger.warning(f"Date validation error (pattern3): {e}")
             return None
             
+    logger.warning(f"No regex pattern matched for: '{text}'")
     return None
 
 # --- СИСТЕМА УВЕДОМЛЕНИЙ ---
