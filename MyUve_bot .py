@@ -16,7 +16,7 @@ import pytz
 import re
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.4.4"
+BOT_VERSION = "1.4.5"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -547,7 +547,8 @@ async def start_edit_text(callback: types.CallbackQuery, state: FSMContext):
     
     now = get_local_time()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    events = get_events_for_range(today_start - timedelta(days=7), today_start + timedelta(days=14))
+    # Ищем в широком диапазоне
+    events = get_events_for_range(today_start - timedelta(days=14), today_start + timedelta(days=14))
     
     target_event = None
     for ev in events:
@@ -590,7 +591,8 @@ async def start_edit_date(callback: types.CallbackQuery, state: FSMContext):
     
     now = get_local_time()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    events = get_events_for_range(today_start - timedelta(days=7), today_start + timedelta(days=14))
+    # Ищем в широком диапазоне
+    events = get_events_for_range(today_start - timedelta(days=14), today_start + timedelta(days=14))
     
     target_event = None
     for ev in events:
