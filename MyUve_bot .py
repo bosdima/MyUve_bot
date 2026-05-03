@@ -15,7 +15,7 @@ from aiogram.enums import ParseMode
 import pytz
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.4.0"
+BOT_VERSION = "1.4.1"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -133,7 +133,8 @@ def get_events_for_range(start_date, end_date):
     logger.info(f"Загрузка событий с {start_date} (MSK) по {end_date} (MSK)")
 
     try:
-        events = calendar.date_search(start=start_utc, end=end_utc, expand=True)
+        # Используем search, так как date_search устарел, но с правильными параметрами
+        events = calendar.search(start=start_utc, end=end_utc, expand=True)
         result = []
         
         for event in events:
@@ -276,7 +277,7 @@ def get_manage_list_keyboard(events):
     for ev in events:
         date_str = format_date_full(ev['time'])
         time_str = format_time_only(ev['time'])
-        # Используем префикс edit_ вместо del_
+        # Префикс edit_ для вызова меню действий
         btn_text = f"✏️ {ev['summary']} ({date_str} {time_str})"
         builder.button(text=btn_text, callback_data=f"edit_{ev['uid']}")
 
@@ -286,8 +287,9 @@ def get_manage_list_keyboard(events):
 
 def get_edit_action_keyboard(uid):
     builder = InlineKeyboardBuilder()
-    builder.button(text="📝 Изменить текст", callback_data=f"edit_text_{uid}")
-    builder.button(text="📅 Изменить дату/время", callback_data=f"edit_date_{uid}")
+    # Четкие префиксы для действий
+    builder.button(text="📝 Изменить текст", callback_data=f"act_edit_text_{uid}")
+    builder.button(text="📅 Изменить дату/время", callback_data=f"act_edit_date_{uid}")
     builder.button(text="❌ Удалить", callback_data=f"del_{uid}")
     builder.button(text="🔙 Назад", callback_data="manage_list")
     builder.adjust(1)
@@ -491,18 +493,15 @@ async def show_manage_list(callback: types.CallbackQuery):
         await send_temp_message("Нет задач для редактирования в этом периоде.", reply_markup=kb)
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("edit_"))
+# 1. Обработчик нажатия на задачу в списке управления (префикс edit_)
+@dp.callback_query(F.data.startswith("edit_") & ~F.data.startswith("act_edit_"))
 async def ask_edit_action(callback: types.CallbackQuery):
-    # Проверяем, что это именно выбор действия, а не изменение текста/даты
-    parts = callback.data.split("_")
-    if len(parts) == 2: # format: edit_UID
-        uid = parts[1]
-        kb = get_edit_action_keyboard(uid)
-        await callback.message.edit_text(f"Что сделать с задачей?", reply_markup=kb)
-        await callback.answer()
-    else:
-        await callback.answer()
+    uid = callback.data.split("_")[1]
+    kb = get_edit_action_keyboard(uid)
+    await callback.message.edit_text(f"Что сделать с задачей?", reply_markup=kb)
+    await callback.answer()
 
+# 2. Обработчик удаления (префикс del_)
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_from_list(callback: types.CallbackQuery):
     uid = callback.data.split("_")[1]
@@ -512,14 +511,14 @@ async def delete_from_list(callback: types.CallbackQuery):
     else:
         await callback.answer("Ошибка удаления", show_alert=True)
 
-@dp.callback_query(F.data.startswith("edit_text_"))
+# 3. Обработчик изменения текста (префикс act_edit_text_)
+@dp.callback_query(F.data.startswith("act_edit_text_"))
 async def start_edit_text(callback: types.CallbackQuery, state: FSMContext):
-    uid = callback.data.split("_")[2]
+    uid = callback.data.split("_")[3]
     
-    # Находим событие в текущем отображаемом диапазоне, чтобы взять его время
+    # Находим событие, чтобы сохранить его текущее время
     now = get_local_time()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    # Ищем в широком диапазоне, чтобы наверняка найти
     events = get_events_for_range(today_start - timedelta(days=7), today_start + timedelta(days=14))
     
     target_event = None
@@ -545,9 +544,7 @@ async def process_new_text_final(message: types.Message, state: FSMContext):
     old_time = data.get('original_time')
     
     if uid and old_time:
-        # 1. Удаляем старое
         delete_event(uid)
-        # 2. Создаем новое с тем же временем
         if create_event_in_yandex(new_text, old_time):
             await message.answer("✅ Текст изменен!")
             await send_or_edit_main_message()
@@ -558,9 +555,10 @@ async def process_new_text_final(message: types.Message, state: FSMContext):
         
     await state.clear()
 
-@dp.callback_query(F.data.startswith("edit_date_"))
+# 4. Обработчик изменения даты (префикс act_edit_date_)
+@dp.callback_query(F.data.startswith("act_edit_date_"))
 async def start_edit_date(callback: types.CallbackQuery, state: FSMContext):
-    uid = callback.data.split("_")[2]
+    uid = callback.data.split("_")[3]
     
     now = get_local_time()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
