@@ -15,7 +15,7 @@ from aiogram.enums import ParseMode
 import pytz
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.3.9"
+BOT_VERSION = "1.4.0"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -493,10 +493,15 @@ async def show_manage_list(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("edit_"))
 async def ask_edit_action(callback: types.CallbackQuery):
-    uid = callback.data.split("_")[1]
-    kb = get_edit_action_keyboard(uid)
-    await callback.message.edit_text(f"Что сделать с задачей?", reply_markup=kb)
-    await callback.answer()
+    # Проверяем, что это именно выбор действия, а не изменение текста/даты
+    parts = callback.data.split("_")
+    if len(parts) == 2: # format: edit_UID
+        uid = parts[1]
+        kb = get_edit_action_keyboard(uid)
+        await callback.message.edit_text(f"Что сделать с задачей?", reply_markup=kb)
+        await callback.answer()
+    else:
+        await callback.answer()
 
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_from_list(callback: types.CallbackQuery):
@@ -509,38 +514,6 @@ async def delete_from_list(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("edit_text_"))
 async def start_edit_text(callback: types.CallbackQuery, state: FSMContext):
-    uid = callback.data.split("_")[2]
-    # Сохраняем UID в состояние
-    await state.update_data(original_uid=uid)
-    await callback.message.edit_text("✍️ Введите новый текст задачи:", reply_markup=None)
-    await state.set_state(EditNoteState.waiting_for_new_text)
-    await callback.answer()
-
-@dp.message(EditNoteState.waiting_for_new_text)
-async def process_new_text(message: types.Message, state: FSMContext):
-    new_text = message.text
-    data = await state.get_data()
-    uid = data.get('original_uid')
-    
-    # Чтобы изменить текст, нам нужно знать время старого события.
-    # Проще всего: удалить старое и создать новое. Но мы не знаем время из UID напрямую в этом хендлере.
-    # Поэтому мы должны были сохранить и время в состоянии при нажатии edit_text_, но мы этого не сделали.
-    # Исправление: При нажатии edit_text_ нам нужно найти событие по UID, чтобы узнать его время.
-    
-    # Поиск события по UID (грубый метод, перебираем недавние, лучше сохранять время в state заранее)
-    # Для простоты, давайте сохраним время в state при нажатии кнопки edit_text_
-    # Но так как хендлер уже ушел, сделаем так:
-    
-    # В реальной системе лучше хранить кэш событий. Здесь мы поступим хитро:
-    # Пользователь нажал "Изменить текст". Мы не знаем время. 
-    # Поэтому изменим логику: при нажатии edit_text_ мы должны были найти событие.
-    
-    # Исправляем start_edit_text:
-    pass # См. исправление ниже в новом start_edit_text
-
-# ПЕРЕОПРЕДЕЛЯЕМ start_edit_text ЧТОБЫ СОХРАНИТЬ ВРЕМЯ
-@dp.callback_query(F.data.startswith("edit_text_"))
-async def start_edit_text_fixed(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.data.split("_")[2]
     
     # Находим событие в текущем отображаемом диапазоне, чтобы взять его время
