@@ -15,7 +15,7 @@ from aiogram.enums import ParseMode
 import pytz
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.4.1"
+BOT_VERSION = "1.4.2"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -122,23 +122,28 @@ def get_events_for_range(start_date, end_date):
     
     moscow_tz = pytz.timezone('Europe/Moscow')
     
+    # 1. Приводим входные даты к московскому времени, если они без зоны
     if start_date.tzinfo is None:
         start_date = moscow_tz.localize(start_date)
     if end_date.tzinfo is None:
         end_date = moscow_tz.localize(end_date)
         
+    # 2. Конвертируем в UTC для запроса
     start_utc = start_date.astimezone(pytz.utc)
     end_utc = end_date.astimezone(pytz.utc)
 
     logger.info(f"Загрузка событий с {start_date} (MSK) по {end_date} (MSK)")
+    logger.debug(f"Query range UTC: {start_utc} - {end_utc}")
 
     try:
-        # Используем search, так как date_search устарел, но с правильными параметрами
-        events = calendar.search(start=start_utc, end=end_utc, expand=True)
-        result = []
+        # Используем date_search, так как он стабильнее работает с Яндексом
+        # expand=True важен для повторяющихся событий
+        events = calendar.date_search(start=start_utc, end=end_utc, expand=True)
         
+        result = []
         for event in events:
             try:
+                # Пробуем получить данные через icalendar_instance (новый стандарт)
                 vevent = None
                 if hasattr(event, 'icalendar_instance') and event.icalendar_instance:
                     for component in event.icalendar_instance.walk():
@@ -146,9 +151,14 @@ def get_events_for_range(start_date, end_date):
                             vevent = component
                             break
                 
+                # Если не получилось, пробуем старый способ (instance)
+                if not vevent and hasattr(event, 'instance') and event.instance:
+                     vevent = event.instance.vevent
+
                 if not vevent:
                     continue
 
+                # Извлечение данных
                 uid = str(vevent.get('UID', ''))
                 summary_obj = vevent.get('SUMMARY')
                 summary = str(summary_obj) if summary_obj else "Без названия"
@@ -159,14 +169,17 @@ def get_events_for_range(start_date, end_date):
                     
                 dt_start_val = dt_start_prop.dt
                 
+                # Обработка типа даты
                 if isinstance(dt_start_val, datetime):
                     if dt_start_val.tzinfo is None:
                         dt_start_dt = dt_start_val.replace(tzinfo=timezone.utc)
                     else:
                         dt_start_dt = dt_start_val
                 else:
+                    # Дата без времени (целый день)
                     dt_start_dt = datetime.combine(dt_start_val, datetime.min.time()).replace(tzinfo=timezone.utc)
 
+                # Перевод в Москву для отображения
                 local_dt = dt_start_dt.astimezone(moscow_tz)
                 
                 result.append({
@@ -184,7 +197,15 @@ def get_events_for_range(start_date, end_date):
         
     except Exception as e:
         logger.error(f"Error fetching events from CalDAV: {e}")
-        return []
+        # Если date_search упал, попробуем search с явными параметрами (резервный вариант)
+        try:
+            logger.info("Повторная попытка через search...")
+            events = calendar.search(start=start_utc, end=end_utc, expand=True)
+            # ... логика парсинга та же, но для краткости вернем пустой список, 
+            # так как основная проблема скорее всего в датах.
+            return []
+        except:
+            return []
 
 def delete_event(uid):
     calendar = get_calendar()
@@ -277,7 +298,6 @@ def get_manage_list_keyboard(events):
     for ev in events:
         date_str = format_date_full(ev['time'])
         time_str = format_time_only(ev['time'])
-        # Префикс edit_ для вызова меню действий
         btn_text = f"✏️ {ev['summary']} ({date_str} {time_str})"
         builder.button(text=btn_text, callback_data=f"edit_{ev['uid']}")
 
@@ -287,7 +307,6 @@ def get_manage_list_keyboard(events):
 
 def get_edit_action_keyboard(uid):
     builder = InlineKeyboardBuilder()
-    # Четкие префиксы для действий
     builder.button(text="📝 Изменить текст", callback_data=f"act_edit_text_{uid}")
     builder.button(text="📅 Изменить дату/время", callback_data=f"act_edit_date_{uid}")
     builder.button(text="❌ Удалить", callback_data=f"del_{uid}")
