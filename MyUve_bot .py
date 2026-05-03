@@ -13,9 +13,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ParseMode
 import pytz
+from icalendar import Calendar as IcalCalendar
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.3.5"
+BOT_VERSION = "1.3.6" # Обновил версию
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -89,7 +90,6 @@ async def delete_temp_messages():
     """Автоматическое удаление временных сообщений (бота и пользователя) через 5 минут"""
     while True:
         await asyncio.sleep(300)  # 5 минут
-        # Копируем список, чтобы безопасно итерироваться при удалении
         for msg_id in TEMP_MESSAGES[:]:
             try:
                 await bot.delete_message(ADMIN_ID, msg_id)
@@ -97,7 +97,6 @@ async def delete_temp_messages():
                     TEMP_MESSAGES.remove(msg_id)
                 logger.info(f"Временное сообщение {msg_id} удалено")
             except Exception as e:
-                # Если сообщение уже удалено или не найдено, просто убираем из списка
                 if msg_id in TEMP_MESSAGES:
                     TEMP_MESSAGES.remove(msg_id)
                 else:
@@ -127,7 +126,7 @@ def get_calendar():
 def get_events_for_week(start_date, end_date):
     """
     Получает события за неделю.
-    start_date и end_date - datetime объекты (наивные или с таймзоной, считаются Москвой).
+    Использует icalendar_instance для совместимости с новыми версиями caldav.
     """
     calendar = get_calendar()
     if not calendar:
@@ -148,40 +147,55 @@ def get_events_for_week(start_date, end_date):
     logger.debug(f"Query range UTC: {start_utc} - {end_utc}")
 
     try:
-        # expand=True важен для повторяющихся событий
-        events = calendar.date_search(start=start_utc, end=end_utc, expand=True)
+        # Используем search вместо date_search (date_search устарел)
+        events = calendar.search(start=start_utc, end=end_utc, expand=True)
         result = []
         
         for event in events:
             try:
-                # Исправлено: проверка на наличие instance
-                if not hasattr(event, 'instance') or event.instance is None:
+                # Получаем объект icalendar
+                ical_event = event.icalendar_instance
+                
+                if not ical_event:
                     continue
                     
-                vevent = event.instance.vevent
+                # В icalendar_instance содержится компонент VEVENT
+                # Иногда это может быть список компонентов, но обычно один
+                vevent = None
+                for component in ical_event.walk():
+                    if component.name == "VEVENT":
+                        vevent = component
+                        break
                 
-                # Получаем время начала
-                dt_start = vevent.dtstart.value
+                if not vevent:
+                    continue
+
+                # Получаем UID
+                uid = str(vevent.get('UID', ''))
                 
                 # Получаем название
-                summary = str(vevent.summary.value) if vevent.summary else "Без названия"
+                summary_obj = vevent.get('SUMMARY')
+                summary = str(summary_obj) if summary_obj else "Без названия"
                 
-                # Получаем UID
-                uid = str(vevent.uid.value) if vevent.uid else None
+                # Получаем время начала
+                dt_start_prop = vevent.get('DTSTART')
+                if not dt_start_prop:
+                    continue
+                    
+                dt_start_val = dt_start_prop.dt
                 
-                # --- Обработка типа даты (Дата или Дата+Время) ---
-                
-                # Если это просто дата (без времени), например, целый день
-                if hasattr(dt_start, 'date') and not hasattr(dt_start, 'hour'):
-                    # Создаем datetime на начало этого дня в UTC
-                    dt_start_dt = datetime.combine(dt_start, datetime.min.time()).replace(tzinfo=timezone.utc)
-                else:
-                    # Если это datetime
-                    if dt_start.tzinfo is None:
-                        # Если время без зоны, считаем его UTC
-                        dt_start_dt = dt_start.replace(tzinfo=timezone.utc)
+                # Обработка типа даты (Дата или Дата+Время)
+                if isinstance(dt_start_val, datetime):
+                    # Это дата со временем
+                    if dt_start_val.tzinfo is None:
+                        # Если время без зоны, считаем его UTC (стандарт CalDAV)
+                        dt_start_dt = dt_start_val.replace(tzinfo=timezone.utc)
                     else:
-                        dt_start_dt = dt_start
+                        dt_start_dt = dt_start_val
+                else:
+                    # Это просто дата (целый день)
+                    # Создаем datetime на начало этого дня в UTC
+                    dt_start_dt = datetime.combine(dt_start_val, datetime.min.time()).replace(tzinfo=timezone.utc)
 
                 # Переводим полученное время обратно в Москву для отображения пользователю
                 local_dt = dt_start_dt.astimezone(moscow_tz)
@@ -196,6 +210,8 @@ def get_events_for_week(start_date, end_date):
                 })
             except Exception as e:
                 logger.warning(f"Ошибка парсинга отдельного события: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
                 continue
         
         # Сортировка по времени
@@ -258,14 +274,12 @@ def get_main_nav_keyboard(week_start):
     week_end = week_start + timedelta(days=6)
     builder = InlineKeyboardBuilder()
     
-    # СТРОКА 1: Обновить и Сегодня/Завтра (в одной строке)
     today = get_local_time().replace(hour=0, minute=0, second=0, microsecond=0)
     builder.row(
         InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"),
         InlineKeyboardButton(text="📅 Сегодня/Завтра", callback_data=f"nav_today_{int(today.timestamp())}")
     )
 
-    # СТРОКА 2: Навигация по неделям
     prev_week = week_start - timedelta(days=7)
     next_week = week_start + timedelta(days=7)
 
@@ -275,7 +289,6 @@ def get_main_nav_keyboard(week_start):
         InlineKeyboardButton(text="Вперед ➡️", callback_data=f"nav_next_{int(next_week.timestamp())}")
     )
 
-    # СТРОКА 3: Управление
     builder.row(InlineKeyboardButton(text="✏️ Управление (Удалить)", callback_data="manage_list"))
 
     return builder.as_markup()
@@ -331,7 +344,6 @@ async def build_week_report(week_start):
     global CURRENT_WEEK_START
     CURRENT_WEEK_START = week_start
     
-    # Конец недели: воскресенье 23:59:59
     week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
     
     events = get_events_for_week(week_start, week_end)
@@ -375,7 +387,6 @@ async def send_or_edit_main_message(message=None, force_current_week=False):
             if message:
                 sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
-                # Приветственное сообщение тоже временное
                 temp_msg = await message.answer("Используйте кнопки внизу для быстрого доступа.", reply_markup=get_reply_keyboard())
                 add_to_delete_list(temp_msg)
             else:
@@ -411,7 +422,6 @@ class AddNoteState(StatesGroup):
 async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
     await state.clear()
-    # Сообщение /start тоже добавляем в список на удаление
     add_to_delete_list(message)
     await send_or_edit_main_message(message, force_current_week=True)
 
@@ -461,7 +471,6 @@ async def show_manage_list(callback: types.CallbackQuery):
 async def delete_from_list(callback: types.CallbackQuery):
     uid = callback.data.split("_")[1]
     if delete_event(uid):
-        # Сообщение со списком удаляется автоматически через 5 мин, но мы можем обновить его текст сразу
         await callback.message.edit_text("✅ Задача удалена.", reply_markup=None)
         await send_or_edit_main_message()
     else:
@@ -474,7 +483,6 @@ async def close_manage(callback: types.CallbackQuery):
 
 @dp.message(F.text == "➕ Добавить заметку")
 async def start_add_note(message: types.Message, state: FSMContext):
-    # Добавляем сообщение пользователя в список на удаление
     add_to_delete_list(message)
     prompt = await message.answer("✍️ Введите текст новой заметки:", parse_mode=ParseMode.MARKDOWN)
     add_to_delete_list(prompt)
@@ -482,7 +490,6 @@ async def start_add_note(message: types.Message, state: FSMContext):
 
 @dp.message(AddNoteState.waiting_for_text)
 async def process_note_text(message: types.Message, state: FSMContext):
-    # Текст заметки от пользователя тоже удалим
     add_to_delete_list(message)
     await state.update_data(note_text=message.text)
     prompt = await message.answer(f"Текст: {message.text}\nКогда добавить?", reply_markup=get_time_options_kb())
@@ -549,11 +556,9 @@ async def notification_scheduler():
                 
                 should_notify = False
                 if last_notify is None:
-                    # Если уведомление еще не отправляли и событие было менее часа назад
                     if (now - event_time).total_seconds() < 3600: 
                         should_notify = True
                 else:
-                    # Если прошло больше часа с последнего уведомления
                     if (now - last_notify).total_seconds() >= 3600:
                         should_notify = True
                 
