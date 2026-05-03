@@ -15,7 +15,7 @@ from aiogram.enums import ParseMode
 import pytz
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.3.8"
+BOT_VERSION = "1.3.9"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -52,9 +52,8 @@ dp = Dispatcher()
 
 # Глобальные переменные состояния
 MAIN_MESSAGE_ID = None
-# Режимы отображения: 'WEEK' (неделя) или 'TODAY_TOMORROW' (сегодня+завтра)
 VIEW_MODE = 'TODAY_TOMORROW' 
-CURRENT_START_DATE = None # Начало периода отображения
+CURRENT_START_DATE = None 
 TEMP_MESSAGES = []
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -233,11 +232,10 @@ def get_reply_keyboard():
     return builder.as_markup(resize_keyboard=True, one_time_keyboard=False)
 
 def get_main_nav_keyboard():
-    global VIEW_MODE, CURRENT_START_DATE
+    global VIEW_MODE
     
     builder = InlineKeyboardBuilder()
     
-    # Кнопка переключения режима
     if VIEW_MODE == 'TODAY_TOMORROW':
         mode_btn_text = "📅 Показать всю неделю"
         mode_cb_data = "switch_to_week"
@@ -247,7 +245,6 @@ def get_main_nav_keyboard():
         
     builder.row(InlineKeyboardButton(text=mode_btn_text, callback_data=mode_cb_data))
 
-    # Навигация зависит от режима
     if VIEW_MODE == 'WEEK':
         week_start = CURRENT_START_DATE
         prev_week = week_start - timedelta(days=7)
@@ -261,9 +258,6 @@ def get_main_nav_keyboard():
         builder.row(
              InlineKeyboardButton(text=f"📆 {week_start.strftime('%d.%m')} - {week_end.strftime('%d.%m')}", callback_data="current_week_info")
         )
-    else:
-        # В режиме Сегодня/Завтра навигация не нужна, только обновление
-        pass
 
     builder.row(
         InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"),
@@ -282,11 +276,21 @@ def get_manage_list_keyboard(events):
     for ev in events:
         date_str = format_date_full(ev['time'])
         time_str = format_time_only(ev['time'])
-        btn_text = f"❌ {ev['summary']} ({date_str} {time_str})"
-        builder.button(text=btn_text, callback_data=f"del_{ev['uid']}")
+        # Используем префикс edit_ вместо del_
+        btn_text = f"✏️ {ev['summary']} ({date_str} {time_str})"
+        builder.button(text=btn_text, callback_data=f"edit_{ev['uid']}")
 
     builder.adjust(1)
     builder.row(InlineKeyboardButton(text="🔙 Закрыть список", callback_data="close_manage"))
+    return builder.as_markup()
+
+def get_edit_action_keyboard(uid):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📝 Изменить текст", callback_data=f"edit_text_{uid}")
+    builder.button(text="📅 Изменить дату/время", callback_data=f"edit_date_{uid}")
+    builder.button(text="❌ Удалить", callback_data=f"del_{uid}")
+    builder.button(text="🔙 Назад", callback_data="manage_list")
+    builder.adjust(1)
     return builder.as_markup()
 
 def get_notification_keyboard(uid):
@@ -326,15 +330,13 @@ async def build_report():
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     
     if VIEW_MODE == 'TODAY_TOMORROW':
-        # Показываем сегодня и завтра
         start_date = today_start
-        end_date = today_start + timedelta(days=2) # До начала послезавтра
+        end_date = today_start + timedelta(days=2)
         
         header = f"**🔥 Ближайшие дела (Сегодня и Завтра)**\n"
         header += f"_Период: {format_date_full(start_date)} — {format_date_full(end_date - timedelta(seconds=1))}_\n\n"
         
     else:
-        # Показываем неделю
         if CURRENT_START_DATE is None:
             CURRENT_START_DATE = get_week_start(now)
             
@@ -358,9 +360,9 @@ async def build_report():
             
             status_icon = ""
             if ev['time'] < now:
-                status_icon = "⚠️ " # Просрочено
+                status_icon = "⚠️ "
             elif ev['time'].date() == now.date():
-                status_icon = "📍 " # Сегодня
+                status_icon = "📍 "
             
             text += f"{status_icon}`{time_str}` — **{ev['summary']}**\n_{date_str}_\n\n"
 
@@ -403,17 +405,24 @@ async def send_temp_message(text, reply_markup=None):
     add_to_delete_list(msg)
     return msg
 
-# --- ОБРАБОТЧИКИ ---
+# --- ОБРАБОТЧИКИ И СОСТОЯНИЯ ---
+
 class AddNoteState(StatesGroup):
     waiting_for_text = State()
     waiting_for_time = State()
+
+class EditNoteState(StatesGroup):
+    waiting_for_new_text = State()
+    waiting_for_new_time = State()
+    original_uid = State()
+    original_summary = State()
+    original_time = State()
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
     await state.clear()
     add_to_delete_list(message)
-    # При старте всегда сбрасываем на режим Сегодня/Завтра
     global VIEW_MODE, CURRENT_START_DATE
     VIEW_MODE = 'TODAY_TOMORROW'
     CURRENT_START_DATE = None
@@ -440,7 +449,7 @@ async def nav_prev(callback: types.CallbackQuery):
     ts = int(callback.data.split("_")[2])
     new_start = datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).astimezone(pytz.timezone('Europe/Moscow'))
     global CURRENT_START_DATE, VIEW_MODE
-    VIEW_MODE = 'WEEK' # Переключаем в режим недели при навигации
+    VIEW_MODE = 'WEEK'
     CURRENT_START_DATE = new_start
     await callback.answer()
     await send_or_edit_main_message()
@@ -462,7 +471,6 @@ async def force_refresh(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "manage_list")
 async def show_manage_list(callback: types.CallbackQuery):
-    # Для управления показываем события за текущий видимый период
     global VIEW_MODE, CURRENT_START_DATE
     now = get_local_time()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -478,9 +486,16 @@ async def show_manage_list(callback: types.CallbackQuery):
     events = get_events_for_range(start_date, end_date)
     kb = get_manage_list_keyboard(events)
     if events:
-        await send_temp_message("Выберите задачу для удаления:", reply_markup=kb)
+        await send_temp_message("Выберите задачу для редактирования:", reply_markup=kb)
     else:
-        await send_temp_message("Нет задач для удаления в этом периоде.", reply_markup=kb)
+        await send_temp_message("Нет задач для редактирования в этом периоде.", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("edit_"))
+async def ask_edit_action(callback: types.CallbackQuery):
+    uid = callback.data.split("_")[1]
+    kb = get_edit_action_keyboard(uid)
+    await callback.message.edit_text(f"Что сделать с задачей?", reply_markup=kb)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("del_"))
@@ -491,6 +506,128 @@ async def delete_from_list(callback: types.CallbackQuery):
         await send_or_edit_main_message()
     else:
         await callback.answer("Ошибка удаления", show_alert=True)
+
+@dp.callback_query(F.data.startswith("edit_text_"))
+async def start_edit_text(callback: types.CallbackQuery, state: FSMContext):
+    uid = callback.data.split("_")[2]
+    # Сохраняем UID в состояние
+    await state.update_data(original_uid=uid)
+    await callback.message.edit_text("✍️ Введите новый текст задачи:", reply_markup=None)
+    await state.set_state(EditNoteState.waiting_for_new_text)
+    await callback.answer()
+
+@dp.message(EditNoteState.waiting_for_new_text)
+async def process_new_text(message: types.Message, state: FSMContext):
+    new_text = message.text
+    data = await state.get_data()
+    uid = data.get('original_uid')
+    
+    # Чтобы изменить текст, нам нужно знать время старого события.
+    # Проще всего: удалить старое и создать новое. Но мы не знаем время из UID напрямую в этом хендлере.
+    # Поэтому мы должны были сохранить и время в состоянии при нажатии edit_text_, но мы этого не сделали.
+    # Исправление: При нажатии edit_text_ нам нужно найти событие по UID, чтобы узнать его время.
+    
+    # Поиск события по UID (грубый метод, перебираем недавние, лучше сохранять время в state заранее)
+    # Для простоты, давайте сохраним время в state при нажатии кнопки edit_text_
+    # Но так как хендлер уже ушел, сделаем так:
+    
+    # В реальной системе лучше хранить кэш событий. Здесь мы поступим хитро:
+    # Пользователь нажал "Изменить текст". Мы не знаем время. 
+    # Поэтому изменим логику: при нажатии edit_text_ мы должны были найти событие.
+    
+    # Исправляем start_edit_text:
+    pass # См. исправление ниже в новом start_edit_text
+
+# ПЕРЕОПРЕДЕЛЯЕМ start_edit_text ЧТОБЫ СОХРАНИТЬ ВРЕМЯ
+@dp.callback_query(F.data.startswith("edit_text_"))
+async def start_edit_text_fixed(callback: types.CallbackQuery, state: FSMContext):
+    uid = callback.data.split("_")[2]
+    
+    # Находим событие в текущем отображаемом диапазоне, чтобы взять его время
+    now = get_local_time()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Ищем в широком диапазоне, чтобы наверняка найти
+    events = get_events_for_range(today_start - timedelta(days=7), today_start + timedelta(days=14))
+    
+    target_event = None
+    for ev in events:
+        if ev['uid'] == uid:
+            target_event = ev
+            break
+            
+    if not target_event:
+        await callback.answer("Ошибка: Событие не найдено", show_alert=True)
+        return
+
+    await state.update_data(original_uid=uid, original_time=target_event['time'])
+    await callback.message.edit_text(f"Текущий текст: {target_event['summary']}\n\n✍️ Введите новый текст:", reply_markup=None)
+    await state.set_state(EditNoteState.waiting_for_new_text)
+    await callback.answer()
+
+@dp.message(EditNoteState.waiting_for_new_text)
+async def process_new_text_final(message: types.Message, state: FSMContext):
+    new_text = message.text
+    data = await state.get_data()
+    uid = data.get('original_uid')
+    old_time = data.get('original_time')
+    
+    if uid and old_time:
+        # 1. Удаляем старое
+        delete_event(uid)
+        # 2. Создаем новое с тем же временем
+        if create_event_in_yandex(new_text, old_time):
+            await message.answer("✅ Текст изменен!")
+            await send_or_edit_main_message()
+        else:
+            await message.answer("❌ Ошибка при создании нового события.")
+    else:
+        await message.answer("❌ Ошибка данных.")
+        
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("edit_date_"))
+async def start_edit_date(callback: types.CallbackQuery, state: FSMContext):
+    uid = callback.data.split("_")[2]
+    
+    now = get_local_time()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    events = get_events_for_range(today_start - timedelta(days=7), today_start + timedelta(days=14))
+    
+    target_event = None
+    for ev in events:
+        if ev['uid'] == uid:
+            target_event = ev
+            break
+            
+    if not target_event:
+        await callback.answer("Ошибка: Событие не найдено", show_alert=True)
+        return
+
+    await state.update_data(original_uid=uid, original_summary=target_event['summary'])
+    await callback.message.edit_text(f"Задача: {target_event['summary']}\n\n📅 Выберите новое время:", reply_markup=get_time_options_kb())
+    await state.set_state(EditNoteState.waiting_for_new_time)
+    await callback.answer()
+
+@dp.callback_query(EditNoteState.waiting_for_new_time, F.data.startswith("time_"))
+async def process_new_time(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    uid = data.get('original_uid')
+    summary = data.get('original_summary')
+    
+    ts = int(callback.data.split("_")[1])
+    new_time = datetime.fromtimestamp(ts, tz=pytz.timezone('Europe/Moscow'))
+    
+    if uid and summary:
+        delete_event(uid)
+        if create_event_in_yandex(summary, new_time):
+            await callback.message.edit_text("✅ Дата и время изменены!", reply_markup=None)
+            await send_or_edit_main_message()
+        else:
+            await callback.message.edit_text("❌ Ошибка при создании.", reply_markup=None)
+    else:
+        await callback.message.edit_text("❌ Ошибка данных.", reply_markup=None)
+        
+    await state.clear()
 
 @dp.callback_query(F.data == "close_manage")
 async def close_manage(callback: types.CallbackQuery):
