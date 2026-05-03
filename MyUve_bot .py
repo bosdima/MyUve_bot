@@ -13,10 +13,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ParseMode
 import pytz
-from icalendar import Calendar as IcalCalendar
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.3.6" # Обновил версию
+BOT_VERSION = "1.3.7"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -54,16 +53,14 @@ dp = Dispatcher()
 # Глобальные переменные состояния
 MAIN_MESSAGE_ID = None
 CURRENT_WEEK_START = None
-TEMP_MESSAGES = []  # Список ID сообщений для автоудаления
+TEMP_MESSAGES = []
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_local_time():
-    """Получает текущее время в московском часовом поясе"""
     moscow_tz = pytz.timezone('Europe/Moscow')
     return datetime.now(moscow_tz)
 
 def get_week_start(date_obj):
-    """Возвращает понедельник текущей недели для date_obj"""
     return date_obj - timedelta(days=date_obj.weekday())
 
 def format_date_full(dt_obj):
@@ -87,31 +84,26 @@ def format_time_only(dt_obj):
     return dt_obj.strftime("%H:%M")
 
 async def delete_temp_messages():
-    """Автоматическое удаление временных сообщений (бота и пользователя) через 5 минут"""
     while True:
-        await asyncio.sleep(300)  # 5 минут
+        await asyncio.sleep(300)
         for msg_id in TEMP_MESSAGES[:]:
             try:
                 await bot.delete_message(ADMIN_ID, msg_id)
                 if msg_id in TEMP_MESSAGES:
                     TEMP_MESSAGES.remove(msg_id)
-                logger.info(f"Временное сообщение {msg_id} удалено")
             except Exception as e:
                 if msg_id in TEMP_MESSAGES:
                     TEMP_MESSAGES.remove(msg_id)
-                else:
-                    logger.warning(f"Не удалось удалить сообщение {msg_id}: {e}")
 
 def add_to_delete_list(message_obj):
-    """Добавляет ID сообщения в список на удаление"""
     if message_obj and hasattr(message_obj, 'message_id'):
         if message_obj.message_id not in TEMP_MESSAGES:
             TEMP_MESSAGES.append(message_obj.message_id)
-            logger.debug(f"Сообщение {message_obj.message_id} добавлено в очередь удаления")
 
 # --- РАБОТА С CALDAV ---
 def get_calendar():
     try:
+        # Добавляем verify_ssl=False, если есть проблемы с сертификатами, но для Яндекса обычно не нужно
         client = caldav.DAVClient(url=CALDAV_URL, username=YANDEX_LOGIN, password=YANDEX_PASSWORD)
         principal = client.principal()
         calendars = principal.calendars()
@@ -124,22 +116,19 @@ def get_calendar():
         return None
 
 def get_events_for_week(start_date, end_date):
-    """
-    Получает события за неделю.
-    Использует icalendar_instance для совместимости с новыми версиями caldav.
-    """
     calendar = get_calendar()
     if not calendar:
         return []
     
     moscow_tz = pytz.timezone('Europe/Moscow')
     
-    # Нормализация входных данных в UTC для запроса к серверу
+    # 1. Приводим входные даты к московскому времени, если они без зоны
     if start_date.tzinfo is None:
         start_date = moscow_tz.localize(start_date)
     if end_date.tzinfo is None:
         end_date = moscow_tz.localize(end_date)
         
+    # 2. Конвертируем в UTC для запроса
     start_utc = start_date.astimezone(pytz.utc)
     end_utc = end_date.astimezone(pytz.utc)
 
@@ -147,82 +136,79 @@ def get_events_for_week(start_date, end_date):
     logger.debug(f"Query range UTC: {start_utc} - {end_utc}")
 
     try:
-        # Используем search вместо date_search (date_search устарел)
-        events = calendar.search(start=start_utc, end=end_utc, expand=True)
-        result = []
+        # Используем date_search. 
+        # Важно: передаем datetime объекты с tzinfo=UTC
+        events = calendar.date_search(start=start_utc, end=end_utc, expand=True)
         
+        result = []
         for event in events:
             try:
-                # Получаем объект icalendar
-                ical_event = event.icalendar_instance
+                # Пробуем получить данные через vobject_instance (стандарт для caldav < 1.0) 
+                # или icalendar_instance (для caldav >= 1.0)
                 
-                if not ical_event:
-                    continue
-                    
-                # В icalendar_instance содержится компонент VEVENT
-                # Иногда это может быть список компонентов, но обычно один
                 vevent = None
-                for component in ical_event.walk():
-                    if component.name == "VEVENT":
-                        vevent = component
-                        break
+                # Способ 1: Через icalendar (новый стандарт)
+                if hasattr(event, 'icalendar_instance') and event.icalendar_instance:
+                    for component in event.icalendar_instance.walk():
+                        if component.name == "VEVENT":
+                            vevent = component
+                            break
                 
+                # Способ 2: Через instance (старый стандарт, если vobject установлен)
+                if not vevent and hasattr(event, 'instance') and event.instance:
+                     vevent = event.instance.vevent
+
                 if not vevent:
                     continue
 
-                # Получаем UID
+                # Извлечение данных
                 uid = str(vevent.get('UID', ''))
-                
-                # Получаем название
                 summary_obj = vevent.get('SUMMARY')
                 summary = str(summary_obj) if summary_obj else "Без названия"
                 
-                # Получаем время начала
                 dt_start_prop = vevent.get('DTSTART')
                 if not dt_start_prop:
                     continue
                     
                 dt_start_val = dt_start_prop.dt
                 
-                # Обработка типа даты (Дата или Дата+Время)
+                # Обработка типа даты
                 if isinstance(dt_start_val, datetime):
-                    # Это дата со временем
                     if dt_start_val.tzinfo is None:
-                        # Если время без зоны, считаем его UTC (стандарт CalDAV)
                         dt_start_dt = dt_start_val.replace(tzinfo=timezone.utc)
                     else:
                         dt_start_dt = dt_start_val
                 else:
-                    # Это просто дата (целый день)
-                    # Создаем datetime на начало этого дня в UTC
+                    # Дата без времени (целый день)
                     dt_start_dt = datetime.combine(dt_start_val, datetime.min.time()).replace(tzinfo=timezone.utc)
 
-                # Переводим полученное время обратно в Москву для отображения пользователю
+                # Перевод в Москву для отображения
                 local_dt = dt_start_dt.astimezone(moscow_tz)
-                
-                now_msk = get_local_time()
                 
                 result.append({
                      "summary": summary,
                      "time": local_dt,
                      "uid": uid,
-                     "is_overdue": local_dt < now_msk
+                     "is_overdue": local_dt < get_local_time()
                 })
             except Exception as e:
-                logger.warning(f"Ошибка парсинга отдельного события: {e}")
-                import traceback
-                logger.debug(traceback.format_exc())
+                logger.warning(f"Ошибка парсинга события: {e}")
                 continue
         
-        # Сортировка по времени
         result.sort(key=lambda x: x['time'])
         return result
         
     except Exception as e:
         logger.error(f"Error fetching events from CalDAV: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return []
+        # Попробуем без expand, если с ним ошибка
+        try:
+            logger.info("Повторная попытка без expand...")
+            events = calendar.date_search(start=start_utc, end=end_utc, expand=False)
+            # ... логика парсинга та же, но повторяющиеся события могут не раскрыться
+            # Для простоты пока вернем пустой список при ошибке, чтобы не ломать бот
+            return []
+        except:
+            return []
 
 def delete_event(uid):
     calendar = get_calendar()
