@@ -16,7 +16,7 @@ import pytz
 import re
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.4.3"
+BOT_VERSION = "1.4.4"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -115,6 +115,20 @@ def get_calendar():
     except Exception as e:
         logger.error(f"CalDAV Error connection: {e}")
         return None
+
+def check_caldav_connection():
+    """Проверяет подключение к календарю"""
+    try:
+        cal = get_calendar()
+        if cal:
+            logger.info("CalDAV: Подключение успешно установлено.")
+            return True
+        else:
+            logger.error("CalDAV: Не удалось получить объект календаря.")
+            return False
+    except Exception as e:
+        logger.error(f"CalDAV: Ошибка проверки подключения: {e}")
+        return False
 
 def get_events_for_range(start_date, end_date):
     calendar = get_calendar()
@@ -411,12 +425,12 @@ async def send_temp_message(text, reply_markup=None):
 class AddNoteState(StatesGroup):
     waiting_for_text = State()
     waiting_for_time = State()
-    waiting_for_custom_time = State() # Новое состояние для ручного ввода при создании
+    waiting_for_custom_time = State()
 
 class EditNoteState(StatesGroup):
     waiting_for_new_text = State()
     waiting_for_new_time = State()
-    waiting_for_custom_time = State() # Новое состояние для ручного ввода при редактировании
+    waiting_for_custom_time = State()
     original_uid = State()
     original_summary = State()
     original_time = State()
@@ -424,11 +438,25 @@ class EditNoteState(StatesGroup):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
+    
+    # Проверка подключения
+    is_connected = check_caldav_connection()
+    
     await state.clear()
     add_to_delete_list(message)
     global VIEW_MODE, CURRENT_START_DATE
     VIEW_MODE = 'TODAY_TOMORROW'
     CURRENT_START_DATE = None
+    
+    # Отправляем сообщение о версии и статусе
+    status_text = f"✅ Бот запущен!\n**Версия: {BOT_VERSION}**\n"
+    if is_connected:
+        status_text += "🟢 Подключение к календарю: OK"
+    else:
+        status_text += "🔴 Подключение к календарю: ОШИБКА (проверьте логи)"
+        
+    await message.answer(status_text, parse_mode=ParseMode.MARKDOWN)
+    
     await send_or_edit_main_message(message)
 
 @dp.callback_query(F.data == "switch_to_week")
@@ -828,6 +856,9 @@ async def snooze_notify(callback: types.CallbackQuery):
 async def main():
     logger.info(f"Bot started v{BOT_VERSION}")
     await asyncio.sleep(2)
+    
+    # Проверка подключения при старте
+    check_caldav_connection()
     
     asyncio.create_task(notification_scheduler())
     asyncio.create_task(delete_temp_messages())
