@@ -154,7 +154,10 @@ def get_events_for_week(start_date, end_date):
         
         for event in events:
             try:
-                # Исправлено: убраны пробелы в именах атрибутов
+                # Исправлено: проверка на наличие instance
+                if not hasattr(event, 'instance') or event.instance is None:
+                    continue
+                    
                 vevent = event.instance.vevent
                 
                 # Получаем время начала
