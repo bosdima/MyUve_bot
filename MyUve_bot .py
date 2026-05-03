@@ -16,7 +16,7 @@ import pytz
 import re
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.4.7"
+BOT_VERSION = "1.4.8"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
