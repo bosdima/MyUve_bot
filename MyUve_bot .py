@@ -15,7 +15,7 @@ from aiogram.enums import ParseMode
 import pytz
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.3.7"
+BOT_VERSION = "1.3.8"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -52,7 +52,9 @@ dp = Dispatcher()
 
 # Глобальные переменные состояния
 MAIN_MESSAGE_ID = None
-CURRENT_WEEK_START = None
+# Режимы отображения: 'WEEK' (неделя) или 'TODAY_TOMORROW' (сегодня+завтра)
+VIEW_MODE = 'TODAY_TOMORROW' 
+CURRENT_START_DATE = None # Начало периода отображения
 TEMP_MESSAGES = []
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -103,7 +105,6 @@ def add_to_delete_list(message_obj):
 # --- РАБОТА С CALDAV ---
 def get_calendar():
     try:
-        # Добавляем verify_ssl=False, если есть проблемы с сертификатами, но для Яндекса обычно не нужно
         client = caldav.DAVClient(url=CALDAV_URL, username=YANDEX_LOGIN, password=YANDEX_PASSWORD)
         principal = client.principal()
         calendars = principal.calendars()
@@ -115,53 +116,39 @@ def get_calendar():
         logger.error(f"CalDAV Error connection: {e}")
         return None
 
-def get_events_for_week(start_date, end_date):
+def get_events_for_range(start_date, end_date):
     calendar = get_calendar()
     if not calendar:
         return []
     
     moscow_tz = pytz.timezone('Europe/Moscow')
     
-    # 1. Приводим входные даты к московскому времени, если они без зоны
     if start_date.tzinfo is None:
         start_date = moscow_tz.localize(start_date)
     if end_date.tzinfo is None:
         end_date = moscow_tz.localize(end_date)
         
-    # 2. Конвертируем в UTC для запроса
     start_utc = start_date.astimezone(pytz.utc)
     end_utc = end_date.astimezone(pytz.utc)
 
     logger.info(f"Загрузка событий с {start_date} (MSK) по {end_date} (MSK)")
-    logger.debug(f"Query range UTC: {start_utc} - {end_utc}")
 
     try:
-        # Используем date_search. 
-        # Важно: передаем datetime объекты с tzinfo=UTC
         events = calendar.date_search(start=start_utc, end=end_utc, expand=True)
-        
         result = []
+        
         for event in events:
             try:
-                # Пробуем получить данные через vobject_instance (стандарт для caldav < 1.0) 
-                # или icalendar_instance (для caldav >= 1.0)
-                
                 vevent = None
-                # Способ 1: Через icalendar (новый стандарт)
                 if hasattr(event, 'icalendar_instance') and event.icalendar_instance:
                     for component in event.icalendar_instance.walk():
                         if component.name == "VEVENT":
                             vevent = component
                             break
                 
-                # Способ 2: Через instance (старый стандарт, если vobject установлен)
-                if not vevent and hasattr(event, 'instance') and event.instance:
-                     vevent = event.instance.vevent
-
                 if not vevent:
                     continue
 
-                # Извлечение данных
                 uid = str(vevent.get('UID', ''))
                 summary_obj = vevent.get('SUMMARY')
                 summary = str(summary_obj) if summary_obj else "Без названия"
@@ -172,17 +159,14 @@ def get_events_for_week(start_date, end_date):
                     
                 dt_start_val = dt_start_prop.dt
                 
-                # Обработка типа даты
                 if isinstance(dt_start_val, datetime):
                     if dt_start_val.tzinfo is None:
                         dt_start_dt = dt_start_val.replace(tzinfo=timezone.utc)
                     else:
                         dt_start_dt = dt_start_val
                 else:
-                    # Дата без времени (целый день)
                     dt_start_dt = datetime.combine(dt_start_val, datetime.min.time()).replace(tzinfo=timezone.utc)
 
-                # Перевод в Москву для отображения
                 local_dt = dt_start_dt.astimezone(moscow_tz)
                 
                 result.append({
@@ -200,15 +184,7 @@ def get_events_for_week(start_date, end_date):
         
     except Exception as e:
         logger.error(f"Error fetching events from CalDAV: {e}")
-        # Попробуем без expand, если с ним ошибка
-        try:
-            logger.info("Повторная попытка без expand...")
-            events = calendar.date_search(start=start_utc, end=end_utc, expand=False)
-            # ... логика парсинга та же, но повторяющиеся события могут не раскрыться
-            # Для простоты пока вернем пустой список при ошибке, чтобы не ломать бот
-            return []
-        except:
-            return []
+        return []
 
 def delete_event(uid):
     calendar = get_calendar()
@@ -256,26 +232,43 @@ def get_reply_keyboard():
     builder.row(KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки"))
     return builder.as_markup(resize_keyboard=True, one_time_keyboard=False)
 
-def get_main_nav_keyboard(week_start):
-    week_end = week_start + timedelta(days=6)
+def get_main_nav_keyboard():
+    global VIEW_MODE, CURRENT_START_DATE
+    
     builder = InlineKeyboardBuilder()
     
-    today = get_local_time().replace(hour=0, minute=0, second=0, microsecond=0)
+    # Кнопка переключения режима
+    if VIEW_MODE == 'TODAY_TOMORROW':
+        mode_btn_text = "📅 Показать всю неделю"
+        mode_cb_data = "switch_to_week"
+    else:
+        mode_btn_text = "🔥 Сегодня и Завтра"
+        mode_cb_data = "switch_to_today_tomorrow"
+        
+    builder.row(InlineKeyboardButton(text=mode_btn_text, callback_data=mode_cb_data))
+
+    # Навигация зависит от режима
+    if VIEW_MODE == 'WEEK':
+        week_start = CURRENT_START_DATE
+        prev_week = week_start - timedelta(days=7)
+        next_week = week_start + timedelta(days=7)
+        week_end = week_start + timedelta(days=6)
+        
+        builder.row(
+            InlineKeyboardButton(text="⬅️ Пред. неделя", callback_data=f"nav_prev_{int(prev_week.timestamp())}"),
+            InlineKeyboardButton(text="След. неделя ➡️", callback_data=f"nav_next_{int(next_week.timestamp())}")
+        )
+        builder.row(
+             InlineKeyboardButton(text=f"📆 {week_start.strftime('%d.%m')} - {week_end.strftime('%d.%m')}", callback_data="current_week_info")
+        )
+    else:
+        # В режиме Сегодня/Завтра навигация не нужна, только обновление
+        pass
+
     builder.row(
         InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"),
-        InlineKeyboardButton(text="📅 Сегодня/Завтра", callback_data=f"nav_today_{int(today.timestamp())}")
+        InlineKeyboardButton(text="✏️ Управление", callback_data="manage_list")
     )
-
-    prev_week = week_start - timedelta(days=7)
-    next_week = week_start + timedelta(days=7)
-
-    builder.row(
-        InlineKeyboardButton(text="⬅️ Назад", callback_data=f"nav_prev_{int(prev_week.timestamp())}"),
-        InlineKeyboardButton(text=f"📅 {week_start.strftime('%d.%m')} - {week_end.strftime('%d.%m')}", callback_data="current_week"),
-        InlineKeyboardButton(text="Вперед ➡️", callback_data=f"nav_next_{int(next_week.timestamp())}")
-    )
-
-    builder.row(InlineKeyboardButton(text="✏️ Управление (Удалить)", callback_data="manage_list"))
 
     return builder.as_markup()
 
@@ -326,59 +319,70 @@ def get_settings_kb(current_interval):
     return builder.as_markup()
 
 # --- ОСНОВНАЯ ЛОГИКА ОТОБРАЖЕНИЯ ---
-async def build_week_report(week_start):
-    global CURRENT_WEEK_START
-    CURRENT_WEEK_START = week_start
+async def build_report():
+    global VIEW_MODE, CURRENT_START_DATE
     
-    week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
-    
-    events = get_events_for_week(week_start, week_end)
-
     now = get_local_time()
-    sync_time = now.strftime("%d.%m.%Y %H:%M:%S")
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    if VIEW_MODE == 'TODAY_TOMORROW':
+        # Показываем сегодня и завтра
+        start_date = today_start
+        end_date = today_start + timedelta(days=2) # До начала послезавтра
+        
+        header = f"**🔥 Ближайшие дела (Сегодня и Завтра)**\n"
+        header += f"_Период: {format_date_full(start_date)} — {format_date_full(end_date - timedelta(seconds=1))}_\n\n"
+        
+    else:
+        # Показываем неделю
+        if CURRENT_START_DATE is None:
+            CURRENT_START_DATE = get_week_start(now)
+            
+        start_date = CURRENT_START_DATE
+        end_date = start_date + timedelta(days=7)
+        
+        header = f"**📅 Календарь на неделю**\n"
+        header += f"_Период: {format_date_full(start_date)} — {format_date_full(start_date + timedelta(days=6))}_\n\n"
 
-    text = f"**Бот запущен! Версия: {BOT_VERSION}**\n"
-    text += f"_Период: {format_date_full(week_start)} — {format_date_full(week_end)}_\n\n"
+    events = get_events_for_range(start_date, end_date)
+
+    sync_time = now.strftime("%d.%m.%Y %H:%M:%S")
+    text = header
 
     if not events:
-        text += "Нет событий на эту неделю."
+        text += "✨ Нет событий на этот период."
     else:
         for ev in events:
             date_str = format_date_full(ev['time'])
             time_str = format_time_only(ev['time'])
             
             status_icon = ""
-            color_mark = ""
-            
             if ev['time'] < now:
-                status_icon = "️"
+                status_icon = "⚠️ " # Просрочено
             elif ev['time'].date() == now.date():
-                status_icon = ""
+                status_icon = "📍 " # Сегодня
             
-            text += f"{color_mark}{time_str} — {ev['summary']} ({date_str}){status_icon}\n"
+            text += f"{status_icon}`{time_str}` — **{ev['summary']}**\n_{date_str}_\n\n"
 
-    text += f"\n_Последняя синхронизация: {sync_time}_"
-    return text, get_main_nav_keyboard(week_start)
+    text += f"------------------\n_Обновлено: {sync_time}_"
+    return text, get_main_nav_keyboard()
 
-async def send_or_edit_main_message(message=None, force_current_week=False):
-    global MAIN_MESSAGE_ID, CURRENT_WEEK_START
-    
-    if force_current_week or CURRENT_WEEK_START is None:
-        CURRENT_WEEK_START = get_week_start(get_local_time())
+async def send_or_edit_main_message(message=None):
+    global MAIN_MESSAGE_ID
 
-    text, keyboard = await build_week_report(CURRENT_WEEK_START)
+    text, keyboard = await build_report()
 
     try:
         if MAIN_MESSAGE_ID is None:
             if message:
                 sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
-                temp_msg = await message.answer("Используйте кнопки внизу для быстрого доступа.", reply_markup=get_reply_keyboard())
+                temp_msg = await message.answer("Меню:", reply_markup=get_reply_keyboard())
                 add_to_delete_list(temp_msg)
             else:
                 sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
-                temp_msg = await bot.send_message(ADMIN_ID, "Меню управления:", reply_markup=get_reply_keyboard())
+                temp_msg = await bot.send_message(ADMIN_ID, "Меню:", reply_markup=get_reply_keyboard())
                 add_to_delete_list(temp_msg)
         else:
             await bot.edit_message_text(
@@ -409,48 +413,74 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
     await state.clear()
     add_to_delete_list(message)
-    await send_or_edit_main_message(message, force_current_week=True)
+    # При старте всегда сбрасываем на режим Сегодня/Завтра
+    global VIEW_MODE, CURRENT_START_DATE
+    VIEW_MODE = 'TODAY_TOMORROW'
+    CURRENT_START_DATE = None
+    await send_or_edit_main_message(message)
+
+@dp.callback_query(F.data == "switch_to_week")
+async def switch_to_week(callback: types.CallbackQuery):
+    global VIEW_MODE, CURRENT_START_DATE
+    VIEW_MODE = 'WEEK'
+    if CURRENT_START_DATE is None:
+        CURRENT_START_DATE = get_week_start(get_local_time())
+    await callback.answer("Режим: Неделя")
+    await send_or_edit_main_message()
+
+@dp.callback_query(F.data == "switch_to_today_tomorrow")
+async def switch_to_today_tomorrow(callback: types.CallbackQuery):
+    global VIEW_MODE
+    VIEW_MODE = 'TODAY_TOMORROW'
+    await callback.answer("Режим: Сегодня и Завтра")
+    await send_or_edit_main_message()
 
 @dp.callback_query(F.data.startswith("nav_prev_"))
 async def nav_prev(callback: types.CallbackQuery):
     ts = int(callback.data.split("_")[2])
     new_start = datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).astimezone(pytz.timezone('Europe/Moscow'))
+    global CURRENT_START_DATE, VIEW_MODE
+    VIEW_MODE = 'WEEK' # Переключаем в режим недели при навигации
+    CURRENT_START_DATE = new_start
     await callback.answer()
-    global CURRENT_WEEK_START
-    CURRENT_WEEK_START = new_start
     await send_or_edit_main_message()
 
 @dp.callback_query(F.data.startswith("nav_next_"))
 async def nav_next(callback: types.CallbackQuery):
     ts = int(callback.data.split("_")[2])
     new_start = datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).astimezone(pytz.timezone('Europe/Moscow'))
+    global CURRENT_START_DATE, VIEW_MODE
+    VIEW_MODE = 'WEEK'
+    CURRENT_START_DATE = new_start
     await callback.answer()
-    global CURRENT_WEEK_START
-    CURRENT_WEEK_START = new_start
-    await send_or_edit_main_message()
-
-@dp.callback_query(F.data.startswith("nav_today_"))
-async def nav_today(callback: types.CallbackQuery):
-    ts = int(callback.data.split("_")[2])
-    new_start = get_week_start(datetime.fromtimestamp(ts).replace(tzinfo=timezone.utc).astimezone(pytz.timezone('Europe/Moscow')))
-    await callback.answer()
-    global CURRENT_WEEK_START
-    CURRENT_WEEK_START = new_start
     await send_or_edit_main_message()
 
 @dp.callback_query(F.data == "force_refresh")
 async def force_refresh(callback: types.CallbackQuery):
     await callback.answer("Обновление...")
-    await send_or_edit_main_message(force_current_week=True)
+    await send_or_edit_main_message()
 
 @dp.callback_query(F.data == "manage_list")
 async def show_manage_list(callback: types.CallbackQuery):
-    events = get_events_for_week(CURRENT_WEEK_START, CURRENT_WEEK_START + timedelta(days=6))
+    # Для управления показываем события за текущий видимый период
+    global VIEW_MODE, CURRENT_START_DATE
+    now = get_local_time()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    if VIEW_MODE == 'TODAY_TOMORROW':
+        start_date = today_start
+        end_date = today_start + timedelta(days=2)
+    else:
+        if CURRENT_START_DATE is None: CURRENT_START_DATE = get_week_start(now)
+        start_date = CURRENT_START_DATE
+        end_date = start_date + timedelta(days=7)
+        
+    events = get_events_for_range(start_date, end_date)
     kb = get_manage_list_keyboard(events)
     if events:
         await send_temp_message("Выберите задачу для удаления:", reply_markup=kb)
     else:
-        await send_temp_message("Нет задач для удаления в этой неделе.", reply_markup=kb)
+        await send_temp_message("Нет задач для удаления в этом периоде.", reply_markup=kb)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("del_"))
@@ -531,7 +561,7 @@ async def notification_scheduler():
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         tomorrow_end = (today_start + timedelta(days=2))
         
-        events = get_events_for_week(today_start, tomorrow_end)
+        events = get_events_for_range(today_start, tomorrow_end)
         
         for ev in events:
             uid = ev['uid']
@@ -586,7 +616,7 @@ async def main():
     async def refresh_loop():
         while True:
             await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
-            await send_or_edit_main_message(force_current_week=True)
+            await send_or_edit_main_message()
 
     asyncio.create_task(refresh_loop())
 
