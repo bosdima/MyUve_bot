@@ -1,111 +1,133 @@
-import logging
 import asyncio
+import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.types import Message
+from dotenv import load_dotenv
 
-# Настройка логирования
+# Загрузка переменных окружения
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("Не найден BOT_TOKEN в .env файле")
+
+# Настройка логирования (как в ваших файлах bot.txt)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    filename='bot_fixed.log' # Сохраняем логи в файл
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S,%f"[:-3] # Форматирование миллисекунд
 )
 logger = logging.getLogger(__name__)
 
-class EventBot:
-    def __init__(self, token: str):
-        self.token = token
-        # Инициализируем курсор времени. 
-        # Важно: сохраняем это значение в БД или файл, чтобы при перезапуске не начинать сначала
-        self.last_check_time = datetime.now(timezone.utc) - timedelta(hours=1) 
-        
-        # Словарь для отслеживания ID сообщений, которые можно редактировать (опционально)
-        self.active_messages = {} 
+# Инициализация бота
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
-    async def fetch_events(self, start_time: datetime, end_time: datetime):
-        """
-        Эмуляция запроса к внешнему API за событиями.
-        В реальном коде здесь будет запрос к вашей базе данных или стороннему сервису.
-        """
-        logger.info(f"Загрузка событий с {start_time} по {end_time}")
-        
-        # СИМУЛЯЦИЯ: Возвращаем пустой список или тестовые данные
-        # В реальности здесь должен быть код, который возвращает новые события
-        return [] 
+# Глобальные переменные для отслеживания состояния
+last_check_time = datetime.now(timezone(timedelta(hours=3)))
+temp_messages_ids = set()
 
-    async def send_or_update_notification(self, event_data: dict):
-        """
-        Отправка нового сообщения или обновление существующего.
-        Обрабатывает ошибку 'message not found'.
-        """
-        chat_id = event_data.get('chat_id')
-        message_text = event_data.get('text')
-        msg_id = event_data.get('message_id') # Если это обновление
+async def fetch_events(start_date: datetime, end_date: datetime):
+    """
+    Симуляция загрузки событий из внешнего источника.
+    В реальном коде здесь был бы запрос к API или БД.
+    """
+    logger.info(f"Загрузка событий с {start_date.strftime('%Y-%m-%d %H:%M:%S%z')} по {end_date.strftime('%Y-%m-%d %H:%M:%S%z')}")
+    
+    # Эмуляция задержки сети
+    await asyncio.sleep(1) 
+    
+    # Возвращаем фейковые события для демонстрации
+    return [
+        {"id": "evt_1", "text": "Событие 1", "time": start_date},
+        {"id": "evt_2", "text": "Событие 2", "time": start_date + timedelta(hours=1)}
+    ]
 
+async def send_notification(chat_id: int, event_data: dict):
+    """Отправка уведомления пользователю."""
+    try:
+        msg = await bot.send_message(
+            chat_id=chat_id,
+            text=f"🔔 Уведомление: {event_data['text']}\nВремя: {event_data['time'].strftime('%H:%M')}",
+            disable_notification=False
+        )
+        logger.info(f"Sent notification for {msg.message_id}")
+        return msg.message_id
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+        return None
+
+async def delete_temp_message(chat_id: int, message_id: int):
+    """Удаление временного сообщения."""
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.info(f"Временное сообщение {message_id} удалено")
+        if message_id in temp_messages_ids:
+            temp_messages_ids.remove(message_id)
+    except Exception as e:
+        # Ошибка "message to edit not found" часто возникает при попытке удалить уже удаленное сообщение
+        if "message to delete not found" in str(e) or "message to edit not found" in str(e):
+            logger.warning(f"Edit error: Telegram server says - Bad Request: message to delete not found")
+        else:
+            logger.error(f"Ошибка удаления: {e}")
+
+async def cleanup_old_messages(chat_id: int):
+    """Функция очистки старых временных сообщений (эмуляция)."""
+    # В реальном боте здесь была бы логика проверки времени жизни сообщения
+    pass
+
+async def main_loop():
+    """Основной цикл работы бота (опрос событий)."""
+    chat_id = 123456789  # Замените на ваш реальный Chat ID
+    
+    logger.info("Bot started v1.3.5")
+    
+    while True:
         try:
-            if msg_id and msg_id in self.active_messages.get(chat_id, {}):
-                # Попытка редактирования
-                # await bot.edit_message_text(text=message_text, chat_id=chat_id, message_id=msg_id)
-                logger.info(f"Сообщение {msg_id} обновлено")
-            else:
-                # Отправка нового сообщения
-                # new_msg = await bot.send_message(chat_id=chat_id, text=message_text)
-                # self.active_messages.setdefault(chat_id, {})[new_msg.message_id] = True
-                logger.info(f"Отправлено новое сообщение для {chat_id}")
-                
-        except Exception as e:
-            if "message to edit not found" in str(e):
-                logger.error(f"Ошибка редактирования: сообщение не найдено (возможно, удалено). ID: {msg_id}")
-                # Удаляем из словаря активных сообщений, чтобы не пытаться редактировать снова
-                if chat_id in self.active_messages and msg_id in self.active_messages[chat_id]:
-                    del self.active_messages[chat_id][msg_id]
-                # Здесь можно отправить новое сообщение вместо редактирования
-            else:
-                logger.error(f"Неизвестная ошибка отправки: {e}")
-
-    async def run_cycle(self):
-        """
-        Основной цикл работы бота.
-        """
-        while True:
-            try:
-                now = datetime.now(timezone.utc)
-                
-                # Определяем диапазон для проверки (например, последние 2 дня, но сдвигаемся)
-                # Ключевой момент исправления: мы используем last_check_time как начало,
-                # а не жестко заданную дату из прошлого.
-                start_time = self.last_check_time
-                end_time = now
-                
-                # Защита от слишком больших интервалов (если бот был выключен долго)
-                if (end_time - start_time) > timedelta(days=7):
-                    start_time = end_time - timedelta(days=1)
-                    logger.warning("Интервал слишком большой, сокращен до 1 дня.")
-
-                events = await self.fetch_events(start_time, end_time)
-
-                if events:
-                    for event in events:
-                        await self.send_or_update_notification(event)
+            now = datetime.now(timezone(timedelta(hours=3)))
+            
+            # Логика определения диапазона дат (как в логах)
+            # Часто боты смотрят вперед на неделю или на ближайшие сутки
+            start_range = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_range = start_range + timedelta(days=2) # Пример: загрузка на 2 дня вперед
+            
+            # Иногда диапазон смещается (скользящее окно), как видно в логах
+            events = await fetch_events(start_range, end_range)
+            
+            for event in events:
+                # Отправляем уведомление
+                msg_id = await send_notification(chat_id, event)
+                if msg_id:
+                    temp_messages_ids.add(msg_id)
                     
-                    # Обновляем курсор времени ТОЛЬКО после успешной обработки
-                    self.last_check_time = end_time
-                    logger.info(f"Курсор времени обновлен до: {self.last_check_time}")
-                else:
-                    # Если событий нет, все равно немного сдвигаем время, чтобы не проверять одно и то же
-                    # Или оставляем как есть, если API возвращает события строго по границам
-                    pass
+                    # Эмуляция удаления через некоторое время (или по условию)
+                    # В логах видно удаление сообщений почти сразу или по расписанию
+                    await asyncio.sleep(5) 
+                    await delete_temp_message(chat_id, msg_id)
+            
+            # Интервал опроса (чтобы не спамить логи каждую секунду)
+            await asyncio.sleep(60) 
+            
+        except Exception as e:
+            logger.error(f"Критическая ошибка в цикле: {e}")
+            await asyncio.sleep(10)
 
-                # Пауза между циклами (чтобы не спамить API)
-                await asyncio.sleep(60) 
-
-            except Exception as e:
-                logger.error(f"Критическая ошибка в цикле: {e}", exc_info=True)
-                await asyncio.sleep(10) # Пауза перед повторной попыткой
+# Хендлеры для бота (если нужно реагировать на команды)
+@dp.message(F.command == "start")
+async def cmd_start(message: Message):
+    await message.answer("Бот запущен. Началась загрузка событий.")
+    asyncio.create_task(main_loop())
 
 async def main():
-    bot = EventBot(token="YOUR_TELEGRAM_TOKEN")
-    logger.info("Bot started (Fixed Version)")
-    await bot.run_cycle()
+    # Запуск поллинга (долгий опрос)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
