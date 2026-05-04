@@ -16,7 +16,7 @@ import pytz
 import re
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.4.9"
+BOT_VERSION = "1.5.0"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -88,7 +88,7 @@ def format_time_only(dt_obj):
 async def delete_temp_messages():
     """Автоматическое удаление временных сообщений через 15 минут"""
     while True:
-        await asyncio.sleep(900)  # 15 минут (было 300 = 5 минут)
+        await asyncio.sleep(900)  # 15 минут
         for msg_id in TEMP_MESSAGES[:]:
             try:
                 await bot.delete_message(ADMIN_ID, msg_id)
@@ -397,12 +397,11 @@ async def send_or_edit_main_message(message=None):
             if message:
                 sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
-                # ReplyKeyboard отправляем ОТДЕЛЬНО и НЕ добавляем в список удаления!
+                # ReplyKeyboard НЕ добавляем в список удаления, чтобы он всегда был виден
                 await message.answer("Меню:", reply_markup=get_reply_keyboard())
             else:
                 sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
-                # ReplyKeyboard отправляем ОТДЕЛЬНО и НЕ добавляем в список удаления!
                 await bot.send_message(ADMIN_ID, "Меню:", reply_markup=get_reply_keyboard())
         else:
             await bot.edit_message_text(
@@ -419,7 +418,6 @@ async def send_or_edit_main_message(message=None):
             MAIN_MESSAGE_ID = None
 
 async def send_temp_message(text, reply_markup=None):
-    """Отправляет сообщение и добавляет его в список на удаление"""
     msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
     add_to_delete_list(msg)
     return msg
@@ -434,6 +432,7 @@ class AddNoteState(StatesGroup):
 class EditNoteState(StatesGroup):
     waiting_for_new_text = State()
     waiting_for_new_time = State()
+    waiting_for_custom_time = State()
     original_uid = State()
     original_summary = State()
     original_time = State()
@@ -455,7 +454,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
     else:
         status_text += "🔴 Подключение к календарю: ОШИБКА"
         
-    # Отправляем статус и добавляем в список удаления
     status_msg = await message.answer(status_text, parse_mode=ParseMode.MARKDOWN)
     add_to_delete_list(status_msg)
     
@@ -577,7 +575,6 @@ async def process_new_text_final(message: types.Message, state: FSMContext):
     if uid and old_time:
         delete_event(uid)
         if create_event_in_yandex(new_text, old_time):
-            # Отправляем подтверждение и добавляем в список удаления
             confirm_msg = await message.answer("✅ Текст изменен!", parse_mode=ParseMode.MARKDOWN)
             add_to_delete_list(confirm_msg)
             await send_or_edit_main_message()
@@ -626,7 +623,6 @@ async def process_new_time(callback: types.CallbackQuery, state: FSMContext):
     if uid and summary:
         delete_event(uid)
         if create_event_in_yandex(summary, new_time):
-            # Отправляем подтверждение и добавляем в список удаления
             confirm_msg = await callback.message.edit_text("✅ Дата и время изменены!", reply_markup=None, parse_mode=ParseMode.MARKDOWN)
             add_to_delete_list(confirm_msg)
             await send_or_edit_main_message()
@@ -637,10 +633,17 @@ async def process_new_time(callback: types.CallbackQuery, state: FSMContext):
         
     await state.clear()
 
-@dp.message(EditNoteState.waiting_for_new_time)
-async def process_custom_time_text(message: types.Message, state: FSMContext):
+@dp.callback_query(EditNoteState.waiting_for_new_time, F.data == "time_custom")
+async def request_custom_time_edit(callback: types.CallbackQuery, state: FSMContext):
+    logger.debug("User requested custom time input for editing")
+    await callback.message.edit_text("✍️ Введите дату и время в формате:\n`ДД.ММ ЧЧ:ММ`\nили `ДД.ММ.ГГГГ ЧЧ:ММ`\nПример: `05.05 14:30`", parse_mode=ParseMode.MARKDOWN, reply_markup=None)
+    await state.set_state(EditNoteState.waiting_for_custom_time)
+    await callback.answer()
+
+@dp.message(EditNoteState.waiting_for_custom_time)
+async def process_custom_time_text_edit(message: types.Message, state: FSMContext):
     text = message.text.strip()
-    logger.debug(f"Received text while waiting for time: '{text}'")
+    logger.debug(f"Received text while waiting for time (edit): '{text}'")
     
     new_time = parse_custom_time(text)
     
@@ -653,7 +656,6 @@ async def process_custom_time_text(message: types.Message, state: FSMContext):
         if uid and summary:
             delete_event(uid)
             if create_event_in_yandex(summary, new_time):
-                # Отправляем подтверждение и добавляем в список удаления
                 confirm_msg = await message.answer("✅ Дата и время изменены!", parse_mode=ParseMode.MARKDOWN)
                 add_to_delete_list(confirm_msg)
                 await send_or_edit_main_message()
@@ -703,8 +705,10 @@ async def process_time_selection(callback: types.CallbackQuery, state: FSMContex
         add_to_delete_list(err_msg)
     await state.clear()
 
+# === ИСПРАВЛЕНИЕ ЗДЕСЬ: Добавлен обработчик для ручного ввода при создании ===
 @dp.callback_query(AddNoteState.waiting_for_time, F.data == "time_custom")
 async def request_custom_time_add(callback: types.CallbackQuery, state: FSMContext):
+    logger.debug("User requested custom time input for adding")
     await callback.message.edit_text("✍️ Введите дату и время в формате:\n`ДД.ММ ЧЧ:ММ`\nили `ДД.ММ.ГГГГ ЧЧ:ММ`\nПример: `05.05 14:30`", parse_mode=ParseMode.MARKDOWN, reply_markup=None)
     await state.set_state(AddNoteState.waiting_for_custom_time)
     await callback.answer()
@@ -763,6 +767,7 @@ def parse_custom_time(text: str) -> datetime:
     moscow_tz = pytz.timezone('Europe/Moscow')
     text = text.strip()
     
+    # Паттерны
     pattern1 = r'^(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})$'
     pattern2 = r'^(\d{1,2})\.(\d{1,2})\.(\d{2})\s+(\d{1,2}):(\d{2})$'
     pattern3 = r'^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})$'
