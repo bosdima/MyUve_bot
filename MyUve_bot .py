@@ -16,7 +16,7 @@ import pytz
 import calendar as cal_module
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.5.3"
+BOT_VERSION = "1.5.4"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -56,6 +56,8 @@ MAIN_MESSAGE_ID = None
 VIEW_MODE = 'TODAY_TOMORROW' 
 CURRENT_START_DATE = None 
 TEMP_MESSAGES = []
+# Словарь для хранения ID последних уведомлений: {uid: message_id}
+LAST_NOTIFICATION_IDS = {}
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_local_time():
@@ -110,11 +112,8 @@ def get_calendar_keyboard(year=None, month=None):
     
     builder = InlineKeyboardBuilder()
     month_name = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"][month - 1]
-    
-    # Заголовок
     builder.row(InlineKeyboardButton(text=f"{month_name} {year}", callback_data="calendar_ignore"))
     
-    # Навигация
     prev_month = month - 1 if month > 1 else 12
     prev_year = year if month > 1 else year - 1
     next_month = month + 1 if month < 12 else 1
@@ -125,11 +124,9 @@ def get_calendar_keyboard(year=None, month=None):
         InlineKeyboardButton(text="▶️", callback_data=f"cal_next_{next_year}_{next_month}")
     )
     
-    # Дни недели
     days_short = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     builder.row(*[InlineKeyboardButton(text=d, callback_data="day_ignore") for d in days_short])
     
-    # Дни месяца
     cal = cal_module.Calendar(firstweekday=0)
     month_days = cal.monthdayscalendar(year, month)
     
@@ -144,10 +141,8 @@ def get_calendar_keyboard(year=None, month=None):
                     is_today = (day == now.day and month == now.month and year == now.year)
                     
                     if day_date.date() < now.date():
-                        # Прошедшие даты
                         row.append(InlineKeyboardButton(text=str(day), callback_data="day_ignore"))
                     else:
-                        # Будущие даты
                         btn_text = f"{day} 🟢" if is_today else str(day)
                         row.append(InlineKeyboardButton(text=btn_text, callback_data=f"cal_day_{year}_{month}_{day}"))
                 except:
@@ -160,14 +155,9 @@ def get_calendar_keyboard(year=None, month=None):
 def get_hours_keyboard(year, month, day):
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text=f"Выберите час: {day}.{month}.{year}", callback_data="hours_ignore"))
-    
-    buttons = []
-    for hour in range(24):
-        buttons.append(InlineKeyboardButton(text=f"{hour:02d}", callback_data=f"hour_{year}_{month}_{day}_{hour}"))
-    
+    buttons = [InlineKeyboardButton(text=f"{hour:02d}", callback_data=f"hour_{year}_{month}_{day}_{hour}") for hour in range(24)]
     for i in range(0, len(buttons), 4):
         builder.row(*buttons[i:i+4])
-    
     builder.row(InlineKeyboardButton(text="◀️ Назад к календарю", callback_data=f"back_calendar_{year}_{month}"))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_datetime"))
     return builder.as_markup()
@@ -175,10 +165,8 @@ def get_hours_keyboard(year, month, day):
 def get_minutes_keyboard(year, month, day, hour):
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text=f"Выберите минуты: {hour}:__", callback_data="min_ignore"))
-    
     minutes = [0, 10, 20, 30, 40, 50]
     buttons = [InlineKeyboardButton(text=f"{m:02d}", callback_data=f"min_{year}_{month}_{day}_{hour}_{m}") for m in minutes]
-    
     builder.row(*buttons)
     builder.row(InlineKeyboardButton(text="◀️ Назад к часам", callback_data=f"back_hours_{year}_{month}_{day}"))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_datetime"))
@@ -647,7 +635,6 @@ async def hour_selected(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text(f"⏱️ Выберите минуты для {hour}:__:", reply_markup=get_minutes_keyboard(year, month, day, hour))
     await callback.answer()
 
-# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ВЫБОРА МИНУТ ---
 @dp.callback_query(F.data.startswith("min_"))
 async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
     logger.debug(">>> minute_selected TRIGGERED <<<")
@@ -655,7 +642,7 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
     try:
         year, month, day, hour, minute = int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])
     except IndexError:
-        logger.error(f"Failed to parse minute callback data: {callback.data}")
+        logger.error(f"Failed to parse minute callback: {callback.data}")
         await callback.answer("Ошибка данных", show_alert=True)
         return
 
@@ -766,32 +753,60 @@ async def set_interval(callback: types.CallbackQuery):
 async def close_settings(callback: types.CallbackQuery):
     await callback.message.delete()
 
-# --- УВЕДОМЛЕНИЯ ---
-active_notifications = {}
+# --- УВЕДОМЛЕНИЯ С ЗАМЕНОЙ ---
 async def notification_scheduler():
     while True:
         await asyncio.sleep(60)
         now = get_local_time()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         tomorrow_end = (today_start + timedelta(days=2))
+        
         events = get_events_for_range(today_start, tomorrow_end)
+        
         for ev in events:
             uid = ev['uid']
             event_time = ev['time']
+            
+            # Проверяем, нужно ли напоминать
             if event_time <= now:
-                last_notify = active_notifications.get(uid)
+                last_notify_time = LAST_NOTIFICATION_IDS.get(uid + "_time")
+                
                 should_notify = False
-                if last_notify is None:
-                    if (now - event_time).total_seconds() < 3600: should_notify = True
+                # Если уведомление еще не было или прошло больше часа
+                if last_notify_time is None:
+                    if (now - event_time).total_seconds() < 3600: 
+                        should_notify = True
                 else:
-                    if (now - last_notify).total_seconds() >= 3600: should_notify = True
+                    if (now - last_notify_time).total_seconds() >= 3600:
+                        should_notify = True
+                
                 if should_notify:
                     try:
                         kb = get_notification_keyboard(uid)
-                        text = f"**Напоминание:** {ev['summary']}\nВремя: {format_time_only(event_time)}"
-                        await bot.send_message(ADMIN_ID, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
-                        active_notifications[uid] = now
-                        logger.info(f"Sent notification for {uid}")
+                        
+                        # Определяем, является ли это повторным уведомлением
+                        is_repeat = (uid in LAST_NOTIFICATION_IDS)
+                        prefix = "🔁 **(Повторное напоминание)**\n" if is_repeat else ""
+                        
+                        text = f"{prefix}**Напоминание:** {ev['summary']}\nВремя: {format_time_only(event_time)}"
+                        
+                        # Если есть предыдущее уведомление, удаляем его
+                        if uid in LAST_NOTIFICATION_IDS:
+                            old_msg_id = LAST_NOTIFICATION_IDS[uid]
+                            try:
+                                await bot.delete_message(ADMIN_ID, old_msg_id)
+                                logger.debug(f"Deleted old notification {old_msg_id} for UID {uid}")
+                            except Exception as e:
+                                logger.warning(f"Could not delete old notification {old_msg_id}: {e}")
+                        
+                        # Отправляем новое уведомление
+                        notify_msg = await bot.send_message(ADMIN_ID, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+                         
+                        # Сохраняем ID нового сообщения и время отправки
+                        LAST_NOTIFICATION_IDS[uid] = notify_msg.message_id
+                        LAST_NOTIFICATION_IDS[uid + "_time"] = now
+                        
+                        logger.info(f"Sent notification for {uid} (Repeat: {is_repeat})")
                     except Exception as e:
                         logger.error(f"Notify error: {e}")
 
@@ -801,7 +816,13 @@ async def done_notify(callback: types.CallbackQuery):
     if delete_event(uid):
         await callback.message.edit_text("✅ Задача выполнена и удалена.", parse_mode=ParseMode.MARKDOWN)
         add_to_delete_list(callback.message)
-        if uid in active_notifications: del active_notifications[uid]
+        
+        # Очищаем данные о последнем уведомлении
+        if uid in LAST_NOTIFICATION_IDS:
+            del LAST_NOTIFICATION_IDS[uid]
+        if uid + "_time" in LAST_NOTIFICATION_IDS:
+            del LAST_NOTIFICATION_IDS[uid + "_time"]
+            
         await send_or_edit_main_message()
     else:
         await callback.answer("Не удалось удалить", show_alert=True)
