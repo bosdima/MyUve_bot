@@ -16,7 +16,7 @@ import pytz
 import calendar as cal_module
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.5.2"
+BOT_VERSION = "1.5.3"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -87,7 +87,7 @@ def format_time_only(dt_obj):
 
 async def delete_temp_messages():
     while True:
-        await asyncio.sleep(900)
+        await asyncio.sleep(900)  # 15 минут
         for msg_id in TEMP_MESSAGES[:]:
             try:
                 await bot.delete_message(ADMIN_ID, msg_id)
@@ -110,8 +110,11 @@ def get_calendar_keyboard(year=None, month=None):
     
     builder = InlineKeyboardBuilder()
     month_name = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"][month - 1]
+    
+    # Заголовок
     builder.row(InlineKeyboardButton(text=f"{month_name} {year}", callback_data="calendar_ignore"))
     
+    # Навигация
     prev_month = month - 1 if month > 1 else 12
     prev_year = year if month > 1 else year - 1
     next_month = month + 1 if month < 12 else 1
@@ -122,9 +125,11 @@ def get_calendar_keyboard(year=None, month=None):
         InlineKeyboardButton(text="▶️", callback_data=f"cal_next_{next_year}_{next_month}")
     )
     
+    # Дни недели
     days_short = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
     builder.row(*[InlineKeyboardButton(text=d, callback_data="day_ignore") for d in days_short])
     
+    # Дни месяца
     cal = cal_module.Calendar(firstweekday=0)
     month_days = cal.monthdayscalendar(year, month)
     
@@ -136,10 +141,15 @@ def get_calendar_keyboard(year=None, month=None):
             else:
                 try:
                     day_date = datetime(year, month, day)
+                    is_today = (day == now.day and month == now.month and year == now.year)
+                    
                     if day_date.date() < now.date():
+                        # Прошедшие даты
                         row.append(InlineKeyboardButton(text=str(day), callback_data="day_ignore"))
                     else:
-                        row.append(InlineKeyboardButton(text=str(day), callback_data=f"cal_day_{year}_{month}_{day}"))
+                        # Будущие даты
+                        btn_text = f"{day} 🟢" if is_today else str(day)
+                        row.append(InlineKeyboardButton(text=btn_text, callback_data=f"cal_day_{year}_{month}_{day}"))
                 except:
                     row.append(InlineKeyboardButton(text=str(day), callback_data="day_ignore"))
         builder.row(*row)
@@ -150,9 +160,14 @@ def get_calendar_keyboard(year=None, month=None):
 def get_hours_keyboard(year, month, day):
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text=f"Выберите час: {day}.{month}.{year}", callback_data="hours_ignore"))
-    buttons = [InlineKeyboardButton(text=f"{hour:02d}", callback_data=f"hour_{year}_{month}_{day}_{hour}") for hour in range(24)]
+    
+    buttons = []
+    for hour in range(24):
+        buttons.append(InlineKeyboardButton(text=f"{hour:02d}", callback_data=f"hour_{year}_{month}_{day}_{hour}"))
+    
     for i in range(0, len(buttons), 4):
         builder.row(*buttons[i:i+4])
+    
     builder.row(InlineKeyboardButton(text="◀️ Назад к календарю", callback_data=f"back_calendar_{year}_{month}"))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_datetime"))
     return builder.as_markup()
@@ -160,8 +175,10 @@ def get_hours_keyboard(year, month, day):
 def get_minutes_keyboard(year, month, day, hour):
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text=f"Выберите минуты: {hour}:__", callback_data="min_ignore"))
+    
     minutes = [0, 10, 20, 30, 40, 50]
     buttons = [InlineKeyboardButton(text=f"{m:02d}", callback_data=f"min_{year}_{month}_{day}_{hour}_{m}") for m in minutes]
+    
     builder.row(*buttons)
     builder.row(InlineKeyboardButton(text="◀️ Назад к часам", callback_data=f"back_hours_{year}_{month}_{day}"))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_datetime"))
@@ -356,11 +373,11 @@ def get_settings_kb(current_interval):
     builder.adjust(2)
     return builder.as_markup()
 
-# --- СОСТОЯНИЯ (ИСПРАВЛЕНО) ---
+# --- СОСТОЯНИЯ ---
 class AddNoteState(StatesGroup):
     waiting_for_text = State()
-    waiting_for_time = State()          # Для быстрых кнопок
-    waiting_for_datetime = State()      # Для календаря
+    waiting_for_time = State()
+    waiting_for_datetime = State()
     selected_year = State()
     selected_month = State()
     selected_day = State()
@@ -368,7 +385,7 @@ class AddNoteState(StatesGroup):
 
 class EditNoteState(StatesGroup):
     waiting_for_new_text = State()
-    waiting_for_datetime = State()      # Для календаря при редактировании
+    waiting_for_datetime = State()
     selected_year = State()
     selected_month = State()
     selected_day = State()
@@ -630,17 +647,30 @@ async def hour_selected(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text(f"⏱️ Выберите минуты для {hour}:__:", reply_markup=get_minutes_keyboard(year, month, day, hour))
     await callback.answer()
 
+# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ВЫБОРА МИНУТ ---
 @dp.callback_query(F.data.startswith("min_"))
 async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
+    logger.debug(">>> minute_selected TRIGGERED <<<")
     parts = callback.data.split("_")
-    year, month, day, hour, minute = int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])
+    try:
+        year, month, day, hour, minute = int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])
+    except IndexError:
+        logger.error(f"Failed to parse minute callback data: {callback.data}")
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+
     moscow_tz = pytz.timezone('Europe/Moscow')
     selected_datetime = moscow_tz.localize(datetime(year, month, day, hour, minute))
-    current_state = await state.get_state()
+    logger.debug(f"Selected datetime: {selected_datetime}")
     
-    if current_state == AddNoteState.waiting_for_datetime.__name__:
+    current_state = await state.get_state()
+    logger.debug(f"Current FSM state: {current_state}")
+    
+    if current_state == AddNoteState.waiting_for_datetime:
+        logger.debug("Processing as NEW NOTE creation")
         data = await state.get_data()
         note_text = data.get("note_text")
+        
         if note_text:
             if create_event_in_yandex(note_text, selected_datetime):
                 await callback.message.edit_text(f"✅ Добавлено!\n📅 {day}.{month}.{year} {hour}:{minute:02d}", reply_markup=None)
@@ -650,10 +680,12 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
         else:
             await callback.message.edit_text("❌ Ошибка: текст заметки не найден.", reply_markup=None)
             
-    elif current_state == EditNoteState.waiting_for_datetime.__name__:
+    elif current_state == EditNoteState.waiting_for_datetime:
+        logger.debug("Processing as EDITING existing note")
         data = await state.get_data()
         uid = data.get('original_uid')
         summary = data.get('original_summary')
+        
         if uid and summary:
             delete_event(uid)
             if create_event_in_yandex(summary, selected_datetime):
@@ -663,7 +695,12 @@ async def minute_selected(callback: types.CallbackQuery, state: FSMContext):
                 await callback.message.edit_text("❌ Ошибка при создании события.", reply_markup=None)
         else:
             await callback.message.edit_text("❌ Ошибка данных.", reply_markup=None)
-    
+    else:
+        logger.warning(f"Unexpected state: {current_state}")
+        await callback.answer("Сессия истекла, начните заново.", show_alert=True)
+        await state.clear()
+        return
+
     await state.clear()
     await callback.answer()
 
