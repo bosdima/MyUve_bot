@@ -54,6 +54,7 @@ dp = Dispatcher()
 MAIN_MESSAGE_ID = None
 CURRENT_WEEK_START = None
 TEMP_MESSAGES = []  # Список ID сообщений для автоудаления
+LAST_NOTIFICATION_IDS = {} # Словарь для хранения ID последних уведомлений {uid: message_id}
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_local_time():
@@ -86,9 +87,9 @@ def format_time_only(dt_obj):
     return dt_obj.strftime("%H:%M")
 
 async def delete_temp_messages():
-    """Автоматическое удаление временных сообщений (бота и пользователя) через 5 минут"""
+    """Автоматическое удаление временных сообщений (бота и пользователя) через 15 минут"""
     while True:
-        await asyncio.sleep(300)  # 5 минут
+        await asyncio.sleep(900)  # 15 минут (было 300 = 5 минут)
         for msg_id in TEMP_MESSAGES[:]:
             try:
                 await bot.delete_message(ADMIN_ID, msg_id)
@@ -121,6 +122,20 @@ def get_calendar():
     except Exception as e:
         logger.error(f"CalDAV Error connection: {e}")
         return None
+
+def check_caldav_connection():
+    """Проверяет подключение к календарю"""
+    try:
+        cal = get_calendar()
+        if cal:
+            logger.info("CalDAV: Подключение успешно установлено.")
+            return True
+        else:
+            logger.error("CalDAV: Не удалось получить объект календаря.")
+            return False
+    except Exception as e:
+        logger.error(f"CalDAV: Ошибка проверки подключения: {e}")
+        return False
 
 def get_events_for_week(start_date, end_date):
     """
@@ -375,13 +390,13 @@ async def send_or_edit_main_message(message=None, force_current_week=False):
             if message:
                 sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
-                temp_msg = await message.answer("Используйте кнопки внизу для быстрого доступа.", reply_markup=get_reply_keyboard())
-                add_to_delete_list(temp_msg)
+                # ВАЖНО: ReplyKeyboard отправляем ОТДЕЛЬНО и НЕ добавляем в список удаления!
+                await message.answer("Меню:", reply_markup=get_reply_keyboard())
             else:
                 sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
-                temp_msg = await bot.send_message(ADMIN_ID, "Меню управления:", reply_markup=get_reply_keyboard())
-                add_to_delete_list(temp_msg)
+                # ВАЖНО: ReplyKeyboard отправляем ОТДЕЛЬНО и НЕ добавляем в список удаления!
+                await bot.send_message(ADMIN_ID, "Меню:", reply_markup=get_reply_keyboard())
         else:
             await bot.edit_message_text(
                 chat_id=ADMIN_ID,
@@ -409,8 +424,27 @@ class AddNoteState(StatesGroup):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
+    
+    # Проверка подключения
+    is_connected = check_caldav_connection()
+    
     await state.clear()
     add_to_delete_list(message)
+    global VIEW_MODE, CURRENT_WEEK_START
+    VIEW_MODE = 'TODAY_TOMORROW'
+    CURRENT_WEEK_START = None
+    
+    # Отправляем сообщение о версии и статусе
+    status_text = f"✅ Бот запущен!\n**Версия: {BOT_VERSION}**\n"
+    if is_connected:
+        status_text += "🟢 Подключение к календарю: OK"
+    else:
+        status_text += "🔴 Подключение к календарю: ОШИБКА (проверьте логи)"
+        
+    # Статус тоже можно добавить в удаление, если нужно, но пусть висит для наглядности при старте
+    # add_to_delete_list(await message.answer(status_text, parse_mode=ParseMode.MARKDOWN))
+    await message.answer(status_text, parse_mode=ParseMode.MARKDOWN)
+    
     await send_or_edit_main_message(message, force_current_week=True)
 
 @dp.callback_query(F.data.startswith("nav_prev_"))
@@ -524,8 +558,6 @@ async def close_settings(callback: types.CallbackQuery):
     await callback.message.delete()
 
 # --- СИСТЕМА УВЕДОМЛЕНИЙ ---
-active_notifications = {}
-
 async def notification_scheduler():
     while True:
         await asyncio.sleep(60)
@@ -540,24 +572,43 @@ async def notification_scheduler():
             event_time = ev['time']
             
             if event_time <= now:
-                last_notify = active_notifications.get(uid)
+                last_notify_time = LAST_NOTIFICATION_IDS.get(uid + "_time")
                 
                 should_notify = False
-                if last_notify is None:
+                if last_notify_time is None:
                     if (now - event_time).total_seconds() < 3600: 
                         should_notify = True
                 else:
-                    if (now - last_notify).total_seconds() >= 3600:
+                    if (now - last_notify_time).total_seconds() >= 3600:
                         should_notify = True
                 
                 if should_notify:
                     try:
                         kb = get_notification_keyboard(uid)
-                        text = f"**Напоминание:** {ev['summary']}\nВремя: {format_time_only(event_time)}"
+                        
+                        # Определяем, является ли это повторным уведомлением
+                        is_repeat = (uid in LAST_NOTIFICATION_IDS)
+                        prefix = "🔁 **(Повторное напоминание)**\n" if is_repeat else ""
+                        
+                        text = f"{prefix}**Напоминание:** {ev['summary']}\nВремя: {format_time_only(event_time)}"
+                        
+                        # Если есть предыдущее уведомление, удаляем его
+                        if uid in LAST_NOTIFICATION_IDS:
+                            old_msg_id = LAST_NOTIFICATION_IDS[uid]
+                            try:
+                                await bot.delete_message(ADMIN_ID, old_msg_id)
+                                logger.debug(f"Deleted old notification {old_msg_id} for UID {uid}")
+                            except Exception as e:
+                                logger.warning(f"Could not delete old notification {old_msg_id}: {e}")
+                        
+                        # Отправляем новое уведомление
                         notify_msg = await bot.send_message(ADMIN_ID, text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
                          
-                        active_notifications[uid] = now
-                        logger.info(f"Sent notification for {uid}")
+                        # Сохраняем ID нового сообщения и время отправки
+                        LAST_NOTIFICATION_IDS[uid] = notify_msg.message_id
+                        LAST_NOTIFICATION_IDS[uid + "_time"] = now
+                        
+                        logger.info(f"Sent notification for {uid} (Repeat: {is_repeat})")
                     except Exception as e:
                         logger.error(f"Notify error: {e}")
 
@@ -565,10 +616,15 @@ async def notification_scheduler():
 async def done_notify(callback: types.CallbackQuery):
     uid = callback.data.split("_")[2]
     if delete_event(uid):
-        await callback.message.edit_text("✅ Задача выполнена и удалена.")
+        await callback.message.edit_text("✅ Задача выполнена и удалена.", parse_mode=ParseMode.MARKDOWN)
         add_to_delete_list(callback.message)
-        if uid in active_notifications:
-            del active_notifications[uid]
+        
+        # Очищаем данные о последнем уведомлении
+        if uid in LAST_NOTIFICATION_IDS:
+            del LAST_NOTIFICATION_IDS[uid]
+        if uid + "_time" in LAST_NOTIFICATION_IDS:
+            del LAST_NOTIFICATION_IDS[uid + "_time"]
+            
         await send_or_edit_main_message()
     else:
         await callback.answer("Не удалось удалить", show_alert=True)
@@ -581,6 +637,9 @@ async def snooze_notify(callback: types.CallbackQuery):
 async def main():
     logger.info(f"Bot started v{BOT_VERSION}")
     await asyncio.sleep(2)
+    
+    # Проверка подключения при старте
+    check_caldav_connection()
     
     asyncio.create_task(notification_scheduler())
     asyncio.create_task(delete_temp_messages())
