@@ -13,10 +13,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ParseMode
 import pytz
-import calendar as cal_module
 
 # --- НАСТРОЙКИ И ВЕРСИЯ ---
-BOT_VERSION = "1.6.2"
+BOT_VERSION = "1.6.3"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -54,14 +53,16 @@ dp = Dispatcher()
 # Глобальные переменные состояния
 MAIN_MESSAGE_ID = None
 CURRENT_WEEK_START = None
-TEMP_MESSAGES = []
+TEMP_MESSAGES = []  # Список ID сообщений для автоудаления
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def get_local_time():
+    """Получает текущее время в московском часовом поясе"""
     moscow_tz = pytz.timezone('Europe/Moscow')
     return datetime.now(moscow_tz)
 
 def get_week_start(date_obj):
+    """Возвращает понедельник текущей недели для date_obj"""
     return date_obj - timedelta(days=date_obj.weekday())
 
 def format_date_full(dt_obj):
@@ -85,6 +86,7 @@ def format_time_only(dt_obj):
     return dt_obj.strftime("%H:%M")
 
 async def delete_temp_messages():
+    """Автоматическое удаление временных сообщений через 15 минут"""
     while True:
         await asyncio.sleep(900)  # 15 минут
         for msg_id in TEMP_MESSAGES[:]:
@@ -97,77 +99,10 @@ async def delete_temp_messages():
                     TEMP_MESSAGES.remove(msg_id)
 
 def add_to_delete_list(message_obj):
+    """Добавляет ID сообщения в список на удаление"""
     if message_obj and hasattr(message_obj, 'message_id'):
         if message_obj.message_id not in TEMP_MESSAGES:
             TEMP_MESSAGES.append(message_obj.message_id)
-
-# --- КАЛЕНДАРЬ И ВЫБОР ВРЕМЕНИ ---
-def get_calendar_keyboard(year=None, month=None):
-    now = get_local_time()
-    if year is None: year = now.year
-    if month is None: month = now.month
-    
-    builder = InlineKeyboardBuilder()
-    month_name = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"][month - 1]
-    builder.row(InlineKeyboardButton(text=f"{month_name} {year}", callback_data="calendar_ignore"))
-    
-    prev_month = month - 1 if month > 1 else 12
-    prev_year = year if month > 1 else year - 1
-    next_month = month + 1 if month < 12 else 1
-    next_year = year if month < 12 else year + 1
-    
-    builder.row(
-        InlineKeyboardButton(text="◀️", callback_data=f"cal_prev_{prev_year}_{prev_month}"),
-        InlineKeyboardButton(text="▶️", callback_data=f"cal_next_{next_year}_{next_month}")
-    )
-    
-    days_short = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-    builder.row(*[InlineKeyboardButton(text=d, callback_data="day_ignore") for d in days_short])
-    
-    cal = cal_module.Calendar(firstweekday=0)
-    month_days = cal.monthdayscalendar(year, month)
-    
-    for week in month_days:
-        row = []
-        for day in week:
-            if day == 0:
-                row.append(InlineKeyboardButton(text=" ", callback_data="day_ignore"))
-            else:
-                try:
-                    day_date = datetime(year, month, day)
-                    is_today = (day == now.day and month == now.month and year == now.year)
-                    
-                    if day_date.date() < now.date():
-                        row.append(InlineKeyboardButton(text=str(day), callback_data="day_ignore"))
-                    else:
-                        btn_text = f"{day} 🟢" if is_today else str(day)
-                        row.append(InlineKeyboardButton(text=btn_text, callback_data=f"cal_day_{year}_{month}_{day}"))
-                except:
-                    row.append(InlineKeyboardButton(text=str(day), callback_data="day_ignore"))
-        builder.row(*row)
-    
-    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_datetime"))
-    return builder.as_markup()
-
-def get_hours_keyboard(year, month, day):
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text=f"Выберите час: {day}.{month}.{year}", callback_data="hours_ignore"))
-    buttons = [InlineKeyboardButton(text=f"{hour:02d}", callback_data=f"hour_{year}_{month}_{day}_{hour}") for hour in range(24)]
-    for i in range(0, len(buttons), 4):
-        builder.row(*buttons[i:i+4])
-    builder.row(InlineKeyboardButton(text="◀️ Назад к календарю", callback_data=f"back_calendar_{year}_{month}"))
-    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_datetime"))
-    return builder.as_markup()
-
-def get_minutes_keyboard(year, month, day, hour):
-    builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text=f"Выберите минуты: {hour}:__", callback_data="min_ignore"))
-    minutes = [0, 10, 20, 30, 40, 50]
-    buttons = [InlineKeyboardButton(text=f"{m:02d}", callback_data=f"min_{year}_{month}_{day}_{hour}_{m}") for m in minutes]
-    builder.row(*buttons)
-    builder.row(InlineKeyboardButton(text="◀️ Назад к часам", callback_data=f"back_hours_{year}_{month}_{day}"))
-    builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_datetime"))
-    return builder.as_markup()
 
 # --- РАБОТА С CALDAV ---
 def get_calendar():
@@ -190,6 +125,7 @@ def get_events_for_week(start_date, end_date):
     
     moscow_tz = pytz.timezone('Europe/Moscow')
     
+    # Нормализация входных данных в UTC для запроса к серверу
     if start_date.tzinfo is None:
         start_date = moscow_tz.localize(start_date)
     if end_date.tzinfo is None:
@@ -375,30 +311,12 @@ def get_settings_kb(current_interval):
     builder.adjust(2)
     return builder.as_markup()
 
-# --- СОСТОЯНИЯ ---
-class AddNoteState(StatesGroup):
-    waiting_for_text = State()
-    waiting_for_time = State()
-    waiting_for_datetime = State()
-    selected_year = State()
-    selected_month = State()
-    selected_day = State()
-    selected_hour = State()
-
-class EditNoteState(StatesGroup):
-    waiting_for_datetime = State()
-    selected_year = State()
-    selected_month = State()
-    selected_day = State()
-    selected_hour = State()
-    original_uid = State()
-    original_summary = State()
-
 # --- ОСНОВНАЯ ЛОГИКА ---
 async def build_week_report(week_start):
     global CURRENT_WEEK_START
     CURRENT_WEEK_START = week_start
     
+    # Конец недели: воскресенье 23:59:59
     week_end = week_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
     events = get_events_for_week(week_start, week_end)
 
@@ -437,6 +355,7 @@ async def send_or_edit_main_message(message=None, force_current_week=False):
             if message:
                 sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
+                # ReplyKeyboard отправляем ОТДЕЛЬНО и НЕ добавляем в список удаления!
                 await message.answer("📋", reply_markup=get_reply_keyboard())
             else:
                 sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
@@ -500,9 +419,17 @@ async def force_refresh(callback: types.CallbackQuery):
     await callback.answer("Обновление...")
     await send_or_edit_main_message(force_current_week=True)
 
+# === ИСПРАВЛЕНИЕ ЗДЕСЬ ===
 @dp.callback_query(F.data == "manage_list")
 async def show_manage_list(callback: types.CallbackQuery):
-    events = get_events_for_week(CURRENT_WEEK_START, CURRENT_WEEK_START + timedelta(days=6))
+    # Гарантируем, что начало недели инициализировано
+    if CURRENT_WEEK_START is None:
+        CURRENT_WEEK_START = get_week_start(get_local_time())
+        
+    # Исправляем конец недели, чтобы включить ВЕСЬ день воскресенья (до 23:59:59)
+    week_end = CURRENT_WEEK_START + timedelta(days=6, hours=23, minutes=59, seconds=59)
+    events = get_events_for_week(CURRENT_WEEK_START, week_end)
+    
     kb = get_manage_list_keyboard(events)
     if events:
         await send_temp_message("Выберите задачу для управления:", reply_markup=kb)
