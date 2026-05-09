@@ -18,7 +18,7 @@ import calendar as cal_module
 # ==========================================
 # НАСТРОЙКИ И ВЕРСИЯ
 # ==========================================
-BOT_VERSION = "1.6.4"
+BOT_VERSION = "1.6.5"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -61,7 +61,7 @@ CURRENT_WEEK_START = None
 TEMP_MESSAGES = []
 
 # ==========================================
-# FSM СОСТОЯНИЯ (Определены ДО обработчиков!)
+# FSM СОСТОЯНИЯ
 # ==========================================
 class AddNoteState(StatesGroup):
     waiting_for_text = State()
@@ -412,7 +412,6 @@ async def send_or_edit_main_message(message=None, force_current_week=False):
             if message:
                 sent_msg = await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
                 MAIN_MESSAGE_ID = sent_msg.message_id
-                # ReplyKeyboard отправляем ОТДЕЛЬНО и НЕ добавляем в список удаления!
                 await message.answer("📋", reply_markup=get_reply_keyboard())
             else:
                 sent_msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
@@ -470,17 +469,26 @@ async def force_refresh(callback: types.CallbackQuery):
     await callback.answer("Обновление...")
     await send_or_edit_main_message(force_current_week=True)
 
+# === ИСПРАВЛЕННЫЙ ОБРАБОТЧИК КНОПКИ "УПРАВЛЕНИЕ" ===
 @dp.callback_query(F.data == "manage_list")
 async def show_manage_list(callback: types.CallbackQuery):
-    if CURRENT_WEEK_START is None: CURRENT_WEEK_START = get_week_start(get_local_time())
-    week_end = CURRENT_WEEK_START + timedelta(days=6, hours=23, minutes=59, seconds=59)
-    events = get_events_for_week(CURRENT_WEEK_START, week_end)
-    kb = get_manage_list_keyboard(events)
-    if events:
-        await send_temp_message("Выберите задачу для управления:", reply_markup=kb)
-    else:
-        await send_temp_message("Нет задач для управления.", reply_markup=kb)
+    # 1. Сразу отвечаем на callback, чтобы убрать индикатор загрузки в Telegram
     await callback.answer()
+    try:
+        global CURRENT_WEEK_START
+        if CURRENT_WEEK_START is None:
+            CURRENT_WEEK_START = get_week_start(get_local_time())
+            
+        week_end = CURRENT_WEEK_START + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        events = get_events_for_week(CURRENT_WEEK_START, week_end)
+        
+        kb = get_manage_list_keyboard(events)
+        text = "Выберите задачу для управления:" if events else "Нет задач для управления."
+        
+        await send_temp_message(text, reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Ошибка в show_manage_list: {e}", exc_info=True)
+        await bot.send_message(ADMIN_ID, "❌ Произошла ошибка при загрузке списка задач.")
 
 @dp.callback_query(F.data.startswith("manage_"))
 async def show_manage_actions(callback: types.CallbackQuery):
