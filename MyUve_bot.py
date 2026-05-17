@@ -19,7 +19,7 @@ import re
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.8.1"
+BOT_VERSION = "1.8.2"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -317,10 +317,13 @@ async def send_or_edit_main_message(message=None):
             logger.info(f"Обновление главного сообщения (ID: {MAIN_MESSAGE_ID})...")
             await bot.edit_message_text(chat_id=ADMIN_ID, message_id=MAIN_MESSAGE_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception as e:
-        logger.error(f"Ошибка отправки/редактирования главного сообщения: {e}")
-        if "message to edit not found" in str(e): 
+        if "message is not modified" in str(e):
+            logger.debug("Сообщение не изменено (игнорируем)")
+        elif "message to edit not found" in str(e):
             MAIN_MESSAGE_ID = None
             logger.info("Сброс MAIN_MESSAGE_ID. Следующий вызов создаст сообщение заново.")
+        else:
+            logger.error(f"Ошибка отправки/редактирования главного сообщения: {e}")
 
 # ==========================================
 # ОБРАБОТЧИКИ
@@ -330,7 +333,6 @@ async def cmd_start(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     logger.debug(f"/start от {message.from_user.id}")
     await send_or_edit_main_message(message)
-    await callback.answer() if hasattr(message, 'callback_query') else None
 
 @dp.callback_query(F.data == "force_refresh")
 async def force_refresh(callback: types.CallbackQuery):
@@ -360,14 +362,17 @@ async def mark_done(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("edit_date_"))
 async def start_edit_date_from_manage(callback: types.CallbackQuery, state: FSMContext):
-    uid = callback.data.split("_")[2]
+    # Безопасный парсинг UID (edit_date_{uid})
+    uid = callback.data.split("_", maxsplit=2)[2]
     logger.debug(f"Начало редактирования: {uid}")
     events = get_events_for_range(get_local_time() - timedelta(days=14), get_local_time() + timedelta(days=20))
     target = next((e for e in events if e['uid'] == uid), None)
     if not target: await callback.answer("Событие не найдено", show_alert=True); return
     await state.update_data(original_uid=uid, original_summary=target['summary'])
     await state.set_state(EditNoteState.waiting_for_datetime)
-    await callback.message.edit_text(f"📅 Изменяем: <b>{escape_html(target['summary'])}</b>\nВыберите новую дату:", reply_markup=get_calendar_keyboard(), parse_mode=ParseMode.HTML)
+    try:
+        await callback.message.edit_text(f"📅 Изменяем: <b>{escape_html(target['summary'])}</b>\nВыберите новую дату:", reply_markup=get_calendar_keyboard(), parse_mode=ParseMode.HTML)
+    except Exception as e: logger.error(f"edit_date edit error: {e}")
     await callback.answer()
 
 # --- КАЛЕНДАРЬ И ВРЕМЯ ---
@@ -381,54 +386,67 @@ async def cal_nav(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("cal_day_"))
 async def cal_day(callback: types.CallbackQuery, state: FSMContext):
-    logger.debug(f"callback: {callback.data} | split: {callback.data.split('_')}")
-    _, y, m, d = map(int, callback.data.split("_"))
-    logger.debug(f"Выбрана дата: {d}.{m}.{y} | State: {await state.get_state()}")
-    try: await callback.message.edit_text(f"🕐 Час для {d}.{m}.{y}:", reply_markup=get_hours_keyboard(y, m, d))
-    except Exception as e: logger.error(f"cal_day edit error: {e}")
+    try:
+        logger.debug(f"CalDay Callback: {callback.data}")
+        parts = callback.data.split("_")
+        y, m, d = int(parts[2]), int(parts[3]), int(parts[4])
+        logger.info(f"Выбрана дата: {d}.{m}.{y} | State: {await state.get_state()}")
+        await callback.message.edit_text(f"🕐 Час для {d}.{m}.{y}:", reply_markup=get_hours_keyboard(y, m, d))
+    except Exception as e:
+        logger.error(f"cal_day error: {e}", exc_info=True)
+        await callback.answer("Ошибка интерфейса", show_alert=True)
+        return
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("hour_"))
 async def sel_hour(callback: types.CallbackQuery, state: FSMContext):
-    logger.debug(f"Выбран час: {callback.data}")
-    _, y, m, d, h = map(int, callback.data.split("_"))
-    try: await callback.message.edit_text(f"⏱ Минуты для {h}:__:", reply_markup=get_minutes_keyboard(y, m, d, h))
-    except Exception as e: logger.error(f"sel_hour edit error: {e}")
+    try:
+        logger.debug(f"Hour Callback: {callback.data}")
+        parts = callback.data.split("_")
+        y, m, d, h = int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
+        await callback.message.edit_text(f"⏱ Минуты для {h}:__:", reply_markup=get_minutes_keyboard(y, m, d, h))
+    except Exception as e:
+        logger.error(f"sel_hour error: {e}", exc_info=True)
+        await callback.answer("Ошибка интерфейса", show_alert=True)
+        return
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("min_"))
 async def sel_min(callback: types.CallbackQuery, state: FSMContext):
     try:
-        logger.debug(f"Финальный выбор: {callback.data}")
-        _, y, m, d, h, mn = map(int, callback.data.split("_"))
+        logger.debug(f"Min Callback: {callback.data}")
+        parts = callback.data.split("_")
+        y, m, d, h, mn = int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])
         dt = pytz.timezone('Europe/Moscow').localize(datetime(y, m, d, h, mn))
         st = await state.get_state()
-        logger.debug(f"Текущий state: {st}")
-        
+        logger.info(f"Текущее состояние: {st} | Выбрано время: {dt}")
+
         if st == AddNoteState.waiting_for_datetime.state:
             data = await state.get_data()
             txt = data.get("note_text", "Без названия")
-            logger.info(f"Создание события: {txt} на {dt}")
+            logger.info(f"Создание события: '{txt}' на {dt}")
             if create_event_in_yandex(txt, dt):
                 await callback.message.edit_text(f"✅ <b>Создано!</b>\n{format_date_full(dt)} {format_time_only(dt)}", parse_mode=ParseMode.HTML)
                 await send_or_edit_main_message()
-                
         elif st == EditNoteState.waiting_for_datetime.state:
             data = await state.get_data()
             uid = data.get("original_uid")
             summ = data.get("original_summary")
-            logger.info(f"Редактирование события {uid} -> {summ} на {dt}")
+            logger.info(f"Редактирование UID:{uid} '{summ}' на {dt}")
             if uid and summ:
                 if delete_event(uid):
                     create_event_in_yandex(summ, dt)
                     active_notifications.pop(uid, None)
                     await callback.message.edit_text(f"✅ <b>Изменено!</b>\n{format_date_full(dt)} {format_time_only(dt)}", parse_mode=ParseMode.HTML)
                     await send_or_edit_main_message()
-                    
+                else:
+                    await callback.answer("Не удалось удалить старое событие", show_alert=True)
+                    return
         await state.clear()
+        logger.info("Состояние очищено")
     except Exception as e:
-        logger.error(f"Time select error: {e}", exc_info=True)
-        await callback.answer("Ошибка формата", show_alert=True)
+        logger.error(f"sel_min error: {e}", exc_info=True)
+        await callback.answer("Ошибка сохранения", show_alert=True)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("back_"))
@@ -493,7 +511,7 @@ async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("edit_date_notify_"))
 async def edit_date_from_notification(callback: types.CallbackQuery, state: FSMContext):
     try:
-        uid = callback.data.split("_")[3]
+        uid = callback.data.split("_", maxsplit=3)[3]
         events = get_events_for_range(get_local_time() - timedelta(days=14), get_local_time() + timedelta(days=20))
         target = next((e for e in events if e['uid'] == uid), None)
         if not target: await callback.answer("Событие не найдено", show_alert=True); return
@@ -559,10 +577,6 @@ async def check_startup_status():
     ok, cal_obj = await check_caldav_connection()
     if ok:
         status_lines.append("✅ Яндекс.Календарь: <b>Подключен успешно</b>")
-        try:
-            events_count = len(get_events_for_range(get_local_time(), get_local_time()+timedelta(days=1)))
-            status_lines.append(f"📅 Найдено событий на сегодня: <b>{events_count}</b>")
-        except: pass
     else:
         status_lines.append("❌ Яндекс.Календарь: <b>ОШИБКА ПОДКЛЮЧЕНИЯ</b>")
         status_lines.append("🔧 Проверьте в .env:\n- YANDEX_LOGIN\n- YANDEX_APP_PASSWORD (пароль приложения, не основной!)\n- Доступ к календарю в настройках Яндекса")
@@ -572,11 +586,8 @@ async def check_startup_status():
     logger.info("Стартовое сообщение отправлено администратору")
 
 async def main():
-    # 1. Проверка статуса
     await check_startup_status()
-    # 2. Автоматическая отправка главного отчёта сразу после запуска
     await send_or_edit_main_message()
-    # 3. Запуск фоновых задач и polling
     asyncio.create_task(notification_loop())
     asyncio.create_task(delete_temp_messages())
     logger.info("Бот готов к работе. Ожидание обновлений...")
