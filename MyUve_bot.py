@@ -18,7 +18,7 @@ import calendar as cal_module
 # ==========================================
 # НАСТРОЙКИ И ВЕРСИЯ
 # ==========================================
-BOT_VERSION = "1.6.8"
+BOT_VERSION = "1.6.9"
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -115,7 +115,7 @@ def format_time_only(dt_obj):
 
 async def delete_temp_messages():
     while True:
-        await asyncio.sleep(900)
+        await asyncio.sleep(900)  # 15 минут
         for msg_id in TEMP_MESSAGES[:]:
             try:
                 await bot.delete_message(ADMIN_ID, msg_id)
@@ -687,7 +687,6 @@ async def cleanup_notifications():
     while True:
         await asyncio.sleep(900)  # Проверка каждые 15 минут
         now = get_local_time()
-        # Запрашиваем широкий диапазон, чтобы точно найти удалённые события
         wide_start = now - timedelta(days=7)
         wide_end = now + timedelta(days=14)
         events = get_events_for_range(wide_start, wide_end)
@@ -708,7 +707,6 @@ async def done_notify(callback: types.CallbackQuery):
     if delete_event(uid):
         await callback.message.edit_text("✅ Задача выполнена и удалена.", parse_mode=ParseMode.MARKDOWN)
         add_to_delete_list(callback.message)
-        # Очищаем запись об уведомлении
         active_notifications.pop(uid, None)
         await send_or_edit_main_message()
     else:
@@ -725,7 +723,6 @@ async def main():
     logger.info(f"Bot started v{BOT_VERSION}")
     await asyncio.sleep(2)
     
-    # Запускаем фоновые задачи
     asyncio.create_task(notification_scheduler())
     asyncio.create_task(cleanup_notifications())
     asyncio.create_task(delete_temp_messages())
