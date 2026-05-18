@@ -19,7 +19,7 @@ import re
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.10.0"
+BOT_VERSION = "1.10.1"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -210,6 +210,55 @@ def get_events_for_range(start_date, end_date):
     except Exception as e:
         logger.error(f"CalDAV fetch error: {e}")
         return []
+
+def get_event_by_uid(uid):
+    """Поиск события по UID во всём календаре (без ограничения по дате)"""
+    if not caldav_connected: 
+        logger.warning("CalDAV не подключен")
+        return None
+    
+    try:
+        client = caldav.DAVClient(url=CALDAV_URL, username=YANDEX_LOGIN, password=YANDEX_PASSWORD)
+        calendars = client.principal().calendars()
+        if not calendars: 
+            logger.warning("Календари не найдены")
+            return None
+        
+        # Ищем событие напрямую по UID
+        try:
+            ev = calendars[0].event_by_uid(uid)
+            if ev:
+                ical = ev.icalendar_instance
+                vevent = next((c for c in ical.walk() if c.name == "VEVENT"), None)
+                if vevent:
+                    summary = str(vevent.get('SUMMARY', 'Без названия'))
+                    dt_prop = vevent.get('DTSTART')
+                    if dt_prop:
+                        dt_val = dt_prop.dt
+                        moscow_tz = pytz.timezone('Europe/Moscow')
+                        dt_utc = dt_val if dt_val.tzinfo else dt_val.replace(tzinfo=timezone.utc)
+                        logger.info(f"Найдено событие по UID: {uid} -> {summary}")
+                        return {"summary": summary, "time": dt_utc.astimezone(moscow_tz), "uid": uid}
+        except Exception as e:
+            logger.warning(f"Прямой поиск по UID не удался: {e}")
+        
+        # Если не нашли, пробуем широкий диапазон
+        logger.info(f"Пробуем широкий диапазон поиска для UID: {uid}")
+        now = get_local_time()
+        start = now - timedelta(days=90)  # 3 месяца назад
+        end = now + timedelta(days=90)    # 3 месяца вперед
+        
+        all_events = get_events_for_range(start, end)
+        for ev in all_events:
+            if ev['uid'] == uid:
+                logger.info(f"Найдено событие в широком диапазоне: {uid}")
+                return ev
+        
+        logger.warning(f"Событие с UID {uid} не найдено")
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка поиска события по UID {uid}: {e}", exc_info=True)
+        return None
 
 def delete_event(uid):
     try:
@@ -408,28 +457,49 @@ async def mark_done(callback: types.CallbackQuery):
         await send_or_edit_main_message()
     else: await callback.answer("Ошибка удаления", show_alert=True)
 
+# ИСПРАВЛЕНО: Используем get_event_by_uid вместо поиска по диапазону
 @dp.callback_query(F.data.startswith("edit_date_"))
 async def start_edit_date(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.data.split("_", maxsplit=2)[2]
-    events = get_events_for_range(get_local_time() - timedelta(days=14), get_local_time() + timedelta(days=20))
-    target = next((e for e in events if e['uid'] == uid), None)
-    if not target: await callback.answer("Событие не найдено", show_alert=True); return
+    logger.info(f"Запрос на изменение даты для UID: {uid}")
+    
+    # ИСПРАВЛЕНО: Используем прямой поиск по UID
+    target = get_event_by_uid(uid)
+    
+    if not target:
+        logger.error(f"Событие {uid} не найдено в календаре")
+        await callback.answer("Событие не найдено в календаре", show_alert=True)
+        return
+    
+    logger.info(f"Найдено событие: {target['summary']} на {target['time']}")
     await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
     await state.set_state(EditNoteState.waiting_for_datetime)
-    try: await callback.message.edit_text(f"📅 Изменяем: <b>{escape_html(target['summary'])}</b>\nВыберите новую дату:", reply_markup=get_calendar_keyboard(), parse_mode=ParseMode.HTML)
-    except: pass
+    try: 
+        await callback.message.edit_text(f"📅 Изменяем: <b>{escape_html(target['summary'])}</b>\nВыберите новую дату:", reply_markup=get_calendar_keyboard(), parse_mode=ParseMode.HTML)
+    except Exception as e: 
+        logger.error(f"Ошибка edit_text: {e}")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("edit_text_"))
 async def start_edit_text(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.data.split("_", maxsplit=2)[2]
-    events = get_events_for_range(get_local_time() - timedelta(days=14), get_local_time() + timedelta(days=20))
-    target = next((e for e in events if e['uid'] == uid), None)
-    if not target: await callback.answer("Событие не найдено", show_alert=True); return
+    logger.info(f"Запрос на изменение текста для UID: {uid}")
+    
+    # ИСПРАВЛЕНО: Используем прямой поиск по UID
+    target = get_event_by_uid(uid)
+    
+    if not target:
+        logger.error(f"Событие {uid} не найдено в календаре")
+        await callback.answer("Событие не найдено в календаре", show_alert=True)
+        return
+    
+    logger.info(f"Найдено событие: {target['summary']}")
     await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
     await state.set_state(EditNoteState.waiting_for_new_text)
-    try: await callback.message.edit_text(f"📝 <b>{escape_html(target['summary'])}</b>\nВведите новый текст:", parse_mode=ParseMode.HTML)
-    except: pass
+    try: 
+        await callback.message.edit_text(f"📝 <b>{escape_html(target['summary'])}</b>\nВведите новый текст:", parse_mode=ParseMode.HTML)
+    except Exception as e: 
+        logger.error(f"Ошибка edit_text: {e}")
     await callback.answer()
 
 # --- КАЛЕНДАРЬ И ВРЕМЯ ---
@@ -485,11 +555,14 @@ async def sel_min(callback: types.CallbackQuery, state: FSMContext):
                     active_notifications.pop(uid, None)
                     await callback.message.edit_text(f"✅ <b>Изменено!</b>\n{format_date_full(dt)} {format_time_only(dt)}", parse_mode=ParseMode.HTML)
                     await send_or_edit_main_message()
-                else: await callback.answer("Не удалось удалить старое событие", show_alert=True); return
+                else: 
+                    await callback.answer("Не удалось удалить старое событие", show_alert=True)
+                    return
         await state.clear()
-    except Exception as e: logger.error(f"sel_min error: {e}", exc_info=True)
-    await callback.answer("Ошибка сохранения", show_alert=True)
-    await callback.answer()
+        await callback.answer()  # ИСПРАВЛЕНО: убираем дублирующийся callback.answer
+    except Exception as e: 
+        logger.error(f"sel_min error: {e}", exc_info=True)
+        await callback.answer("Ошибка сохранения", show_alert=True)
 
 @dp.callback_query(F.data.startswith("back_"))
 async def go_back(callback: types.CallbackQuery):
@@ -573,30 +646,46 @@ async def save_new_text(message: types.Message, state: FSMContext):
 async def edit_date_from_notification(callback: types.CallbackQuery, state: FSMContext):
     try:
         uid = callback.data.split("_", maxsplit=3)[3]
-        events = get_events_for_range(get_local_time() - timedelta(days=14), get_local_time() + timedelta(days=20))
-        target = next((e for e in events if e['uid'] == uid), None)
-        if not target: await callback.answer("Событие не найдено", show_alert=True); return
+        logger.info(f"Запрос на изменение даты из уведомления: {uid}")
+        
+        # ИСПРАВЛЕНО: Используем прямой поиск по UID
+        target = get_event_by_uid(uid)
+        
+        if not target: 
+            await callback.answer("Событие не найдено в календаре", show_alert=True)
+            return
+        
         await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
         await state.set_state(EditNoteState.waiting_for_datetime)
-        try: await callback.message.edit_text(f"📅 Изменяем: <b>{escape_html(target['summary'])}</b>\nВыберите новую дату:", reply_markup=get_calendar_keyboard(), parse_mode=ParseMode.HTML)
+        try: 
+            await callback.message.edit_text(f"📅 Изменяем: <b>{escape_html(target['summary'])}</b>\nВыберите новую дату:", reply_markup=get_calendar_keyboard(), parse_mode=ParseMode.HTML)
         except: pass
-    except Exception as e: logger.error(f"Edit from notify error: {e}", exc_info=True)
-    await callback.answer("Ошибка", show_alert=True)
+    except Exception as e: 
+        logger.error(f"Edit from notify error: {e}", exc_info=True)
+        await callback.answer("Ошибка", show_alert=True)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("edit_text_notify_"))
 async def edit_text_from_notification(callback: types.CallbackQuery, state: FSMContext):
     try:
         uid = callback.data.split("_", maxsplit=3)[3]
-        events = get_events_for_range(get_local_time() - timedelta(days=14), get_local_time() + timedelta(days=20))
-        target = next((e for e in events if e['uid'] == uid), None)
-        if not target: await callback.answer("Событие не найдено", show_alert=True); return
+        logger.info(f"Запрос на изменение текста из уведомления: {uid}")
+        
+        # ИСПРАВЛЕНО: Используем прямой поиск по UID
+        target = get_event_by_uid(uid)
+        
+        if not target: 
+            await callback.answer("Событие не найдено в календаре", show_alert=True)
+            return
+        
         await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
         await state.set_state(EditNoteState.waiting_for_new_text)
-        try: await callback.message.edit_text(f"📝 <b>{escape_html(target['summary'])}</b>\nВведите новый текст:", parse_mode=ParseMode.HTML)
+        try: 
+            await callback.message.edit_text(f"📝 <b>{escape_html(target['summary'])}</b>\nВведите новый текст:", parse_mode=ParseMode.HTML)
         except: pass
-    except Exception as e: logger.error(f"Edit text from notify error: {e}", exc_info=True)
-    await callback.answer("Ошибка", show_alert=True)
+    except Exception as e: 
+        logger.error(f"Edit text from notify error: {e}", exc_info=True)
+        await callback.answer("Ошибка", show_alert=True)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("done_notify_"))
