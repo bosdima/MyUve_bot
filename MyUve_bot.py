@@ -19,7 +19,7 @@ import re
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.9.0"
+BOT_VERSION = "1.10.0"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -57,7 +57,10 @@ MAIN_MESSAGE_ID = None
 TEMP_MESSAGES = []
 active_notifications = {}
 caldav_connected = False
-VIEW_START_DATE = None  # Глобальная дата начала просмотра (по умолчанию понедельник текущей недели)
+
+# Глобальные настройки просмотра
+VIEW_MODE = "short"  # "short" (сегодня/завтра) или "week" (неделя)
+VIEW_OFFSET_DAYS = 0
 
 # ==========================================
 # FSM СОСТОЯНИЯ
@@ -69,10 +72,10 @@ class AddNoteState(StatesGroup):
 
 class EditNoteState(StatesGroup):
     waiting_for_datetime = State()
-    waiting_for_new_text = State()  # НОВОЕ: состояние ожидания текста
+    waiting_for_new_text = State()
     original_uid = State()
     original_summary = State()
-    original_time = State()         # НОВОЕ: сохранение времени для корректного обновления
+    original_time = State()
 
 # ==========================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -232,25 +235,38 @@ def create_event_in_yandex(summary, start_dt, duration_hours=1):
     return False
 
 # ==========================================
-# КЛАВИАТУРЫ
+# КЛАВИАТУРЫ И ОТЧЁТ
 # ==========================================
-def get_reply_keyboard():
-    b = ReplyKeyboardBuilder()
-    b.row(KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки"))
-    return b.as_markup(resize_keyboard=True)
+def get_main_kb():
+    global VIEW_MODE
+    b = InlineKeyboardBuilder()
+    b.row(
+        InlineKeyboardButton(text="📅 Сегодня/Завтра", callback_data="view_short"),
+        InlineKeyboardButton(text="🗓 Неделя", callback_data="view_week")
+    )
+    step = 1 if VIEW_MODE == "short" else 7
+    b.row(
+        InlineKeyboardButton(text="◀️ Назад", callback_data=f"view_back_{step}"),
+        InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"view_next_{step}")
+    )
+    b.row(
+        InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"),
+        InlineKeyboardButton(text="✏️ Управление", callback_data="manage_list")
+    )
+    return b.as_markup()
 
 def get_notification_keyboard(uid):
     b = InlineKeyboardBuilder()
     b.button(text="✅ Выполнено", callback_data=f"done_notify_{uid}")
     b.button(text="📅 Изменить дату", callback_data=f"edit_date_notify_{uid}")
-    b.button(text="📝 Изменить текст", callback_data=f"edit_text_notify_{uid}")  # НОВОЕ
+    b.button(text="📝 Изменить текст", callback_data=f"edit_text_notify_{uid}")
     b.adjust(1)
     return b.as_markup()
 
 def get_manage_action_keyboard(uid):
     b = InlineKeyboardBuilder()
     b.button(text="📅 Изменить дату/время", callback_data=f"edit_date_{uid}")
-    b.button(text="📝 Изменить текст", callback_data=f"edit_text_{uid}")        # НОВОЕ
+    b.button(text="📝 Изменить текст", callback_data=f"edit_text_{uid}")
     b.button(text="✅ Выполнено (Удалить)", callback_data=f"done_{uid}")
     b.adjust(1); return b.as_markup()
 
@@ -271,41 +287,32 @@ def get_settings_kb(current_interval):
         b.button(text=f"{mins} мин {'✅' if mins==current_interval else ''}", callback_data=f"set_{mins}")
     b.adjust(2); return b.as_markup()
 
-# ==========================================
-# ЛОГИКА ОТОБРАЖЕНИЯ (НЕДЕЛЬНЫЙ ПРОСМОТР)
-# ==========================================
-def get_week_navigation_kb(start_date):
-    b = InlineKeyboardBuilder()
-    prev_ts = (start_date - timedelta(days=7)).timestamp()
-    next_ts = (start_date + timedelta(days=7)).timestamp()
-    b.row(
-        InlineKeyboardButton(text="◀️ Пред. неделя", callback_data=f"week_{prev_ts}"),
-        InlineKeyboardButton(text="След. неделя ▶️", callback_data=f"week_{next_ts}")
-    )
-    b.row(InlineKeyboardButton(text="🔄 Обновить", callback_data="force_refresh"))
-    b.row(InlineKeyboardButton(text="✏️ Управление", callback_data="manage_list"))
-    return b.as_markup()
-
-async def build_report(start_date=None):
-    global VIEW_START_DATE
+async def build_report():
+    global VIEW_MODE, VIEW_OFFSET_DAYS
     now = get_local_time()
-    if start_date is None:
-        start_date = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    VIEW_START_DATE = start_date
-    
-    end_date = start_date + timedelta(days=7)
-    events = get_events_for_range(start_date, end_date)
-    week_label = f"{format_date_full(start_date)} — {format_date_full(end_date - timedelta(seconds=1))}"
-    text = f"<b>📅 Неделя</b>\n<i>Период: {week_label}</i>\n\n"
+    base_date = (now + timedelta(days=VIEW_OFFSET_DAYS)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if VIEW_MODE == "short":
+        start = base_date
+        end = start + timedelta(days=2)
+        title = "🔥 Сегодня и Завтра"
+    else:
+        start = base_date
+        end = start + timedelta(days=7)
+        title = "📅 Неделя"
+
+    view_label = f"<i>{format_date_full(start)} — {format_date_full(end - timedelta(seconds=1))}</i>"
+    events = get_events_for_range(start, end)
+    text = f"<b>{title}</b>\n{view_label}\n\n"
     if not events:
-        text += "✨ Нет событий на этой неделе."
+        text += "✨ Нет событий."
     else:
         lines = []
         for ev in events:
             lines.append(f"📍 <b>{format_time_only(ev['time'])}</b> — {escape_html(ev['summary'])} (<i>{format_date_full(ev['time'])}</i>)")
         text += "\n".join(lines)
     text += f"\n\n<i>Обновлено: {now.strftime('%d.%m.%Y %H:%M')}</i>"
-    return text, get_week_navigation_kb(start_date)
+    return text, get_main_kb()
 
 async def send_or_edit_main_message(message=None):
     global MAIN_MESSAGE_ID
@@ -316,11 +323,11 @@ async def send_or_edit_main_message(message=None):
             if message:
                 msg = await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
                 MAIN_MESSAGE_ID = msg.message_id
-                await message.answer("📋", reply_markup=get_reply_keyboard())
+                await message.answer("📋", reply_markup=ReplyKeyboardBuilder().row(KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки")).as_markup(resize_keyboard=True))
             else:
                 msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=kb)
                 MAIN_MESSAGE_ID = msg.message_id
-                await bot.send_message(ADMIN_ID, "📋", reply_markup=get_reply_keyboard())
+                await bot.send_message(ADMIN_ID, "📋", reply_markup=ReplyKeyboardBuilder().row(KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки")).as_markup(resize_keyboard=True))
         else:
             logger.info(f"Обновление главного сообщения (ID: {MAIN_MESSAGE_ID})...")
             await bot.edit_message_text(chat_id=ADMIN_ID, message_id=MAIN_MESSAGE_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -337,30 +344,61 @@ async def send_or_edit_main_message(message=None):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
-    logger.debug(f"/start от {message.from_user.id}")
     await send_or_edit_main_message(message)
 
 @dp.callback_query(F.data == "force_refresh")
 async def force_refresh(callback: types.CallbackQuery):
+    global VIEW_MODE, VIEW_OFFSET_DAYS
+    VIEW_MODE = "short"; VIEW_OFFSET_DAYS = 0
     await callback.answer("Обновлено")
     await send_or_edit_main_message()
 
-@dp.callback_query(F.data.startswith("week_"))
-async def week_nav(callback: types.CallbackQuery):
-    ts = float(callback.data.split("_", maxsplit=1)[1])
+@dp.callback_query(F.data == "view_short")
+async def set_view_short(callback: types.CallbackQuery):
+    global VIEW_MODE, VIEW_OFFSET_DAYS
+    VIEW_MODE = "short"; VIEW_OFFSET_DAYS = 0
     await callback.answer()
     await send_or_edit_main_message()
 
+@dp.callback_query(F.data == "view_week")
+async def set_view_week(callback: types.CallbackQuery):
+    global VIEW_MODE, VIEW_OFFSET_DAYS
+    VIEW_MODE = "week"; VIEW_OFFSET_DAYS = 0
+    await callback.answer()
+    await send_or_edit_main_message()
+
+@dp.callback_query(F.data.startswith("view_back_") | F.data.startswith("view_next_"))
+async def nav_view(callback: types.CallbackQuery):
+    global VIEW_OFFSET_DAYS
+    step = int(callback.data.split("_")[-1])
+    if "back" in callback.data: VIEW_OFFSET_DAYS -= step
+    else: VIEW_OFFSET_DAYS += step
+    await callback.answer()
+    await send_or_edit_main_message()
+
+# --- УПРАВЛЕНИЕ (Список -> Действия) ---
 @dp.callback_query(F.data == "manage_list")
 async def show_manage(callback: types.CallbackQuery):
     now = get_local_time()
-    events = get_events_for_range(now.replace(hour=0, minute=0, second=0, microsecond=0), now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=14))
-    kb = get_manage_action_keyboard(events[0]['uid']) if events else InlineKeyboardBuilder().button(text="🔙 Закрыть", callback_data="close_manage").as_markup()
-    await callback.answer()
-    if events:
-        await bot.send_message(ADMIN_ID, "Выберите действие для первой задачи:", reply_markup=kb, parse_mode=ParseMode.HTML)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=14)
+    events = get_events_for_range(start, end)
+    kb = InlineKeyboardBuilder()
+    if not events:
+        kb.button(text="Нет событий", callback_data="ignore")
     else:
-        await bot.send_message(ADMIN_ID, "Нет задач.", reply_markup=kb)
+        for ev in events:
+            kb.button(text=f"📋 {escape_html(ev['summary'])} ({format_time_only(ev['time'])})", callback_data=f"sel_event_{ev['uid']}")
+    kb.button(text="🔙 Закрыть", callback_data="close_manage")
+    kb.adjust(1)
+    await callback.answer()
+    await bot.send_message(ADMIN_ID, "Выберите задачу для управления:", reply_markup=kb.as_markup(), parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data.startswith("sel_event_"))
+async def select_event_manage(callback: types.CallbackQuery):
+    uid = callback.data.split("_", maxsplit=2)[2]
+    await callback.message.edit_text("Выберите действие:", reply_markup=get_manage_action_keyboard(uid))
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("done_"))
 async def mark_done(callback: types.CallbackQuery):
@@ -520,19 +558,17 @@ async def save_new_text(message: types.Message, state: FSMContext):
     old_time = data.get("original_time")
     
     if uid and old_time:
-        logger.info(f"Изменение текста: UID:{uid} -> '{new_text}' (время сохранено: {old_time})")
+        logger.info(f"Изменение текста: UID:{uid} -> '{new_text}'")
         if delete_event(uid):
             create_event_in_yandex(new_text, old_time)
             active_notifications.pop(uid, None)
             await message.answer(f"✅ <b>Текст изменён!</b>\n{escape_html(new_text)}", parse_mode=ParseMode.HTML)
             await send_or_edit_main_message()
-        else:
-            await message.answer("❌ Ошибка удаления старого события.", parse_mode=ParseMode.HTML)
-    else:
-        await message.answer("❌ Ошибка: данные события потеряны.")
+        else: await message.answer("❌ Ошибка удаления старого события.")
+    else: await message.answer("❌ Ошибка: данные события потеряны.")
     await state.clear()
 
-# --- ИЗМЕНЕНИЕ ДАТЫ ИЗ УВЕДОМЛЕНИЯ ---
+# --- ИЗМЕНЕНИЕ ДАТЫ/ТЕКСТА ИЗ УВЕДОМЛЕНИЯ ---
 @dp.callback_query(F.data.startswith("edit_date_notify_"))
 async def edit_date_from_notification(callback: types.CallbackQuery, state: FSMContext):
     try:
@@ -572,10 +608,6 @@ async def done_notify(callback: types.CallbackQuery):
         await send_or_edit_main_message()
     else: await callback.answer("Ошибка", show_alert=True)
 
-@dp.callback_query(F.data.startswith("snooze_"))
-async def snooze_notify(callback: types.CallbackQuery):
-    await callback.answer("Напомню через час ⏳")
-
 @dp.message(F.text == "⚙️ Настройки")
 async def settings(message: types.Message):
     await message.answer(f"Интервал: {CHECK_INTERVAL_MINUTES} мин", reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES))
@@ -598,13 +630,16 @@ async def notification_loop():
         for ev in get_events_for_range(today, today + timedelta(days=2)):
             if ev['time'] <= now:
                 last = active_notifications.get(ev['uid'])
-                if not last or (now - last['time']).total_seconds() >= 3600:
+                is_repeat = last and (now - last['time']).total_seconds() >= 3600
+                
+                if not last or is_repeat:
                     try:
                         if last and 'msg_id' in last:
                             try: await bot.delete_message(ADMIN_ID, last['msg_id'])
                             except: pass
                         kb = get_notification_keyboard(ev['uid'])
-                        msg = await bot.send_message(ADMIN_ID, f"🔔 <b>{escape_html(ev['summary'])}</b>\n⏰ {format_time_only(ev['time'])}", reply_markup=kb, parse_mode=ParseMode.HTML)
+                        prefix = "🔔 " if not is_repeat else "🔁 Повторное уведомление (каждый час)\n"
+                        msg = await bot.send_message(ADMIN_ID, f"{prefix}<b>{escape_html(ev['summary'])}</b>\n⏰ {format_time_only(ev['time'])}", reply_markup=kb, parse_mode=ParseMode.HTML)
                         active_notifications[ev['uid']] = {'msg_id': msg.message_id, 'time': now}
                     except Exception as e: logger.error(f"Notify error: {e}")
 
