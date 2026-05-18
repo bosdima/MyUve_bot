@@ -19,7 +19,7 @@ import re
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.10.1"
+BOT_VERSION = "1.10.2"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -213,6 +213,11 @@ def get_events_for_range(start_date, end_date):
 
 def get_event_by_uid(uid):
     """Поиск события по UID во всём календаре (без ограничения по дате)"""
+    # Убираем префикс "notify_" если есть
+    if uid.startswith("notify_"):
+        uid = uid.replace("notify_", "", 1)
+        logger.info(f"Убран префикс notify_, реальный UID: {uid}")
+    
     if not caldav_connected: 
         logger.warning("CalDAV не подключен")
         return None
@@ -261,6 +266,9 @@ def get_event_by_uid(uid):
         return None
 
 def delete_event(uid):
+    # Убираем префикс "notify_" если есть
+    if uid.startswith("notify_"):
+        uid = uid.replace("notify_", "", 1)
     try:
         client = caldav.DAVClient(url=CALDAV_URL, username=YANDEX_LOGIN, password=YANDEX_PASSWORD)
         cal = client.principal().calendars()[0]
@@ -336,6 +344,7 @@ def get_settings_kb(current_interval):
         b.button(text=f"{mins} мин {'✅' if mins==current_interval else ''}", callback_data=f"set_{mins}")
     b.adjust(2); return b.as_markup()
 
+# ИСПРАВЛЕНО: Группировка событий по дням
 async def build_report():
     global VIEW_MODE, VIEW_OFFSET_DAYS
     now = get_local_time()
@@ -352,15 +361,41 @@ async def build_report():
 
     view_label = f"<i>{format_date_full(start)} — {format_date_full(end - timedelta(seconds=1))}</i>"
     events = get_events_for_range(start, end)
+    
+    # Группируем события по дням
+    events_by_day = {}
+    for ev in events:
+        day_key = ev['time'].strftime('%Y-%m-%d')
+        if day_key not in events_by_day:
+            events_by_day[day_key] = []
+        events_by_day[day_key].append(ev)
+    
+    # Формируем текст с группировкой
     text = f"<b>{title}</b>\n{view_label}\n\n"
+    
     if not events:
         text += "✨ Нет событий."
     else:
-        lines = []
-        for ev in events:
-            lines.append(f"📍 <b>{format_time_only(ev['time'])}</b> — {escape_html(ev['summary'])} (<i>{format_date_full(ev['time'])}</i>)")
-        text += "\n".join(lines)
-    text += f"\n\n<i>Обновлено: {now.strftime('%d.%m.%Y %H:%M')}</i>"
+        day_names = {"Monday": "Понедельник", "Tuesday": "Вторник", "Wednesday": "Среда", 
+                     "Thursday": "Четверг", "Friday": "Пятница", "Saturday": "Суббота", "Sunday": "Воскресенье"}
+        
+        for day_key in sorted(events_by_day.keys()):
+            day_events = events_by_day[day_key]
+            # Получаем название дня недели
+            day_dt = datetime.strptime(day_key, '%Y-%m-%d')
+            day_name_ru = day_names.get(day_dt.strftime('%A'), day_key)
+            day_date = day_dt.strftime('%d.%m')
+            
+            # Добавляем заголовок дня
+            text += f"-------------{day_name_ru} {day_date}-------------\n"
+            
+            # Добавляем события дня
+            for ev in day_events:
+                text += f" - 📍 <b>{format_time_only(ev['time'])}</b> — {escape_html(ev['summary'])}\n"
+            
+            text += "\n"
+    
+    text += f"Обновлено: {now.strftime('%d.%m.%Y %H:%M')}"
     return text, get_main_kb()
 
 async def send_or_edit_main_message(message=None):
@@ -559,7 +594,7 @@ async def sel_min(callback: types.CallbackQuery, state: FSMContext):
                     await callback.answer("Не удалось удалить старое событие", show_alert=True)
                     return
         await state.clear()
-        await callback.answer()  # ИСПРАВЛЕНО: убираем дублирующийся callback.answer
+        await callback.answer()
     except Exception as e: 
         logger.error(f"sel_min error: {e}", exc_info=True)
         await callback.answer("Ошибка сохранения", show_alert=True)
@@ -648,7 +683,7 @@ async def edit_date_from_notification(callback: types.CallbackQuery, state: FSMC
         uid = callback.data.split("_", maxsplit=3)[3]
         logger.info(f"Запрос на изменение даты из уведомления: {uid}")
         
-        # ИСПРАВЛЕНО: Используем прямой поиск по UID
+        # ИСПРАВЛЕНО: Используем прямой поиск по UID (функция сама уберет префикс)
         target = get_event_by_uid(uid)
         
         if not target: 
@@ -671,7 +706,7 @@ async def edit_text_from_notification(callback: types.CallbackQuery, state: FSMC
         uid = callback.data.split("_", maxsplit=3)[3]
         logger.info(f"Запрос на изменение текста из уведомления: {uid}")
         
-        # ИСПРАВЛЕНО: Используем прямой поиск по UID
+        # ИСПРАВЛЕНО: Используем прямой поиск по UID (функция сама уберет префикс)
         target = get_event_by_uid(uid)
         
         if not target: 
