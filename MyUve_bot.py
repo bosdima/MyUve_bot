@@ -8,18 +8,20 @@ import caldav
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ParseMode
 import pytz
 import calendar as cal_module
 import re
+from functools import lru_cache
+import gc
 
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.10.4"
+BOT_VERSION = "1.10.5"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -54,12 +56,15 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 MAIN_MESSAGE_ID = None
+MAIN_KEYBOARD_SENT = False  # Флаг, что клавиатура уже отправлена
 TEMP_MESSAGES = []
 active_notifications = {}
 caldav_connected = False
+caldav_client = None
+caldav_calendar = None
 
 # Глобальные настройки просмотра
-VIEW_MODE = "short"  # "short" (сегодня/завтра) или "week" (неделя)
+VIEW_MODE = "short"
 VIEW_OFFSET_DAYS = 0
 
 
@@ -73,9 +78,56 @@ def get_main_keyboard():
             [KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки")],
             [KeyboardButton(text="🔄 Обновить")]
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
+        one_time_keyboard=False
     )
     return kb
+
+
+# ==========================================
+# УПРАВЛЕНИЕ CALDAV СОЕДИНЕНИЕМ (оптимизация RAM)
+# ==========================================
+def get_caldav_client():
+    """Получение CalDAV клиента с кешированием"""
+    global caldav_client, caldav_calendar, caldav_connected
+    
+    if caldav_client is None:
+        try:
+            caldav_client = caldav.DAVClient(
+                url=CALDAV_URL, 
+                username=YANDEX_LOGIN, 
+                password=YANDEX_PASSWORD
+            )
+            calendars = caldav_client.principal().calendars()
+            if calendars:
+                caldav_calendar = calendars[0]
+                caldav_connected = True
+                logger.debug("CalDAV клиент создан")
+            else:
+                caldav_connected = False
+                logger.warning("Календари не найдены")
+        except Exception as e:
+            logger.error(f"Ошибка создания CalDAV клиента: {e}")
+            caldav_connected = False
+            caldav_client = None
+            caldav_calendar = None
+    
+    return caldav_calendar
+
+def reset_caldav_client():
+    """Сброс CalDAV клиента для освобождения памяти"""
+    global caldav_client, caldav_calendar
+    if caldav_client:
+        try:
+            # Закрываем соединение если есть метод close
+            if hasattr(caldav_client, 'close'):
+                caldav_client.close()
+        except:
+            pass
+        caldav_client = None
+        caldav_calendar = None
+        gc.collect()
+        logger.debug("CalDAV клиент сброшен")
 
 
 # ==========================================
@@ -120,7 +172,7 @@ def escape_html(text):
 async def delete_temp_messages():
     """Фоновая задача для удаления временных сообщений через 15 минут"""
     while True:
-        await asyncio.sleep(900)  # 15 минут = 900 секунд
+        await asyncio.sleep(900)
         if TEMP_MESSAGES:
             logger.info(f"Очистка временных сообщений. Всего: {len(TEMP_MESSAGES)}")
         for msg_id in TEMP_MESSAGES[:]:
@@ -192,20 +244,18 @@ def get_minutes_keyboard(year, month, day, hour):
 
 
 # ==========================================
-# CALDAV
+# CALDAV (оптимизированный)
 # ==========================================
 async def check_caldav_connection():
     global caldav_connected
     try:
         logger.info("Проверка подключения к CalDAV...")
-        client = caldav.DAVClient(url=CALDAV_URL, username=YANDEX_LOGIN, password=YANDEX_PASSWORD)
-        calendars = client.principal().calendars()
-        if calendars:
+        cal = get_caldav_client()
+        if cal:
             caldav_connected = True
             logger.info("✅ CalDAV подключен успешно")
-            return True, calendars[0]
+            return True, cal
         else:
-            logger.warning("⚠️ CalDAV: календари не найдены")
             caldav_connected = False
             return False, None
     except Exception as e:
@@ -214,15 +264,20 @@ async def check_caldav_connection():
         return False, None
 
 def get_events_for_range(start_date, end_date):
-    if not caldav_connected: return []
+    """Получение событий за диапазон с оптимизацией"""
+    if not caldav_connected:
+        return []
+    
+    cal = get_caldav_client()
+    if not cal:
+        return []
+    
     moscow_tz = pytz.timezone('Europe/Moscow')
     start_utc = start_date.astimezone(pytz.utc) if start_date.tzinfo else moscow_tz.localize(start_date).astimezone(pytz.utc)
     end_utc = end_date.astimezone(pytz.utc) if end_date.tzinfo else moscow_tz.localize(end_date).astimezone(pytz.utc)
+    
     try:
-        client = caldav.DAVClient(url=CALDAV_URL, username=YANDEX_LOGIN, password=YANDEX_PASSWORD)
-        calendars = client.principal().calendars()
-        if not calendars: return []
-        events = calendars[0].date_search(start=start_utc, end=end_utc, expand=True)
+        events = cal.date_search(start=start_utc, end=end_utc, expand=True)
         result = []
         for event in events:
             try:
@@ -237,78 +292,77 @@ def get_events_for_range(start_date, end_date):
                 dt_val = dt_prop.dt
                 dt_utc = dt_val if dt_val.tzinfo else dt_val.replace(tzinfo=timezone.utc)
                 result.append({"summary": summary, "time": dt_utc.astimezone(moscow_tz), "uid": uid})
-            except Exception as e: logger.warning(f"Parse error: {e}")
+            except Exception as e:
+                logger.warning(f"Parse error: {e}")
         return sorted(result, key=lambda x: x['time'])
     except Exception as e:
         logger.error(f"CalDAV fetch error: {e}")
         return []
 
 def get_event_by_uid(uid):
-    """Поиск события по UID во всём календаре (без ограничения по дате)"""
+    """Поиск события по UID"""
     if uid.startswith("notify_"):
         uid = uid.replace("notify_", "", 1)
         logger.info(f"Убран префикс notify_, реальный UID: {uid}")
     
-    if not caldav_connected: 
-        logger.warning("CalDAV не подключен")
+    if not caldav_connected:
+        return None
+    
+    cal = get_caldav_client()
+    if not cal:
         return None
     
     try:
-        client = caldav.DAVClient(url=CALDAV_URL, username=YANDEX_LOGIN, password=YANDEX_PASSWORD)
-        calendars = client.principal().calendars()
-        if not calendars: 
-            logger.warning("Календари не найдены")
-            return None
-        
-        try:
-            ev = calendars[0].event_by_uid(uid)
-            if ev:
-                ical = ev.icalendar_instance
-                vevent = next((c for c in ical.walk() if c.name == "VEVENT"), None)
-                if vevent:
-                    summary = str(vevent.get('SUMMARY', 'Без названия'))
-                    dt_prop = vevent.get('DTSTART')
-                    if dt_prop:
-                        dt_val = dt_prop.dt
-                        moscow_tz = pytz.timezone('Europe/Moscow')
-                        dt_utc = dt_val if dt_val.tzinfo else dt_val.replace(tzinfo=timezone.utc)
-                        logger.info(f"Найдено событие по UID: {uid} -> {summary}")
-                        return {"summary": summary, "time": dt_utc.astimezone(moscow_tz), "uid": uid}
-        except Exception as e:
-            logger.warning(f"Прямой поиск по UID не удался: {e}")
-        
-        logger.info(f"Пробуем широкий диапазон поиска для UID: {uid}")
-        now = get_local_time()
-        start = now - timedelta(days=90)
-        end = now + timedelta(days=90)
-        
-        all_events = get_events_for_range(start, end)
-        for ev in all_events:
-            if ev['uid'] == uid:
-                logger.info(f"Найдено событие в широком диапазоне: {uid}")
-                return ev
-        
-        logger.warning(f"Событие с UID {uid} не найдено")
-        return None
+        ev = cal.event_by_uid(uid)
+        if ev:
+            ical = ev.icalendar_instance
+            vevent = next((c for c in ical.walk() if c.name == "VEVENT"), None)
+            if vevent:
+                summary = str(vevent.get('SUMMARY', 'Без названия'))
+                dt_prop = vevent.get('DTSTART')
+                if dt_prop:
+                    dt_val = dt_prop.dt
+                    moscow_tz = pytz.timezone('Europe/Moscow')
+                    dt_utc = dt_val if dt_val.tzinfo else dt_val.replace(tzinfo=timezone.utc)
+                    logger.info(f"Найдено событие по UID: {uid} -> {summary}")
+                    return {"summary": summary, "time": dt_utc.astimezone(moscow_tz), "uid": uid}
     except Exception as e:
-        logger.error(f"Ошибка поиска события по UID {uid}: {e}", exc_info=True)
-        return None
+        logger.warning(f"Поиск по UID не удался: {e}")
+    
+    # Если не нашли, пробуем широкий диапазон
+    now = get_local_time()
+    start = now - timedelta(days=90)
+    end = now + timedelta(days=90)
+    all_events = get_events_for_range(start, end)
+    for ev in all_events:
+        if ev['uid'] == uid:
+            return ev
+    
+    return None
 
 def delete_event(uid):
     if uid.startswith("notify_"):
         uid = uid.replace("notify_", "", 1)
+    
+    cal = get_caldav_client()
+    if not cal:
+        return False
+    
     try:
-        client = caldav.DAVClient(url=CALDAV_URL, username=YANDEX_LOGIN, password=YANDEX_PASSWORD)
-        cal = client.principal().calendars()[0]
         ev = cal.event_by_uid(uid)
-        if ev: ev.delete(); return True
-    except Exception as e: logger.error(f"Delete error: {e}")
+        if ev:
+            ev.delete()
+            return True
+    except Exception as e:
+        logger.error(f"Delete error: {e}")
     return False
 
 def create_event_in_yandex(summary, start_dt, duration_hours=1):
+    cal = get_caldav_client()
+    if not cal:
+        return False
+    
     try:
-        client = caldav.DAVClient(url=CALDAV_URL, username=YANDEX_LOGIN, password=YANDEX_PASSWORD)
-        cal = client.principal().calendars()[0]
         moscow_tz = pytz.timezone('Europe/Moscow')
         local_dt = start_dt if start_dt.tzinfo else moscow_tz.localize(start_dt)
         utc_dt = local_dt.astimezone(timezone.utc)
@@ -316,8 +370,9 @@ def create_event_in_yandex(summary, start_dt, duration_hours=1):
         ical_data = f"BEGIN:VEVENT\nSUMMARY:{summary}\nDTSTART:{utc_dt.strftime('%Y%m%dT%H%M%SZ')}\nDTEND:{end_dt.strftime('%Y%m%dT%H%M%SZ')}\nEND:VEVENT"
         cal.save_event(ical_data)
         return True
-    except Exception as e: logger.error(f"Create error: {e}")
-    return False
+    except Exception as e:
+        logger.error(f"Create error: {e}")
+        return False
 
 
 # ==========================================
@@ -376,7 +431,6 @@ def get_settings_kb(current_interval):
     b.adjust(2)
     return b.as_markup()
 
-# Группировка событий по дням
 async def build_report():
     global VIEW_MODE, VIEW_OFFSET_DAYS
     now = get_local_time()
@@ -423,6 +477,17 @@ async def build_report():
     text += f"Обновлено: {now.strftime('%d.%m.%Y %H:%M')}"
     return text, get_inline_main_kb()
 
+async def send_main_keyboard():
+    """Отправка постоянной клавиатуры"""
+    global MAIN_KEYBOARD_SENT
+    if not MAIN_KEYBOARD_SENT:
+        try:
+            await bot.send_message(ADMIN_ID, "📋 Главное меню:", reply_markup=get_main_keyboard())
+            MAIN_KEYBOARD_SENT = True
+            logger.info("Постоянная клавиатура отправлена")
+        except Exception as e:
+            logger.error(f"Ошибка отправки клавиатуры: {e}")
+
 async def send_or_edit_main_message(message=None):
     global MAIN_MESSAGE_ID
     text, kb = await build_report()
@@ -434,15 +499,7 @@ async def send_or_edit_main_message(message=None):
             else:
                 msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=kb)
             MAIN_MESSAGE_ID = msg.message_id
-            
-            # Отправляем постоянную Reply-клавиатуру только если её нет
-            # Используем reply_to_message или просто отправляем
-            if message:
-                await message.answer("📋 Главное меню:", reply_markup=get_main_keyboard())
-            else:
-                # Проверяем, есть ли уже клавиатура (можно хранить флаг)
-                # Просто отправляем один раз при старте
-                pass
+            await send_main_keyboard()
         else:
             logger.info(f"Обновление главного сообщения (ID: {MAIN_MESSAGE_ID})...")
             await bot.edit_message_text(chat_id=ADMIN_ID, message_id=MAIN_MESSAGE_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -463,8 +520,7 @@ async def send_or_edit_main_message(message=None):
 async def cmd_start(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     await send_or_edit_main_message(message)
-    # Отправляем постоянную клавиатуру при старте
-    await message.answer("📋 Главное меню:", reply_markup=get_main_keyboard())
+    await send_main_keyboard()
 
 @dp.message(F.text == "🔄 Обновить")
 async def refresh_command(message: types.Message):
@@ -511,7 +567,7 @@ async def nav_view(callback: types.CallbackQuery):
     await send_or_edit_main_message()
 
 
-# --- УПРАВЛЕНИЕ (Список -> Действия) ---
+# --- УПРАВЛЕНИЕ ---
 @dp.callback_query(F.data == "manage_list")
 async def show_manage(callback: types.CallbackQuery):
     now = get_local_time()
@@ -601,7 +657,7 @@ async def start_edit_text(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# --- КАЛЕНДАРЬ И ВРЕМЯ ---
+# --- КАЛЕНДАРЬ ---
 @dp.callback_query(F.data.startswith("cal_prev_") | F.data.startswith("cal_next_"))
 async def cal_nav(callback: types.CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
@@ -748,7 +804,7 @@ async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# --- ОБРАБОТКА НОВОГО ТЕКСТА (FSM) ---
+# --- ОБРАБОТКА НОВОГО ТЕКСТА ---
 @dp.message(EditNoteState.waiting_for_new_text)
 async def save_new_text(message: types.Message, state: FSMContext):
     new_text = message.text
@@ -775,7 +831,7 @@ async def save_new_text(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-# --- ИЗМЕНЕНИЕ ДАТЫ/ТЕКСТА ИЗ УВЕДОМЛЕНИЯ ---
+# --- УВЕДОМЛЕНИЯ ---
 @dp.callback_query(F.data.startswith("edit_date_notify_"))
 async def edit_date_from_notification(callback: types.CallbackQuery, state: FSMContext):
     try:
@@ -861,36 +917,52 @@ async def set_int(callback: types.CallbackQuery):
 
 
 # ==========================================
-# ФОНОВЫЕ ЗАДАЧИ
+# ФОНОВЫЕ ЗАДАЧИ (оптимизированные)
 # ==========================================
 async def notification_loop():
+    """Цикл уведомлений с оптимизацией"""
     while True:
-        await asyncio.sleep(60)
-        now = get_local_time()
-        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        for ev in get_events_for_range(today, today + timedelta(days=2)):
-            if ev['time'] <= now:
-                last = active_notifications.get(ev['uid'])
-                is_repeat = last and (now - last['time']).total_seconds() >= 3600
-                
-                if not last or is_repeat:
-                    try:
-                        if last and 'msg_id' in last:
-                            try:
-                                await bot.delete_message(ADMIN_ID, last['msg_id'])
-                            except:
-                                pass
-                        kb = get_notification_keyboard(ev['uid'])
-                        prefix = "🔔 " if not is_repeat else "🔁 Повторное уведомление (каждый час)\n"
-                        msg = await bot.send_message(
-                            ADMIN_ID,
-                            f"{prefix}<b>{escape_html(ev['summary'])}</b>\n⏰ {format_time_only(ev['time'])}",
-                            reply_markup=kb,
-                            parse_mode=ParseMode.HTML
-                        )
-                        active_notifications[ev['uid']] = {'msg_id': msg.message_id, 'time': now}
-                    except Exception as e:
-                        logger.error(f"Notify error: {e}")
+        try:
+            await asyncio.sleep(60)
+            now = get_local_time()
+            today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            
+            # Получаем события только за сегодня и завтра
+            events = get_events_for_range(today, today + timedelta(days=2))
+            
+            for ev in events:
+                if ev['time'] <= now:
+                    last = active_notifications.get(ev['uid'])
+                    is_repeat = last and (now - last['time']).total_seconds() >= 3600
+                    
+                    if not last or is_repeat:
+                        try:
+                            if last and 'msg_id' in last:
+                                try:
+                                    await bot.delete_message(ADMIN_ID, last['msg_id'])
+                                except:
+                                    pass
+                            kb = get_notification_keyboard(ev['uid'])
+                            prefix = "🔔 " if not is_repeat else "🔁 Повторное уведомление (каждый час)\n"
+                            msg = await bot.send_message(
+                                ADMIN_ID,
+                                f"{prefix}<b>{escape_html(ev['summary'])}</b>\n⏰ {format_time_only(ev['time'])}",
+                                reply_markup=kb,
+                                parse_mode=ParseMode.HTML
+                            )
+                            active_notifications[ev['uid']] = {'msg_id': msg.message_id, 'time': now}
+                        except Exception as e:
+                            logger.error(f"Notify error: {e}")
+        except Exception as e:
+            logger.error(f"Notification loop error: {e}")
+
+async def memory_cleanup_loop():
+    """Периодическая очистка памяти"""
+    while True:
+        await asyncio.sleep(3600)  # Каждый час
+        reset_caldav_client()
+        gc.collect()
+        logger.debug("Выполнена очистка памяти")
 
 
 # ==========================================
@@ -909,13 +981,14 @@ async def check_startup_status():
 
 async def main():
     await check_startup_status()
-    # Отправляем главное сообщение
     await send_or_edit_main_message()
-    # Отправляем постоянную клавиатуру
-    await bot.send_message(ADMIN_ID, "📋 Главное меню:", reply_markup=get_main_keyboard())
+    await send_main_keyboard()
     
+    # Запускаем фоновые задачи
     asyncio.create_task(notification_loop())
     asyncio.create_task(delete_temp_messages())
+    asyncio.create_task(memory_cleanup_loop())
+    
     logger.info("Бот готов к работе.")
     await dp.start_polling(bot)
 
