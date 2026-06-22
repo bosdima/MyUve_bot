@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 import caldav
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -19,7 +19,7 @@ import re
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.10.3"
+BOT_VERSION = "1.10.4"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -62,6 +62,22 @@ caldav_connected = False
 VIEW_MODE = "short"  # "short" (сегодня/завтра) или "week" (неделя)
 VIEW_OFFSET_DAYS = 0
 
+
+# ==========================================
+# ПОСТОЯННАЯ КЛАВИАТУРА
+# ==========================================
+def get_main_keyboard():
+    """Постоянная Reply-клавиатура с кнопками"""
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="🔄 Обновить")]
+        ],
+        resize_keyboard=True
+    )
+    return kb
+
+
 # ==========================================
 # FSM СОСТОЯНИЯ
 # ==========================================
@@ -76,6 +92,7 @@ class EditNoteState(StatesGroup):
     original_uid = State()
     original_summary = State()
     original_time = State()
+
 
 # ==========================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -104,7 +121,8 @@ async def delete_temp_messages():
     """Фоновая задача для удаления временных сообщений через 15 минут"""
     while True:
         await asyncio.sleep(900)  # 15 минут = 900 секунд
-        logger.info(f"Очистка временных сообщений. Всего: {len(TEMP_MESSAGES)}")
+        if TEMP_MESSAGES:
+            logger.info(f"Очистка временных сообщений. Всего: {len(TEMP_MESSAGES)}")
         for msg_id in TEMP_MESSAGES[:]:
             try:
                 await bot.delete_message(ADMIN_ID, msg_id)
@@ -114,7 +132,8 @@ async def delete_temp_messages():
             finally:
                 if msg_id in TEMP_MESSAGES:
                     TEMP_MESSAGES.remove(msg_id)
-        logger.info(f"Очистка завершена. Осталось: {len(TEMP_MESSAGES)}")
+        if TEMP_MESSAGES:
+            logger.info(f"Очистка завершена. Осталось: {len(TEMP_MESSAGES)}")
 
 def add_to_delete_list(message_obj):
     """Добавить сообщение в список на удаление через 15 минут"""
@@ -122,6 +141,7 @@ def add_to_delete_list(message_obj):
         if message_obj.message_id not in TEMP_MESSAGES:
             TEMP_MESSAGES.append(message_obj.message_id)
             logger.debug(f"Добавлено сообщение {message_obj.message_id} в список на удаление")
+
 
 # ==========================================
 # КАЛЕНДАРЬ И ВРЕМЯ
@@ -169,6 +189,7 @@ def get_minutes_keyboard(year, month, day, hour):
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=f"back_hours_{year}_{month}_{day}"))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_datetime"))
     return builder.as_markup()
+
 
 # ==========================================
 # CALDAV
@@ -224,7 +245,6 @@ def get_events_for_range(start_date, end_date):
 
 def get_event_by_uid(uid):
     """Поиск события по UID во всём календаре (без ограничения по дате)"""
-    # Убираем префикс "notify_" если есть
     if uid.startswith("notify_"):
         uid = uid.replace("notify_", "", 1)
         logger.info(f"Убран префикс notify_, реальный UID: {uid}")
@@ -240,7 +260,6 @@ def get_event_by_uid(uid):
             logger.warning("Календари не найдены")
             return None
         
-        # Ищем событие напрямую по UID
         try:
             ev = calendars[0].event_by_uid(uid)
             if ev:
@@ -258,11 +277,10 @@ def get_event_by_uid(uid):
         except Exception as e:
             logger.warning(f"Прямой поиск по UID не удался: {e}")
         
-        # Если не нашли, пробуем широкий диапазон
         logger.info(f"Пробуем широкий диапазон поиска для UID: {uid}")
         now = get_local_time()
-        start = now - timedelta(days=90)  # 3 месяца назад
-        end = now + timedelta(days=90)    # 3 месяца вперед
+        start = now - timedelta(days=90)
+        end = now + timedelta(days=90)
         
         all_events = get_events_for_range(start, end)
         for ev in all_events:
@@ -277,7 +295,6 @@ def get_event_by_uid(uid):
         return None
 
 def delete_event(uid):
-    # Убираем префикс "notify_" если есть
     if uid.startswith("notify_"):
         uid = uid.replace("notify_", "", 1)
     try:
@@ -302,10 +319,11 @@ def create_event_in_yandex(summary, start_dt, duration_hours=1):
     except Exception as e: logger.error(f"Create error: {e}")
     return False
 
+
 # ==========================================
 # КЛАВИАТУРЫ И ОТЧЁТ
 # ==========================================
-def get_main_kb():
+def get_inline_main_kb():
     global VIEW_MODE
     b = InlineKeyboardBuilder()
     b.row(
@@ -336,12 +354,14 @@ def get_manage_action_keyboard(uid):
     b.button(text="📅 Изменить дату/время", callback_data=f"edit_date_{uid}")
     b.button(text="📝 Изменить текст", callback_data=f"edit_text_{uid}")
     b.button(text="✅ Выполнено (Удалить)", callback_data=f"done_{uid}")
-    b.adjust(1); return b.as_markup()
+    b.adjust(1)
+    return b.as_markup()
 
 def get_time_options_kb():
     b = InlineKeyboardBuilder()
     now = get_local_time()
-    t1 = now + timedelta(hours=1); t2 = (now + timedelta(days=1)).replace(hour=9, minute=0)
+    t1 = now + timedelta(hours=1)
+    t2 = (now + timedelta(days=1)).replace(hour=9, minute=0)
     b.button(text=f"Через 1 час ({t1.strftime('%H:%M')})", callback_data=f"time_{int(t1.timestamp())}")
     b.button(text=f"Завтра утром ({t2.strftime('%d.%m %H:%M')})", callback_data=f"time_{int(t2.timestamp())}")
     b.button(text="📅 Выбрать дату и время", callback_data="datetime_wizard")
@@ -353,7 +373,8 @@ def get_settings_kb(current_interval):
     b = InlineKeyboardBuilder()
     for mins in [5, 15, 30, 60]:
         b.button(text=f"{mins} мин {'✅' if mins==current_interval else ''}", callback_data=f"set_{mins}")
-    b.adjust(2); return b.as_markup()
+    b.adjust(2)
+    return b.as_markup()
 
 # Группировка событий по дням
 async def build_report():
@@ -373,7 +394,6 @@ async def build_report():
     view_label = f"<i>{format_date_full(start)} — {format_date_full(end - timedelta(seconds=1))}</i>"
     events = get_events_for_range(start, end)
     
-    # Группируем события по дням
     events_by_day = {}
     for ev in events:
         day_key = ev['time'].strftime('%Y-%m-%d')
@@ -381,7 +401,6 @@ async def build_report():
             events_by_day[day_key] = []
         events_by_day[day_key].append(ev)
     
-    # Формируем текст с группировкой
     text = f"<b>{title}</b>\n{view_label}\n\n"
     
     if not events:
@@ -392,22 +411,17 @@ async def build_report():
         
         for day_key in sorted(events_by_day.keys()):
             day_events = events_by_day[day_key]
-            # Получаем название дня недели
             day_dt = datetime.strptime(day_key, '%Y-%m-%d')
             day_name_ru = day_names.get(day_dt.strftime('%A'), day_key)
             day_date = day_dt.strftime('%d.%m')
             
-            # Добавляем заголовок дня
             text += f"-------------{day_name_ru} {day_date}-------------\n"
-            
-            # Добавляем события дня
             for ev in day_events:
                 text += f" - 📍 <b>{format_time_only(ev['time'])}</b> — {escape_html(ev['summary'])}\n"
-            
             text += "\n"
     
     text += f"Обновлено: {now.strftime('%d.%m.%Y %H:%M')}"
-    return text, get_main_kb()
+    return text, get_inline_main_kb()
 
 async def send_or_edit_main_message(message=None):
     global MAIN_MESSAGE_ID
@@ -417,25 +431,30 @@ async def send_or_edit_main_message(message=None):
             logger.info("Отправка главного сообщения (впервые)...")
             if message:
                 msg = await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-                MAIN_MESSAGE_ID = msg.message_id
-                # Отправляем клавиатуру и добавляем в список на удаление
-                kb_msg = await message.answer("📋", reply_markup=ReplyKeyboardBuilder().row(KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки")).as_markup(resize_keyboard=True))
-                add_to_delete_list(kb_msg)  # Добавляем сообщение с клавиатурой в список на удаление
             else:
                 msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=kb)
-                MAIN_MESSAGE_ID = msg.message_id
-                # Отправляем клавиатуру и добавляем в список на удаление
-                kb_msg = await bot.send_message(ADMIN_ID, "📋", reply_markup=ReplyKeyboardBuilder().row(KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки")).as_markup(resize_keyboard=True))
-                add_to_delete_list(kb_msg)  # Добавляем сообщение с клавиатурой в список на удаление
+            MAIN_MESSAGE_ID = msg.message_id
+            
+            # Отправляем постоянную Reply-клавиатуру только если её нет
+            # Используем reply_to_message или просто отправляем
+            if message:
+                await message.answer("📋 Главное меню:", reply_markup=get_main_keyboard())
+            else:
+                # Проверяем, есть ли уже клавиатура (можно хранить флаг)
+                # Просто отправляем один раз при старте
+                pass
         else:
             logger.info(f"Обновление главного сообщения (ID: {MAIN_MESSAGE_ID})...")
             await bot.edit_message_text(chat_id=ADMIN_ID, message_id=MAIN_MESSAGE_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception as e:
-        if "message is not modified" in str(e): logger.debug("Сообщение не изменено (игнорируем)")
+        if "message is not modified" in str(e):
+            logger.debug("Сообщение не изменено (игнорируем)")
         elif "message to edit not found" in str(e):
             MAIN_MESSAGE_ID = None
             logger.info("Сброс MAIN_MESSAGE_ID.")
-        else: logger.error(f"Ошибка отправки/редактирования: {e}")
+        else:
+            logger.error(f"Ошибка отправки/редактирования: {e}")
+
 
 # ==========================================
 # ОБРАБОТЧИКИ
@@ -444,25 +463,39 @@ async def send_or_edit_main_message(message=None):
 async def cmd_start(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     await send_or_edit_main_message(message)
+    # Отправляем постоянную клавиатуру при старте
+    await message.answer("📋 Главное меню:", reply_markup=get_main_keyboard())
+
+@dp.message(F.text == "🔄 Обновить")
+async def refresh_command(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    global VIEW_MODE, VIEW_OFFSET_DAYS
+    VIEW_MODE = "short"
+    VIEW_OFFSET_DAYS = 0
+    await message.answer("🔄 Обновление...", reply_markup=get_main_keyboard())
+    await send_or_edit_main_message()
 
 @dp.callback_query(F.data == "force_refresh")
 async def force_refresh(callback: types.CallbackQuery):
     global VIEW_MODE, VIEW_OFFSET_DAYS
-    VIEW_MODE = "short"; VIEW_OFFSET_DAYS = 0
+    VIEW_MODE = "short"
+    VIEW_OFFSET_DAYS = 0
     await callback.answer("Обновлено")
     await send_or_edit_main_message()
 
 @dp.callback_query(F.data == "view_short")
 async def set_view_short(callback: types.CallbackQuery):
     global VIEW_MODE, VIEW_OFFSET_DAYS
-    VIEW_MODE = "short"; VIEW_OFFSET_DAYS = 0
+    VIEW_MODE = "short"
+    VIEW_OFFSET_DAYS = 0
     await callback.answer()
     await send_or_edit_main_message()
 
 @dp.callback_query(F.data == "view_week")
 async def set_view_week(callback: types.CallbackQuery):
     global VIEW_MODE, VIEW_OFFSET_DAYS
-    VIEW_MODE = "week"; VIEW_OFFSET_DAYS = 0
+    VIEW_MODE = "week"
+    VIEW_OFFSET_DAYS = 0
     await callback.answer()
     await send_or_edit_main_message()
 
@@ -470,10 +503,13 @@ async def set_view_week(callback: types.CallbackQuery):
 async def nav_view(callback: types.CallbackQuery):
     global VIEW_OFFSET_DAYS
     step = int(callback.data.split("_")[-1])
-    if "back" in callback.data: VIEW_OFFSET_DAYS -= step
-    else: VIEW_OFFSET_DAYS += step
+    if "back" in callback.data:
+        VIEW_OFFSET_DAYS -= step
+    else:
+        VIEW_OFFSET_DAYS += step
     await callback.answer()
     await send_or_edit_main_message()
+
 
 # --- УПРАВЛЕНИЕ (Список -> Действия) ---
 @dp.callback_query(F.data == "manage_list")
@@ -492,7 +528,12 @@ async def show_manage(callback: types.CallbackQuery):
     kb.adjust(1)
     await callback.answer()
     msg = await bot.send_message(ADMIN_ID, "Выберите задачу для управления:", reply_markup=kb.as_markup(), parse_mode=ParseMode.HTML)
-    add_to_delete_list(msg)  # Добавляем в список на удаление
+    add_to_delete_list(msg)
+
+@dp.callback_query(F.data == "close_manage")
+async def close_manage(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("sel_event_"))
 async def select_event_manage(callback: types.CallbackQuery):
@@ -505,9 +546,10 @@ async def mark_done(callback: types.CallbackQuery):
     uid = callback.data.split("_", maxsplit=1)[1]
     if delete_event(uid):
         msg = await callback.message.edit_text("✅ Удалено.")
-        add_to_delete_list(msg)  # Добавляем в список на удаление
+        add_to_delete_list(msg)
         await send_or_edit_main_message()
-    else: await callback.answer("Ошибка удаления", show_alert=True)
+    else:
+        await callback.answer("Ошибка удаления", show_alert=True)
 
 @dp.callback_query(F.data.startswith("edit_date_"))
 async def start_edit_date(callback: types.CallbackQuery, state: FSMContext):
@@ -524,9 +566,13 @@ async def start_edit_date(callback: types.CallbackQuery, state: FSMContext):
     logger.info(f"Найдено событие: {target['summary']} на {target['time']}")
     await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
     await state.set_state(EditNoteState.waiting_for_datetime)
-    try: 
-        await callback.message.edit_text(f"📅 Изменяем: <b>{escape_html(target['summary'])}</b>\nВыберите новую дату:", reply_markup=get_calendar_keyboard(), parse_mode=ParseMode.HTML)
-    except Exception as e: 
+    try:
+        await callback.message.edit_text(
+            f"📅 Изменяем: <b>{escape_html(target['summary'])}</b>\nВыберите новую дату:",
+            reply_markup=get_calendar_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
         logger.error(f"Ошибка edit_text: {e}")
     await callback.answer()
 
@@ -545,19 +591,25 @@ async def start_edit_text(callback: types.CallbackQuery, state: FSMContext):
     logger.info(f"Найдено событие: {target['summary']}")
     await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
     await state.set_state(EditNoteState.waiting_for_new_text)
-    try: 
-        await callback.message.edit_text(f"📝 <b>{escape_html(target['summary'])}</b>\nВведите новый текст:", parse_mode=ParseMode.HTML)
-    except Exception as e: 
+    try:
+        await callback.message.edit_text(
+            f"📝 <b>{escape_html(target['summary'])}</b>\nВведите новый текст:",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
         logger.error(f"Ошибка edit_text: {e}")
     await callback.answer()
+
 
 # --- КАЛЕНДАРЬ И ВРЕМЯ ---
 @dp.callback_query(F.data.startswith("cal_prev_") | F.data.startswith("cal_next_"))
 async def cal_nav(callback: types.CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     y, m = int(parts[2]), int(parts[3])
-    try: await callback.message.edit_text("📅 Выберите дату:", reply_markup=get_calendar_keyboard(y, m))
-    except: pass
+    try:
+        await callback.message.edit_text("📅 Выберите дату:", reply_markup=get_calendar_keyboard(y, m))
+    except:
+        pass
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("cal_day_"))
@@ -566,7 +618,8 @@ async def cal_day(callback: types.CallbackQuery, state: FSMContext):
         parts = callback.data.split("_")
         y, m, d = int(parts[2]), int(parts[3]), int(parts[4])
         await callback.message.edit_text(f"🕐 Час для {d}.{m}.{y}:", reply_markup=get_hours_keyboard(y, m, d))
-    except Exception as e: logger.error(f"cal_day error: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"cal_day error: {e}", exc_info=True)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("hour_"))
@@ -575,7 +628,8 @@ async def sel_hour(callback: types.CallbackQuery, state: FSMContext):
         parts = callback.data.split("_")
         y, m, d, h = int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
         await callback.message.edit_text(f"⏱ Минуты для {h}:__:", reply_markup=get_minutes_keyboard(y, m, d, h))
-    except Exception as e: logger.error(f"sel_hour error: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"sel_hour error: {e}", exc_info=True)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("min_"))
@@ -591,8 +645,11 @@ async def sel_min(callback: types.CallbackQuery, state: FSMContext):
             data = await state.get_data()
             txt = data.get("note_text", "Без названия")
             if create_event_in_yandex(txt, dt):
-                msg = await callback.message.edit_text(f"✅ <b>Создано!</b>\n{format_date_full(dt)} {format_time_only(dt)}", parse_mode=ParseMode.HTML)
-                add_to_delete_list(msg)  # Добавляем в список на удаление
+                msg = await callback.message.edit_text(
+                    f"✅ <b>Создано!</b>\n{format_date_full(dt)} {format_time_only(dt)}",
+                    parse_mode=ParseMode.HTML
+                )
+                add_to_delete_list(msg)
                 await send_or_edit_main_message()
         elif st == EditNoteState.waiting_for_datetime.state:
             data = await state.get_data()
@@ -603,15 +660,18 @@ async def sel_min(callback: types.CallbackQuery, state: FSMContext):
                 if delete_event(uid):
                     create_event_in_yandex(summ, dt)
                     active_notifications.pop(uid, None)
-                    msg = await callback.message.edit_text(f"✅ <b>Изменено!</b>\n{format_date_full(dt)} {format_time_only(dt)}", parse_mode=ParseMode.HTML)
-                    add_to_delete_list(msg)  # Добавляем в список на удаление
+                    msg = await callback.message.edit_text(
+                        f"✅ <b>Изменено!</b>\n{format_date_full(dt)} {format_time_only(dt)}",
+                        parse_mode=ParseMode.HTML
+                    )
+                    add_to_delete_list(msg)
                     await send_or_edit_main_message()
-                else: 
+                else:
                     await callback.answer("Не удалось удалить старое событие", show_alert=True)
                     return
         await state.clear()
         await callback.answer()
-    except Exception as e: 
+    except Exception as e:
         logger.error(f"sel_min error: {e}", exc_info=True)
         await callback.answer("Ошибка сохранения", show_alert=True)
 
@@ -625,28 +685,36 @@ async def go_back(callback: types.CallbackQuery):
         elif "hours" in callback.data:
             y, m, d = int(parts[2]), int(parts[3]), int(parts[4])
             await callback.message.edit_text(f"🕐 Час для {d}.{m}.{y}:", reply_markup=get_hours_keyboard(y, m, d))
-    except: pass
+    except:
+        pass
     await callback.answer()
 
 @dp.callback_query(F.data == "cancel_datetime")
 async def cancel_dt(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    try: await callback.message.delete()
-    except: pass
+    try:
+        await callback.message.delete()
+    except:
+        pass
     await callback.answer()
+
 
 # --- ДОБАВЛЕНИЕ ЗАМЕТОК ---
 @dp.message(F.text == "➕ Добавить заметку")
 async def add_note(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(AddNoteState.waiting_for_text)
-    await message.answer("✍️ Текст заметки:")
+    await message.answer("✍️ Текст заметки:", reply_markup=ReplyKeyboardRemove())
 
 @dp.message(AddNoteState.waiting_for_text)
 async def note_text(message: types.Message, state: FSMContext):
     await state.update_data(note_text=message.text)
     await state.set_state(AddNoteState.waiting_for_time)
-    await message.answer(f"📝 <b>{escape_html(message.text)}</b>\n⏰ Когда?", parse_mode=ParseMode.HTML, reply_markup=get_time_options_kb())
+    await message.answer(
+        f"📝 <b>{escape_html(message.text)}</b>\n⏰ Когда?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_time_options_kb()
+    )
 
 @dp.callback_query(AddNoteState.waiting_for_time, F.data.startswith("time_"))
 async def quick_time(callback: types.CallbackQuery, state: FSMContext):
@@ -654,8 +722,8 @@ async def quick_time(callback: types.CallbackQuery, state: FSMContext):
     dt = datetime.fromtimestamp(ts, tz=pytz.timezone('Europe/Moscow'))
     data = await state.get_data()
     if create_event_in_yandex(data.get("note_text", ""), dt):
-        msg = await callback.message.answer("✅ Добавлено!")
-        add_to_delete_list(msg)  # Добавляем в список на удаление
+        msg = await callback.message.answer("✅ Добавлено!", reply_markup=get_main_keyboard())
+        add_to_delete_list(msg)
         await send_or_edit_main_message()
     await state.clear()
     await callback.answer()
@@ -663,16 +731,22 @@ async def quick_time(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(AddNoteState.waiting_for_time, F.data == "datetime_wizard")
 async def start_wizard(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AddNoteState.waiting_for_datetime)
-    try: await callback.message.edit_text("📅 Выберите дату:", reply_markup=get_calendar_keyboard())
-    except: pass
+    try:
+        await callback.message.edit_text("📅 Выберите дату:", reply_markup=get_calendar_keyboard())
+    except:
+        pass
     await callback.answer()
 
 @dp.callback_query(F.data == "cancel_add")
 async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    try: await callback.message.delete()
-    except: pass
+    try:
+        await callback.message.delete()
+        await callback.message.answer("❌ Отменено", reply_markup=get_main_keyboard())
+    except:
+        pass
     await callback.answer()
+
 
 # --- ОБРАБОТКА НОВОГО ТЕКСТА (FSM) ---
 @dp.message(EditNoteState.waiting_for_new_text)
@@ -687,12 +761,19 @@ async def save_new_text(message: types.Message, state: FSMContext):
         if delete_event(uid):
             create_event_in_yandex(new_text, old_time)
             active_notifications.pop(uid, None)
-            msg = await message.answer(f"✅ <b>Текст изменён!</b>\n{escape_html(new_text)}", parse_mode=ParseMode.HTML)
-            add_to_delete_list(msg)  # Добавляем в список на удаление
+            msg = await message.answer(
+                f"✅ <b>Текст изменён!</b>\n{escape_html(new_text)}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=get_main_keyboard()
+            )
+            add_to_delete_list(msg)
             await send_or_edit_main_message()
-        else: await message.answer("❌ Ошибка удаления старого события.")
-    else: await message.answer("❌ Ошибка: данные события потеряны.")
+        else:
+            await message.answer("❌ Ошибка удаления старого события.", reply_markup=get_main_keyboard())
+    else:
+        await message.answer("❌ Ошибка: данные события потеряны.", reply_markup=get_main_keyboard())
     await state.clear()
+
 
 # --- ИЗМЕНЕНИЕ ДАТЫ/ТЕКСТА ИЗ УВЕДОМЛЕНИЯ ---
 @dp.callback_query(F.data.startswith("edit_date_notify_"))
@@ -703,16 +784,21 @@ async def edit_date_from_notification(callback: types.CallbackQuery, state: FSMC
         
         target = get_event_by_uid(uid)
         
-        if not target: 
+        if not target:
             await callback.answer("Событие не найдено в календаре", show_alert=True)
             return
         
         await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
         await state.set_state(EditNoteState.waiting_for_datetime)
-        try: 
-            await callback.message.edit_text(f"📅 Изменяем: <b>{escape_html(target['summary'])}</b>\nВыберите новую дату:", reply_markup=get_calendar_keyboard(), parse_mode=ParseMode.HTML)
-        except: pass
-    except Exception as e: 
+        try:
+            await callback.message.edit_text(
+                f"📅 Изменяем: <b>{escape_html(target['summary'])}</b>\nВыберите новую дату:",
+                reply_markup=get_calendar_keyboard(),
+                parse_mode=ParseMode.HTML
+            )
+        except:
+            pass
+    except Exception as e:
         logger.error(f"Edit from notify error: {e}", exc_info=True)
         await callback.answer("Ошибка", show_alert=True)
     await callback.answer()
@@ -725,16 +811,20 @@ async def edit_text_from_notification(callback: types.CallbackQuery, state: FSMC
         
         target = get_event_by_uid(uid)
         
-        if not target: 
+        if not target:
             await callback.answer("Событие не найдено в календаре", show_alert=True)
             return
         
         await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
         await state.set_state(EditNoteState.waiting_for_new_text)
-        try: 
-            await callback.message.edit_text(f"📝 <b>{escape_html(target['summary'])}</b>\nВведите новый текст:", parse_mode=ParseMode.HTML)
-        except: pass
-    except Exception as e: 
+        try:
+            await callback.message.edit_text(
+                f"📝 <b>{escape_html(target['summary'])}</b>\nВведите новый текст:",
+                parse_mode=ParseMode.HTML
+            )
+        except:
+            pass
+    except Exception as e:
         logger.error(f"Edit text from notify error: {e}", exc_info=True)
         await callback.answer("Ошибка", show_alert=True)
     await callback.answer()
@@ -744,14 +834,23 @@ async def done_notify(callback: types.CallbackQuery):
     uid = callback.data.split("_", maxsplit=2)[2]
     if delete_event(uid):
         msg = await callback.message.edit_text("✅ Выполнено.")
-        add_to_delete_list(msg)  # Добавляем в список на удаление
+        add_to_delete_list(msg)
         active_notifications.pop(uid, None)
         await send_or_edit_main_message()
-    else: await callback.answer("Ошибка", show_alert=True)
+    else:
+        await callback.answer("Ошибка", show_alert=True)
 
+
+# --- НАСТРОЙКИ ---
 @dp.message(F.text == "⚙️ Настройки")
 async def settings(message: types.Message):
-    await message.answer(f"Интервал: {CHECK_INTERVAL_MINUTES} мин", reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES))
+    if message.from_user.id != ADMIN_ID: return
+    await message.answer(
+        f"⏱ <b>Интервал проверки:</b> {CHECK_INTERVAL_MINUTES} мин\n\n"
+        "Выберите новый интервал (в минутах):",
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES)
+    )
 
 @dp.callback_query(F.data.startswith("set_"))
 async def set_int(callback: types.CallbackQuery):
@@ -759,6 +858,7 @@ async def set_int(callback: types.CallbackQuery):
     CHECK_INTERVAL_MINUTES = int(callback.data.split("_")[1])
     await callback.message.edit_text(f"✅ Установлено: {CHECK_INTERVAL_MINUTES} мин")
     await callback.answer()
+
 
 # ==========================================
 # ФОНОВЫЕ ЗАДАЧИ
@@ -776,13 +876,22 @@ async def notification_loop():
                 if not last or is_repeat:
                     try:
                         if last and 'msg_id' in last:
-                            try: await bot.delete_message(ADMIN_ID, last['msg_id'])
-                            except: pass
+                            try:
+                                await bot.delete_message(ADMIN_ID, last['msg_id'])
+                            except:
+                                pass
                         kb = get_notification_keyboard(ev['uid'])
                         prefix = "🔔 " if not is_repeat else "🔁 Повторное уведомление (каждый час)\n"
-                        msg = await bot.send_message(ADMIN_ID, f"{prefix}<b>{escape_html(ev['summary'])}</b>\n⏰ {format_time_only(ev['time'])}", reply_markup=kb, parse_mode=ParseMode.HTML)
+                        msg = await bot.send_message(
+                            ADMIN_ID,
+                            f"{prefix}<b>{escape_html(ev['summary'])}</b>\n⏰ {format_time_only(ev['time'])}",
+                            reply_markup=kb,
+                            parse_mode=ParseMode.HTML
+                        )
                         active_notifications[ev['uid']] = {'msg_id': msg.message_id, 'time': now}
-                    except Exception as e: logger.error(f"Notify error: {e}")
+                    except Exception as e:
+                        logger.error(f"Notify error: {e}")
+
 
 # ==========================================
 # ЗАПУСК
@@ -790,7 +899,8 @@ async def notification_loop():
 async def check_startup_status():
     status_lines = [f"<b>🤖 Бот запущен!</b>\n🔖 Версия: v{BOT_VERSION}"]
     ok, _ = await check_caldav_connection()
-    if ok: status_lines.append("✅ Яндекс.Календарь: <b>Подключен успешно</b>")
+    if ok:
+        status_lines.append("✅ Яндекс.Календарь: <b>Подключен успешно</b>")
     else:
         status_lines.append("❌ Яндекс.Календарь: <b>ОШИБКА ПОДКЛЮЧЕНИЯ</b>")
         status_lines.append("🔧 Проверьте в .env:\n- YANDEX_LOGIN\n- YANDEX_APP_PASSWORD")
@@ -799,9 +909,13 @@ async def check_startup_status():
 
 async def main():
     await check_startup_status()
+    # Отправляем главное сообщение
     await send_or_edit_main_message()
+    # Отправляем постоянную клавиатуру
+    await bot.send_message(ADMIN_ID, "📋 Главное меню:", reply_markup=get_main_keyboard())
+    
     asyncio.create_task(notification_loop())
-    asyncio.create_task(delete_temp_messages())  # Запускаем задачу очистки
+    asyncio.create_task(delete_temp_messages())
     logger.info("Бот готов к работе.")
     await dp.start_polling(bot)
 
