@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 import caldav
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -15,13 +15,12 @@ from aiogram.enums import ParseMode
 import pytz
 import calendar as cal_module
 import re
-from functools import lru_cache
 import gc
 
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.10.6"
+BOT_VERSION = "1.10.7"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -57,7 +56,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 MAIN_MESSAGE_ID = None
-MAIN_KEYBOARD_SENT = False
 TEMP_MESSAGES = []
 active_notifications = {}
 caldav_connected = False
@@ -73,7 +71,7 @@ VIEW_OFFSET_DAYS = 0
 # ==========================================
 def get_main_keyboard():
     """Постоянная Reply-клавиатура с кнопками"""
-    kb = ReplyKeyboardMarkup(
+    return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ Добавить заметку"), KeyboardButton(text="⚙️ Настройки")],
             [KeyboardButton(text="🔄 Обновить")]
@@ -81,13 +79,11 @@ def get_main_keyboard():
         resize_keyboard=True,
         one_time_keyboard=False
     )
-    return kb
 
 # ==========================================
-# УПРАВЛЕНИЕ CALDAV СОЕДИНЕНИЕМ (оптимизация RAM)
+# УПРАВЛЕНИЕ CALDAV СОЕДИНЕНИЕМ
 # ==========================================
 def get_caldav_client():
-    """Получение CalDAV клиента с кешированием"""
     global caldav_client, caldav_calendar, caldav_connected
     if caldav_client is None:
         try:
@@ -112,7 +108,6 @@ def get_caldav_client():
     return caldav_calendar
 
 def reset_caldav_client():
-    """Сброс CalDAV клиента для освобождения памяти"""
     global caldav_client, caldav_calendar
     if caldav_client:
         try:
@@ -171,7 +166,6 @@ def escape_html(text):
     return re.sub(r'[<>]', '', str(text))
 
 async def delete_temp_messages():
-    """Фоновая задача для удаления временных сообщений через 15 минут"""
     while True:
         await asyncio.sleep(900)
         if TEMP_MESSAGES:
@@ -185,30 +179,27 @@ async def delete_temp_messages():
                 finally:
                     if msg_id in TEMP_MESSAGES:
                         TEMP_MESSAGES.remove(msg_id)
-            if TEMP_MESSAGES:
-                logger.info(f"Очистка завершена. Осталось: {len(TEMP_MESSAGES)}")
 
 def add_to_delete_list(message_obj):
-    """Добавить сообщение в список на удаление через 15 минут"""
     if message_obj and hasattr(message_obj, 'message_id'):
         if message_obj.message_id not in TEMP_MESSAGES:
             TEMP_MESSAGES.append(message_obj.message_id)
-            logger.debug(f"Добавлено сообщение {message_obj.message_id} в список на удаление")
 
-async def restore_main_keyboard(message=None):
+async def send_main_keyboard(message=None):
     """
-    🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ:
-    Всегда отправляет постоянную Reply-клавиатуру, чтобы она не исчезала.
-    Вызывается после любых операций, которые могли её удалить.
+    🔑 КЛЮЧЕВАЯ ФУНКЦИЯ:
+    Отправляет Reply-клавиатуру БЕЗ флага - вызывается всегда, когда нужно
+    восстановить клавиатуру после любого нового сообщения бота.
     """
     try:
+        kb = get_main_keyboard()
         if message:
-            await message.answer("📋 Главное меню:", reply_markup=get_main_keyboard())
+            await message.answer("📋", reply_markup=kb)
         else:
-            await bot.send_message(ADMIN_ID, "📋 Главное меню:", reply_markup=get_main_keyboard())
-        logger.debug("Постоянная клавиатура восстановлена/отправлена")
+            await bot.send_message(ADMIN_ID, "📋", reply_markup=kb)
+        logger.debug("Reply-клавиатура отправлена/восстановлена")
     except Exception as e:
-        logger.error(f"Ошибка восстановления клавиатуры: {e}")
+        logger.error(f"Ошибка отправки клавиатуры: {e}")
 
 # ==========================================
 # КАЛЕНДАРЬ И ВРЕМЯ
@@ -261,7 +252,7 @@ def get_minutes_keyboard(year, month, day, hour):
     return builder.as_markup()
 
 # ==========================================
-# CALDAV (оптимизированный)
+# CALDAV
 # ==========================================
 async def check_caldav_connection():
     global caldav_connected
@@ -281,7 +272,6 @@ async def check_caldav_connection():
         return False, None
 
 def get_events_for_range(start_date, end_date):
-    """Получение событий за диапазон с оптимизацией"""
     if not caldav_connected:
         return []
     cal = get_caldav_client()
@@ -314,7 +304,6 @@ def get_events_for_range(start_date, end_date):
         return []
 
 def get_event_by_uid(uid):
-    """Поиск события по UID"""
     if uid.startswith("notify_"):
         uid = uid.replace("notify_", "", 1)
         logger.info(f"Убран префикс notify_, реальный UID: {uid}")
@@ -339,7 +328,6 @@ def get_event_by_uid(uid):
                     return {"summary": summary, "time": dt_utc.astimezone(moscow_tz), "uid": uid}
     except Exception as e:
         logger.warning(f"Поиск по UID не удался: {e}")
-    # Если не нашли, пробуем широкий диапазон
     now = get_local_time()
     start = now - timedelta(days=90)
     end = now + timedelta(days=90)
@@ -474,17 +462,6 @@ async def build_report():
     text += f"Обновлено: {now.strftime('%d.%m.%Y %H:%M')}"
     return text, get_inline_main_kb()
 
-async def send_main_keyboard():
-    """Отправка постоянной клавиатуры"""
-    global MAIN_KEYBOARD_SENT
-    if not MAIN_KEYBOARD_SENT:
-        try:
-            await bot.send_message(ADMIN_ID, "📋 Главное меню:", reply_markup=get_main_keyboard())
-            MAIN_KEYBOARD_SENT = True
-            logger.info("Постоянная клавиатура отправлена")
-        except Exception as e:
-            logger.error(f"Ошибка отправки клавиатуры: {e}")
-
 async def send_or_edit_main_message(message=None):
     global MAIN_MESSAGE_ID
     text, kb = await build_report()
@@ -494,10 +471,10 @@ async def send_or_edit_main_message(message=None):
             if message:
                 msg = await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
             else:
-                # 🔧 ИСПРАВЛЕНИЕ: убрана опечатка reply_mark up -> reply_markup
                 msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=kb)
             MAIN_MESSAGE_ID = msg.message_id
-            await send_main_keyboard()
+            # 🔧 ИСПРАВЛЕНИЕ: всегда отправляем Reply-клавиатуру после нового сообщения
+            await send_main_keyboard(message)
         else:
             logger.info(f"Обновление главного сообщения (ID: {MAIN_MESSAGE_ID})...")
             await bot.edit_message_text(chat_id=ADMIN_ID, message_id=MAIN_MESSAGE_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -517,7 +494,6 @@ async def send_or_edit_main_message(message=None):
 async def cmd_start(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     await send_or_edit_main_message(message)
-    await send_main_keyboard()
 
 @dp.message(F.text == "🔄 Обновить")
 async def refresh_command(message: types.Message):
@@ -525,8 +501,7 @@ async def refresh_command(message: types.Message):
     global VIEW_MODE, VIEW_OFFSET_DAYS
     VIEW_MODE = "short"
     VIEW_OFFSET_DAYS = 0
-    await message.answer("🔄 Обновление...", reply_markup=get_main_keyboard())
-    await send_or_edit_main_message()
+    await send_or_edit_main_message(message)
 
 @dp.callback_query(F.data == "force_refresh")
 async def force_refresh(callback: types.CallbackQuery):
@@ -581,6 +556,8 @@ async def show_manage(callback: types.CallbackQuery):
     await callback.answer()
     msg = await bot.send_message(ADMIN_ID, "Выберите задачу для управления:", reply_markup=kb.as_markup(), parse_mode=ParseMode.HTML)
     add_to_delete_list(msg)
+    # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем Reply-клавиатуру после нового сообщения
+    await send_main_keyboard()
 
 @dp.callback_query(F.data == "close_manage")
 async def close_manage(callback: types.CallbackQuery):
@@ -600,8 +577,7 @@ async def mark_done(callback: types.CallbackQuery):
         msg = await callback.message.edit_text("✅ Удалено.")
         add_to_delete_list(msg)
         await send_or_edit_main_message()
-        # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем постоянную клавиатуру
-        await restore_main_keyboard(callback.message)
+        await send_main_keyboard(callback.message)
     else:
         await callback.answer("Ошибка удаления", show_alert=True)
 
@@ -697,8 +673,7 @@ async def sel_min(callback: types.CallbackQuery, state: FSMContext):
                 )
                 add_to_delete_list(msg)
                 await send_or_edit_main_message()
-                # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем постоянную клавиатуру после создания
-                await restore_main_keyboard(callback.message)
+                await send_main_keyboard(callback.message)
         elif st == EditNoteState.waiting_for_datetime.state:
             data = await state.get_data()
             uid = data.get("original_uid")
@@ -714,8 +689,7 @@ async def sel_min(callback: types.CallbackQuery, state: FSMContext):
                     )
                     add_to_delete_list(msg)
                     await send_or_edit_main_message()
-                    # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем постоянную клавиатуру после редактирования
-                    await restore_main_keyboard(callback.message)
+                    await send_main_keyboard(callback.message)
                 else:
                     await callback.answer("Не удалось удалить старое событие", show_alert=True)
                     return
@@ -746,8 +720,7 @@ async def cancel_dt(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.delete()
     except:
         pass
-    # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем клавиатуру после отмены
-    await restore_main_keyboard()
+    await send_main_keyboard()
     await callback.answer()
 
 # --- ДОБАВЛЕНИЕ ЗАМЕТОК ---
@@ -755,10 +728,9 @@ async def cancel_dt(callback: types.CallbackQuery, state: FSMContext):
 async def add_note(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(AddNoteState.waiting_for_text)
-    # 🔧 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: убран ReplyKeyboardRemove()!
-    # Именно он удалял постоянную клавиатуру из чата.
-    # Теперь просто отправляем сообщение без изменения reply-клавиатуры.
-    await message.answer("✍️ Текст заметки:")
+    # 🔧 ИСПРАВЛЕНИЕ: НЕ используем ReplyKeyboardRemove!
+    # Просто отправляем сообщение с Reply-клавиатурой, чтобы она осталась
+    await message.answer("✍️ Текст заметки:", reply_markup=get_main_keyboard())
 
 @dp.message(AddNoteState.waiting_for_text)
 async def note_text(message: types.Message, state: FSMContext):
@@ -769,6 +741,8 @@ async def note_text(message: types.Message, state: FSMContext):
         parse_mode=ParseMode.HTML,
         reply_markup=get_time_options_kb()
     )
+    # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем Reply-клавиатуру после нового сообщения
+    await send_main_keyboard(message)
 
 @dp.callback_query(AddNoteState.waiting_for_time, F.data.startswith("time_"))
 async def quick_time(callback: types.CallbackQuery, state: FSMContext):
@@ -798,10 +772,9 @@ async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     try:
         await callback.message.delete()
-        await callback.message.answer("❌ Отменено", reply_markup=get_main_keyboard())
     except:
-        # 🔧 ИСПРАВЛЕНИЕ: если не удалось удалить, всё равно восстанавливаем клавиатуру
-        await restore_main_keyboard()
+        pass
+    await send_main_keyboard()
     await callback.answer()
 
 # --- ОБРАБОТКА НОВОГО ТЕКСТА ---
@@ -885,8 +858,7 @@ async def done_notify(callback: types.CallbackQuery):
         add_to_delete_list(msg)
         active_notifications.pop(uid, None)
         await send_or_edit_main_message()
-        # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем клавиатуру после выполнения из уведомления
-        await restore_main_keyboard(callback.message)
+        await send_main_keyboard(callback.message)
     else:
         await callback.answer("Ошибка", show_alert=True)
 
@@ -900,6 +872,8 @@ async def settings(message: types.Message):
         parse_mode=ParseMode.HTML,
         reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES)
     )
+    # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем Reply-клавиатуру после нового сообщения
+    await send_main_keyboard(message)
 
 @dp.callback_query(F.data.startswith("set_"))
 async def set_int(callback: types.CallbackQuery):
@@ -909,16 +883,15 @@ async def set_int(callback: types.CallbackQuery):
     await callback.answer()
 
 # ==========================================
-# ФОНОВЫЕ ЗАДАЧИ (оптимизированные)
+# ФОНОВЫЕ ЗАДАЧИ
 # ==========================================
 async def notification_loop():
-    """Цикл уведомлений с оптимизацией"""
+    """Цикл уведомлений с восстановлением клавиатуры"""
     while True:
         try:
             await asyncio.sleep(60)
             now = get_local_time()
             today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            # Получаем события только за сегодня и завтра
             events = get_events_for_range(today, today + timedelta(days=2))
             for ev in events:
                 if ev['time'] <= now:
@@ -940,15 +913,18 @@ async def notification_loop():
                                 parse_mode=ParseMode.HTML
                             )
                             active_notifications[ev['uid']] = {'msg_id': msg.message_id, 'time': now}
+                            # 🔧 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: после отправки уведомления
+                            # (которое не имеет Reply-клавиатуры) ВОССТАНАВЛИВАЕМ её!
+                            # Именно это было главной причиной исчезновения кнопки.
+                            await send_main_keyboard()
                         except Exception as e:
                             logger.error(f"Notify error: {e}")
         except Exception as e:
             logger.error(f"Notification loop error: {e}")
 
 async def memory_cleanup_loop():
-    """Периодическая очистка памяти"""
     while True:
-        await asyncio.sleep(3600)  # Каждый час
+        await asyncio.sleep(3600)
         reset_caldav_client()
         gc.collect()
         logger.debug("Выполнена очистка памяти")
@@ -970,8 +946,6 @@ async def check_startup_status():
 async def main():
     await check_startup_status()
     await send_or_edit_main_message()
-    await send_main_keyboard()
-    # Запускаем фоновые задачи
     asyncio.create_task(notification_loop())
     asyncio.create_task(delete_temp_messages())
     asyncio.create_task(memory_cleanup_loop())
