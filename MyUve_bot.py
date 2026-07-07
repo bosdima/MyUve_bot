@@ -21,7 +21,7 @@ import gc
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.10.5"
+BOT_VERSION = "1.10.6"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -33,6 +33,7 @@ ADMIN_ID = int(get_env("ADMIN_ID"))
 YANDEX_LOGIN = get_env("YANDEX_LOGIN")
 YANDEX_PASSWORD = get_env("YANDEX_APP_PASSWORD")
 CALDAV_URL = get_env("CALDAV_URL", "https://caldav.yandex.ru/")
+
 try:
     CHECK_INTERVAL_MINUTES = int(get_env("CHECK_INTERVAL_MINUTES", "15"))
 except ValueError:
@@ -56,7 +57,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 MAIN_MESSAGE_ID = None
-MAIN_KEYBOARD_SENT = False  # Флаг, что клавиатура уже отправлена
+MAIN_KEYBOARD_SENT = False
 TEMP_MESSAGES = []
 active_notifications = {}
 caldav_connected = False
@@ -66,7 +67,6 @@ caldav_calendar = None
 # Глобальные настройки просмотра
 VIEW_MODE = "short"
 VIEW_OFFSET_DAYS = 0
-
 
 # ==========================================
 # ПОСТОЯННАЯ КЛАВИАТУРА
@@ -83,19 +83,17 @@ def get_main_keyboard():
     )
     return kb
 
-
 # ==========================================
 # УПРАВЛЕНИЕ CALDAV СОЕДИНЕНИЕМ (оптимизация RAM)
 # ==========================================
 def get_caldav_client():
     """Получение CalDAV клиента с кешированием"""
     global caldav_client, caldav_calendar, caldav_connected
-    
     if caldav_client is None:
         try:
             caldav_client = caldav.DAVClient(
-                url=CALDAV_URL, 
-                username=YANDEX_LOGIN, 
+                url=CALDAV_URL,
+                username=YANDEX_LOGIN,
                 password=YANDEX_PASSWORD
             )
             calendars = caldav_client.principal().calendars()
@@ -111,7 +109,6 @@ def get_caldav_client():
             caldav_connected = False
             caldav_client = None
             caldav_calendar = None
-    
     return caldav_calendar
 
 def reset_caldav_client():
@@ -119,16 +116,14 @@ def reset_caldav_client():
     global caldav_client, caldav_calendar
     if caldav_client:
         try:
-            # Закрываем соединение если есть метод close
             if hasattr(caldav_client, 'close'):
                 caldav_client.close()
         except:
             pass
         caldav_client = None
         caldav_calendar = None
-        gc.collect()
-        logger.debug("CalDAV клиент сброшен")
-
+    gc.collect()
+    logger.debug("CalDAV клиент сброшен")
 
 # ==========================================
 # FSM СОСТОЯНИЯ
@@ -145,7 +140,6 @@ class EditNoteState(StatesGroup):
     original_summary = State()
     original_time = State()
 
-
 # ==========================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
@@ -154,16 +148,23 @@ def get_local_time():
 
 def format_date_full(dt_obj):
     if dt_obj is None: return ""
-    if dt_obj.tzinfo is None: dt_obj = pytz.timezone('Europe/Moscow').localize(dt_obj)
-    else: dt_obj = dt_obj.astimezone(pytz.timezone('Europe/Moscow'))
-    day_map = {"Monday": "Пн", "Tuesday": "Вт", "Wednesday": "Ср", "Thursday": "Чт", "Friday": "Пт", "Saturday": "Сб", "Sunday": "Вс"}
+    if dt_obj.tzinfo is None:
+        dt_obj = pytz.timezone('Europe/Moscow').localize(dt_obj)
+    else:
+        dt_obj = dt_obj.astimezone(pytz.timezone('Europe/Moscow'))
+    day_map = {
+        "Monday": "Пн", "Tuesday": "Вт", "Wednesday": "Ср",
+        "Thursday": "Чт", "Friday": "Пт", "Saturday": "Сб", "Sunday": "Вс"
+    }
     day_name = day_map.get(dt_obj.strftime("%A"), dt_obj.strftime("%A"))
     return f"{day_name}, {dt_obj.strftime('%d.%m')}"
 
 def format_time_only(dt_obj):
     if dt_obj is None: return "--:--"
-    if dt_obj.tzinfo is None: dt_obj = pytz.timezone('Europe/Moscow').localize(dt_obj)
-    else: dt_obj = dt_obj.astimezone(pytz.timezone('Europe/Moscow'))
+    if dt_obj.tzinfo is None:
+        dt_obj = pytz.timezone('Europe/Moscow').localize(dt_obj)
+    else:
+        dt_obj = dt_obj.astimezone(pytz.timezone('Europe/Moscow'))
     return dt_obj.strftime("%H:%M")
 
 def escape_html(text):
@@ -175,17 +176,17 @@ async def delete_temp_messages():
         await asyncio.sleep(900)
         if TEMP_MESSAGES:
             logger.info(f"Очистка временных сообщений. Всего: {len(TEMP_MESSAGES)}")
-        for msg_id in TEMP_MESSAGES[:]:
-            try:
-                await bot.delete_message(ADMIN_ID, msg_id)
-                logger.debug(f"Удалено сообщение {msg_id}")
-            except Exception as e:
-                logger.debug(f"Не удалось удалить сообщение {msg_id}: {e}")
-            finally:
-                if msg_id in TEMP_MESSAGES:
-                    TEMP_MESSAGES.remove(msg_id)
-        if TEMP_MESSAGES:
-            logger.info(f"Очистка завершена. Осталось: {len(TEMP_MESSAGES)}")
+            for msg_id in TEMP_MESSAGES[:]:
+                try:
+                    await bot.delete_message(ADMIN_ID, msg_id)
+                    logger.debug(f"Удалено сообщение {msg_id}")
+                except Exception as e:
+                    logger.debug(f"Не удалось удалить сообщение {msg_id}: {e}")
+                finally:
+                    if msg_id in TEMP_MESSAGES:
+                        TEMP_MESSAGES.remove(msg_id)
+            if TEMP_MESSAGES:
+                logger.info(f"Очистка завершена. Осталось: {len(TEMP_MESSAGES)}")
 
 def add_to_delete_list(message_obj):
     """Добавить сообщение в список на удаление через 15 минут"""
@@ -194,6 +195,20 @@ def add_to_delete_list(message_obj):
             TEMP_MESSAGES.append(message_obj.message_id)
             logger.debug(f"Добавлено сообщение {message_obj.message_id} в список на удаление")
 
+async def restore_main_keyboard(message=None):
+    """
+    🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ:
+    Всегда отправляет постоянную Reply-клавиатуру, чтобы она не исчезала.
+    Вызывается после любых операций, которые могли её удалить.
+    """
+    try:
+        if message:
+            await message.answer("📋 Главное меню:", reply_markup=get_main_keyboard())
+        else:
+            await bot.send_message(ADMIN_ID, "📋 Главное меню:", reply_markup=get_main_keyboard())
+        logger.debug("Постоянная клавиатура восстановлена/отправлена")
+    except Exception as e:
+        logger.error(f"Ошибка восстановления клавиатуры: {e}")
 
 # ==========================================
 # КАЛЕНДАРЬ И ВРЕМЯ
@@ -203,7 +218,8 @@ def get_calendar_keyboard(year=None, month=None):
     year = year or now.year
     month = month or now.month
     builder = InlineKeyboardBuilder()
-    months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+    months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+              "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
     builder.row(InlineKeyboardButton(text=f"{months[month-1]} {year}", callback_data="ignore"))
     prev_m, prev_y = (month-1 if month > 1 else 12), (year if month > 1 else year-1)
     next_m, next_y = (month+1 if month < 12 else 1), (year if month < 12 else year+1)
@@ -216,7 +232,8 @@ def get_calendar_keyboard(year=None, month=None):
     for week in cal.monthdayscalendar(year, month):
         row = []
         for day in week:
-            if day == 0: row.append(InlineKeyboardButton(text="  ", callback_data="ignore"))
+            if day == 0:
+                row.append(InlineKeyboardButton(text="  ", callback_data="ignore"))
             else:
                 is_today = (day == now.day and month == now.month and year == now.year)
                 row.append(InlineKeyboardButton(text=f"{day} 🟢" if is_today else str(day), callback_data=f"cal_day_{year}_{month}_{day}"))
@@ -228,7 +245,8 @@ def get_hours_keyboard(year, month, day):
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text=f"Час для {day}.{month}.{year}", callback_data="ignore"))
     buttons = [InlineKeyboardButton(text=f"{h:02d}", callback_data=f"hour_{year}_{month}_{day}_{h}") for h in range(24)]
-    for i in range(0, len(buttons), 4): builder.row(*buttons[i:i+4])
+    for i in range(0, len(buttons), 4):
+        builder.row(*buttons[i:i+4])
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=f"back_calendar_{year}_{month}"))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_datetime"))
     return builder.as_markup()
@@ -241,7 +259,6 @@ def get_minutes_keyboard(year, month, day, hour):
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data=f"back_hours_{year}_{month}_{day}"))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_datetime"))
     return builder.as_markup()
-
 
 # ==========================================
 # CALDAV (оптимизированный)
@@ -267,15 +284,12 @@ def get_events_for_range(start_date, end_date):
     """Получение событий за диапазон с оптимизацией"""
     if not caldav_connected:
         return []
-    
     cal = get_caldav_client()
     if not cal:
         return []
-    
     moscow_tz = pytz.timezone('Europe/Moscow')
     start_utc = start_date.astimezone(pytz.utc) if start_date.tzinfo else moscow_tz.localize(start_date).astimezone(pytz.utc)
     end_utc = end_date.astimezone(pytz.utc) if end_date.tzinfo else moscow_tz.localize(end_date).astimezone(pytz.utc)
-    
     try:
         events = cal.date_search(start=start_utc, end=end_utc, expand=True)
         result = []
@@ -304,14 +318,11 @@ def get_event_by_uid(uid):
     if uid.startswith("notify_"):
         uid = uid.replace("notify_", "", 1)
         logger.info(f"Убран префикс notify_, реальный UID: {uid}")
-    
     if not caldav_connected:
         return None
-    
     cal = get_caldav_client()
     if not cal:
         return None
-    
     try:
         ev = cal.event_by_uid(uid)
         if ev:
@@ -328,7 +339,6 @@ def get_event_by_uid(uid):
                     return {"summary": summary, "time": dt_utc.astimezone(moscow_tz), "uid": uid}
     except Exception as e:
         logger.warning(f"Поиск по UID не удался: {e}")
-    
     # Если не нашли, пробуем широкий диапазон
     now = get_local_time()
     start = now - timedelta(days=90)
@@ -337,17 +347,14 @@ def get_event_by_uid(uid):
     for ev in all_events:
         if ev['uid'] == uid:
             return ev
-    
     return None
 
 def delete_event(uid):
     if uid.startswith("notify_"):
         uid = uid.replace("notify_", "", 1)
-    
     cal = get_caldav_client()
     if not cal:
         return False
-    
     try:
         ev = cal.event_by_uid(uid)
         if ev:
@@ -361,7 +368,6 @@ def create_event_in_yandex(summary, start_dt, duration_hours=1):
     cal = get_caldav_client()
     if not cal:
         return False
-    
     try:
         moscow_tz = pytz.timezone('Europe/Moscow')
         local_dt = start_dt if start_dt.tzinfo else moscow_tz.localize(start_dt)
@@ -373,7 +379,6 @@ def create_event_in_yandex(summary, start_dt, duration_hours=1):
     except Exception as e:
         logger.error(f"Create error: {e}")
         return False
-
 
 # ==========================================
 # КЛАВИАТУРЫ И ОТЧЁТ
@@ -435,7 +440,6 @@ async def build_report():
     global VIEW_MODE, VIEW_OFFSET_DAYS
     now = get_local_time()
     base_date = (now + timedelta(days=VIEW_OFFSET_DAYS)).replace(hour=0, minute=0, second=0, microsecond=0)
-
     if VIEW_MODE == "short":
         start = base_date
         end = start + timedelta(days=2)
@@ -444,36 +448,29 @@ async def build_report():
         start = base_date
         end = start + timedelta(days=7)
         title = "📅 Неделя"
-
     view_label = f"<i>{format_date_full(start)} — {format_date_full(end - timedelta(seconds=1))}</i>"
     events = get_events_for_range(start, end)
-    
     events_by_day = {}
     for ev in events:
         day_key = ev['time'].strftime('%Y-%m-%d')
         if day_key not in events_by_day:
             events_by_day[day_key] = []
         events_by_day[day_key].append(ev)
-    
     text = f"<b>{title}</b>\n{view_label}\n\n"
-    
     if not events:
         text += "✨ Нет событий."
     else:
-        day_names = {"Monday": "Понедельник", "Tuesday": "Вторник", "Wednesday": "Среда", 
+        day_names = {"Monday": "Понедельник", "Tuesday": "Вторник", "Wednesday": "Среда",
                      "Thursday": "Четверг", "Friday": "Пятница", "Saturday": "Суббота", "Sunday": "Воскресенье"}
-        
         for day_key in sorted(events_by_day.keys()):
             day_events = events_by_day[day_key]
             day_dt = datetime.strptime(day_key, '%Y-%m-%d')
             day_name_ru = day_names.get(day_dt.strftime('%A'), day_key)
             day_date = day_dt.strftime('%d.%m')
-            
             text += f"-------------{day_name_ru} {day_date}-------------\n"
             for ev in day_events:
                 text += f" - 📍 <b>{format_time_only(ev['time'])}</b> — {escape_html(ev['summary'])}\n"
             text += "\n"
-    
     text += f"Обновлено: {now.strftime('%d.%m.%Y %H:%M')}"
     return text, get_inline_main_kb()
 
@@ -497,6 +494,7 @@ async def send_or_edit_main_message(message=None):
             if message:
                 msg = await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
             else:
+                # 🔧 ИСПРАВЛЕНИЕ: убрана опечатка reply_mark up -> reply_markup
                 msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=kb)
             MAIN_MESSAGE_ID = msg.message_id
             await send_main_keyboard()
@@ -511,7 +509,6 @@ async def send_or_edit_main_message(message=None):
             logger.info("Сброс MAIN_MESSAGE_ID.")
         else:
             logger.error(f"Ошибка отправки/редактирования: {e}")
-
 
 # ==========================================
 # ОБРАБОТЧИКИ
@@ -566,7 +563,6 @@ async def nav_view(callback: types.CallbackQuery):
     await callback.answer()
     await send_or_edit_main_message()
 
-
 # --- УПРАВЛЕНИЕ ---
 @dp.callback_query(F.data == "manage_list")
 async def show_manage(callback: types.CallbackQuery):
@@ -604,6 +600,8 @@ async def mark_done(callback: types.CallbackQuery):
         msg = await callback.message.edit_text("✅ Удалено.")
         add_to_delete_list(msg)
         await send_or_edit_main_message()
+        # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем постоянную клавиатуру
+        await restore_main_keyboard(callback.message)
     else:
         await callback.answer("Ошибка удаления", show_alert=True)
 
@@ -611,14 +609,11 @@ async def mark_done(callback: types.CallbackQuery):
 async def start_edit_date(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.data.split("_", maxsplit=2)[2]
     logger.info(f"Запрос на изменение даты для UID: {uid}")
-    
     target = get_event_by_uid(uid)
-    
     if not target:
         logger.error(f"Событие {uid} не найдено в календаре")
         await callback.answer("Событие не найдено в календаре", show_alert=True)
         return
-    
     logger.info(f"Найдено событие: {target['summary']} на {target['time']}")
     await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
     await state.set_state(EditNoteState.waiting_for_datetime)
@@ -636,14 +631,11 @@ async def start_edit_date(callback: types.CallbackQuery, state: FSMContext):
 async def start_edit_text(callback: types.CallbackQuery, state: FSMContext):
     uid = callback.data.split("_", maxsplit=2)[2]
     logger.info(f"Запрос на изменение текста для UID: {uid}")
-    
     target = get_event_by_uid(uid)
-    
     if not target:
         logger.error(f"Событие {uid} не найдено в календаре")
         await callback.answer("Событие не найдено в календаре", show_alert=True)
         return
-    
     logger.info(f"Найдено событие: {target['summary']}")
     await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
     await state.set_state(EditNoteState.waiting_for_new_text)
@@ -655,7 +647,6 @@ async def start_edit_text(callback: types.CallbackQuery, state: FSMContext):
     except Exception as e:
         logger.error(f"Ошибка edit_text: {e}")
     await callback.answer()
-
 
 # --- КАЛЕНДАРЬ ---
 @dp.callback_query(F.data.startswith("cal_prev_") | F.data.startswith("cal_next_"))
@@ -696,7 +687,6 @@ async def sel_min(callback: types.CallbackQuery, state: FSMContext):
         dt = pytz.timezone('Europe/Moscow').localize(datetime(y, m, d, h, mn))
         st = await state.get_state()
         logger.info(f"Текущее состояние: {st} | Выбрано время: {dt}")
-
         if st == AddNoteState.waiting_for_datetime.state:
             data = await state.get_data()
             txt = data.get("note_text", "Без названия")
@@ -707,6 +697,8 @@ async def sel_min(callback: types.CallbackQuery, state: FSMContext):
                 )
                 add_to_delete_list(msg)
                 await send_or_edit_main_message()
+                # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем постоянную клавиатуру после создания
+                await restore_main_keyboard(callback.message)
         elif st == EditNoteState.waiting_for_datetime.state:
             data = await state.get_data()
             uid = data.get("original_uid")
@@ -722,6 +714,8 @@ async def sel_min(callback: types.CallbackQuery, state: FSMContext):
                     )
                     add_to_delete_list(msg)
                     await send_or_edit_main_message()
+                    # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем постоянную клавиатуру после редактирования
+                    await restore_main_keyboard(callback.message)
                 else:
                     await callback.answer("Не удалось удалить старое событие", show_alert=True)
                     return
@@ -752,15 +746,19 @@ async def cancel_dt(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.delete()
     except:
         pass
+    # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем клавиатуру после отмены
+    await restore_main_keyboard()
     await callback.answer()
-
 
 # --- ДОБАВЛЕНИЕ ЗАМЕТОК ---
 @dp.message(F.text == "➕ Добавить заметку")
 async def add_note(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(AddNoteState.waiting_for_text)
-    await message.answer("✍️ Текст заметки:", reply_markup=ReplyKeyboardRemove())
+    # 🔧 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: убран ReplyKeyboardRemove()!
+    # Именно он удалял постоянную клавиатуру из чата.
+    # Теперь просто отправляем сообщение без изменения reply-клавиатуры.
+    await message.answer("✍️ Текст заметки:")
 
 @dp.message(AddNoteState.waiting_for_text)
 async def note_text(message: types.Message, state: FSMContext):
@@ -781,8 +779,10 @@ async def quick_time(callback: types.CallbackQuery, state: FSMContext):
         msg = await callback.message.answer("✅ Добавлено!", reply_markup=get_main_keyboard())
         add_to_delete_list(msg)
         await send_or_edit_main_message()
-    await state.clear()
-    await callback.answer()
+        await state.clear()
+        await callback.answer()
+    else:
+        await callback.answer("Ошибка создания", show_alert=True)
 
 @dp.callback_query(AddNoteState.waiting_for_time, F.data == "datetime_wizard")
 async def start_wizard(callback: types.CallbackQuery, state: FSMContext):
@@ -800,9 +800,9 @@ async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.delete()
         await callback.message.answer("❌ Отменено", reply_markup=get_main_keyboard())
     except:
-        pass
+        # 🔧 ИСПРАВЛЕНИЕ: если не удалось удалить, всё равно восстанавливаем клавиатуру
+        await restore_main_keyboard()
     await callback.answer()
-
 
 # --- ОБРАБОТКА НОВОГО ТЕКСТА ---
 @dp.message(EditNoteState.waiting_for_new_text)
@@ -811,7 +811,6 @@ async def save_new_text(message: types.Message, state: FSMContext):
     data = await state.get_data()
     uid = data.get("original_uid")
     old_time = data.get("original_time")
-    
     if uid and old_time:
         logger.info(f"Изменение текста: UID:{uid} -> '{new_text}'")
         if delete_event(uid):
@@ -830,20 +829,16 @@ async def save_new_text(message: types.Message, state: FSMContext):
         await message.answer("❌ Ошибка: данные события потеряны.", reply_markup=get_main_keyboard())
     await state.clear()
 
-
 # --- УВЕДОМЛЕНИЯ ---
 @dp.callback_query(F.data.startswith("edit_date_notify_"))
 async def edit_date_from_notification(callback: types.CallbackQuery, state: FSMContext):
     try:
         uid = callback.data.split("_", maxsplit=3)[3]
         logger.info(f"Запрос на изменение даты из уведомления: {uid}")
-        
         target = get_event_by_uid(uid)
-        
         if not target:
             await callback.answer("Событие не найдено в календаре", show_alert=True)
             return
-        
         await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
         await state.set_state(EditNoteState.waiting_for_datetime)
         try:
@@ -864,13 +859,10 @@ async def edit_text_from_notification(callback: types.CallbackQuery, state: FSMC
     try:
         uid = callback.data.split("_", maxsplit=3)[3]
         logger.info(f"Запрос на изменение текста из уведомления: {uid}")
-        
         target = get_event_by_uid(uid)
-        
         if not target:
             await callback.answer("Событие не найдено в календаре", show_alert=True)
             return
-        
         await state.update_data(original_uid=uid, original_summary=target['summary'], original_time=target['time'])
         await state.set_state(EditNoteState.waiting_for_new_text)
         try:
@@ -893,9 +885,10 @@ async def done_notify(callback: types.CallbackQuery):
         add_to_delete_list(msg)
         active_notifications.pop(uid, None)
         await send_or_edit_main_message()
+        # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем клавиатуру после выполнения из уведомления
+        await restore_main_keyboard(callback.message)
     else:
         await callback.answer("Ошибка", show_alert=True)
-
 
 # --- НАСТРОЙКИ ---
 @dp.message(F.text == "⚙️ Настройки")
@@ -915,7 +908,6 @@ async def set_int(callback: types.CallbackQuery):
     await callback.message.edit_text(f"✅ Установлено: {CHECK_INTERVAL_MINUTES} мин")
     await callback.answer()
 
-
 # ==========================================
 # ФОНОВЫЕ ЗАДАЧИ (оптимизированные)
 # ==========================================
@@ -926,15 +918,12 @@ async def notification_loop():
             await asyncio.sleep(60)
             now = get_local_time()
             today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            
             # Получаем события только за сегодня и завтра
             events = get_events_for_range(today, today + timedelta(days=2))
-            
             for ev in events:
                 if ev['time'] <= now:
                     last = active_notifications.get(ev['uid'])
                     is_repeat = last and (now - last['time']).total_seconds() >= 3600
-                    
                     if not last or is_repeat:
                         try:
                             if last and 'msg_id' in last:
@@ -964,7 +953,6 @@ async def memory_cleanup_loop():
         gc.collect()
         logger.debug("Выполнена очистка памяти")
 
-
 # ==========================================
 # ЗАПУСК
 # ==========================================
@@ -983,12 +971,10 @@ async def main():
     await check_startup_status()
     await send_or_edit_main_message()
     await send_main_keyboard()
-    
     # Запускаем фоновые задачи
     asyncio.create_task(notification_loop())
     asyncio.create_task(delete_temp_messages())
     asyncio.create_task(memory_cleanup_loop())
-    
     logger.info("Бот готов к работе.")
     await dp.start_polling(bot)
 
