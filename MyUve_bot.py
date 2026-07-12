@@ -20,7 +20,7 @@ import gc
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.10.7"
+BOT_VERSION = "1.10.8"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -473,7 +473,6 @@ async def send_or_edit_main_message(message=None):
             else:
                 msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=kb)
             MAIN_MESSAGE_ID = msg.message_id
-            # 🔧 ИСПРАВЛЕНИЕ: всегда отправляем Reply-клавиатуру после нового сообщения
             await send_main_keyboard(message)
         else:
             logger.info(f"Обновление главного сообщения (ID: {MAIN_MESSAGE_ID})...")
@@ -510,6 +509,7 @@ async def force_refresh(callback: types.CallbackQuery):
     VIEW_OFFSET_DAYS = 0
     await callback.answer("Обновлено")
     await send_or_edit_main_message()
+    await send_main_keyboard(callback.message)
 
 @dp.callback_query(F.data == "view_short")
 async def set_view_short(callback: types.CallbackQuery):
@@ -518,6 +518,7 @@ async def set_view_short(callback: types.CallbackQuery):
     VIEW_OFFSET_DAYS = 0
     await callback.answer()
     await send_or_edit_main_message()
+    await send_main_keyboard(callback.message)
 
 @dp.callback_query(F.data == "view_week")
 async def set_view_week(callback: types.CallbackQuery):
@@ -526,6 +527,7 @@ async def set_view_week(callback: types.CallbackQuery):
     VIEW_OFFSET_DAYS = 0
     await callback.answer()
     await send_or_edit_main_message()
+    await send_main_keyboard(callback.message)
 
 @dp.callback_query(F.data.startswith("view_back_") | F.data.startswith("view_next_"))
 async def nav_view(callback: types.CallbackQuery):
@@ -537,6 +539,7 @@ async def nav_view(callback: types.CallbackQuery):
         VIEW_OFFSET_DAYS += step
     await callback.answer()
     await send_or_edit_main_message()
+    await send_main_keyboard(callback.message)
 
 # --- УПРАВЛЕНИЕ ---
 @dp.callback_query(F.data == "manage_list")
@@ -556,19 +559,20 @@ async def show_manage(callback: types.CallbackQuery):
     await callback.answer()
     msg = await bot.send_message(ADMIN_ID, "Выберите задачу для управления:", reply_markup=kb.as_markup(), parse_mode=ParseMode.HTML)
     add_to_delete_list(msg)
-    # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем Reply-клавиатуру после нового сообщения
-    await send_main_keyboard()
+    await send_main_keyboard(callback.message)
 
 @dp.callback_query(F.data == "close_manage")
 async def close_manage(callback: types.CallbackQuery):
     await callback.message.delete()
     await callback.answer()
+    await send_main_keyboard()
 
 @dp.callback_query(F.data.startswith("sel_event_"))
 async def select_event_manage(callback: types.CallbackQuery):
     uid = callback.data.split("_", maxsplit=2)[2]
     await callback.message.edit_text("Выберите действие:", reply_markup=get_manage_action_keyboard(uid))
     await callback.answer()
+    await send_main_keyboard(callback.message)
 
 @dp.callback_query(F.data.startswith("done_"))
 async def mark_done(callback: types.CallbackQuery):
@@ -728,8 +732,6 @@ async def cancel_dt(callback: types.CallbackQuery, state: FSMContext):
 async def add_note(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(AddNoteState.waiting_for_text)
-    # 🔧 ИСПРАВЛЕНИЕ: НЕ используем ReplyKeyboardRemove!
-    # Просто отправляем сообщение с Reply-клавиатурой, чтобы она осталась
     await message.answer("✍️ Текст заметки:", reply_markup=get_main_keyboard())
 
 @dp.message(AddNoteState.waiting_for_text)
@@ -741,7 +743,6 @@ async def note_text(message: types.Message, state: FSMContext):
         parse_mode=ParseMode.HTML,
         reply_markup=get_time_options_kb()
     )
-    # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем Reply-клавиатуру после нового сообщения
     await send_main_keyboard(message)
 
 @dp.callback_query(AddNoteState.waiting_for_time, F.data.startswith("time_"))
@@ -872,7 +873,6 @@ async def settings(message: types.Message):
         parse_mode=ParseMode.HTML,
         reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES)
     )
-    # 🔧 ИСПРАВЛЕНИЕ: восстанавливаем Reply-клавиатуру после нового сообщения
     await send_main_keyboard(message)
 
 @dp.callback_query(F.data.startswith("set_"))
@@ -881,6 +881,7 @@ async def set_int(callback: types.CallbackQuery):
     CHECK_INTERVAL_MINUTES = int(callback.data.split("_")[1])
     await callback.message.edit_text(f"✅ Установлено: {CHECK_INTERVAL_MINUTES} мин")
     await callback.answer()
+    await send_main_keyboard(callback.message)
 
 # ==========================================
 # ФОНОВЫЕ ЗАДАЧИ
@@ -915,7 +916,6 @@ async def notification_loop():
                             active_notifications[ev['uid']] = {'msg_id': msg.message_id, 'time': now}
                             # 🔧 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: после отправки уведомления
                             # (которое не имеет Reply-клавиатуры) ВОССТАНАВЛИВАЕМ её!
-                            # Именно это было главной причиной исчезновения кнопки.
                             await send_main_keyboard()
                         except Exception as e:
                             logger.error(f"Notify error: {e}")
