@@ -20,7 +20,7 @@ import gc
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.10.8"
+BOT_VERSION = "1.10.9"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -167,7 +167,7 @@ def escape_html(text):
 
 async def delete_temp_messages():
     while True:
-        await asyncio.sleep(900)
+        await asyncio.sleep(300)  # Проверка каждые 5 минут
         if TEMP_MESSAGES:
             logger.info(f"Очистка временных сообщений. Всего: {len(TEMP_MESSAGES)}")
             for msg_id in TEMP_MESSAGES[:]:
@@ -184,20 +184,43 @@ def add_to_delete_list(message_obj):
     if message_obj and hasattr(message_obj, 'message_id'):
         if message_obj.message_id not in TEMP_MESSAGES:
             TEMP_MESSAGES.append(message_obj.message_id)
+            # Запланировать удаление через 5 минут
+            asyncio.create_task(delete_message_after_delay(message_obj.message_id, 300))
+
+async def delete_message_after_delay(message_id, delay):
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(ADMIN_ID, message_id)
+        if message_id in TEMP_MESSAGES:
+            TEMP_MESSAGES.remove(message_id)
+    except Exception as e:
+        logger.debug(f"Не удалось удалить сообщение {message_id}: {e}")
 
 async def send_main_keyboard(message=None):
     """
-    🔑 КЛЮЧЕВАЯ ФУНКЦИЯ:
-    Отправляет Reply-клавиатуру БЕЗ флага - вызывается всегда, когда нужно
-    восстановить клавиатуру после любого нового сообщения бота.
+    Отправляет Reply-клавиатуру ТОЛЬКО если есть активное сообщение для ответа
     """
     try:
         kb = get_main_keyboard()
         if message:
             await message.answer("📋", reply_markup=kb)
+            logger.debug("Reply-клавиатура отправлена как ответ на сообщение")
         else:
-            await bot.send_message(ADMIN_ID, "📋", reply_markup=kb)
-        logger.debug("Reply-клавиатура отправлена/восстановлена")
+            # НЕ отправляем новое сообщение без контекста!
+            # Только если есть MAIN_MESSAGE_ID, обновляем его клавиатуру
+            if MAIN_MESSAGE_ID:
+                try:
+                    # Получаем текущее сообщение
+                    current_msg = await bot.edit_message_reply_markup(
+                        chat_id=ADMIN_ID,
+                        message_id=MAIN_MESSAGE_ID,
+                        reply_markup=None  # Убираем инлайн-клавиатуру, но не трогаем Reply
+                    )
+                    logger.debug("Reply-клавиатура восстановлена (обновление главного сообщения)")
+                except Exception as e:
+                    logger.debug(f"Не удалось обновить главное сообщение: {e}")
+            else:
+                logger.debug("Нет контекста для отправки клавиатуры - пропускаем")
     except Exception as e:
         logger.error(f"Ошибка отправки клавиатуры: {e}")
 
@@ -210,7 +233,7 @@ def get_calendar_keyboard(year=None, month=None):
     month = month or now.month
     builder = InlineKeyboardBuilder()
     months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-              "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+              "Июль", "Август", "Сентябрь", "Окторябрь", "Ноябрь", "Декабрь"]
     builder.row(InlineKeyboardButton(text=f"{months[month-1]} {year}", callback_data="ignore"))
     prev_m, prev_y = (month-1 if month > 1 else 12), (year if month > 1 else year-1)
     next_m, next_y = (month+1 if month < 12 else 1), (year if month < 12 else year+1)
@@ -473,7 +496,9 @@ async def send_or_edit_main_message(message=None):
             else:
                 msg = await bot.send_message(ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=kb)
             MAIN_MESSAGE_ID = msg.message_id
-            await send_main_keyboard(message)
+            # Отправляем клавиатуру ТОЛЬКО если есть сообщение для ответа
+            if message:
+                await send_main_keyboard(message)
         else:
             logger.info(f"Обновление главного сообщения (ID: {MAIN_MESSAGE_ID})...")
             await bot.edit_message_text(chat_id=ADMIN_ID, message_id=MAIN_MESSAGE_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -509,7 +534,6 @@ async def force_refresh(callback: types.CallbackQuery):
     VIEW_OFFSET_DAYS = 0
     await callback.answer("Обновлено")
     await send_or_edit_main_message()
-    await send_main_keyboard(callback.message)
 
 @dp.callback_query(F.data == "view_short")
 async def set_view_short(callback: types.CallbackQuery):
@@ -518,7 +542,6 @@ async def set_view_short(callback: types.CallbackQuery):
     VIEW_OFFSET_DAYS = 0
     await callback.answer()
     await send_or_edit_main_message()
-    await send_main_keyboard(callback.message)
 
 @dp.callback_query(F.data == "view_week")
 async def set_view_week(callback: types.CallbackQuery):
@@ -527,7 +550,6 @@ async def set_view_week(callback: types.CallbackQuery):
     VIEW_OFFSET_DAYS = 0
     await callback.answer()
     await send_or_edit_main_message()
-    await send_main_keyboard(callback.message)
 
 @dp.callback_query(F.data.startswith("view_back_") | F.data.startswith("view_next_"))
 async def nav_view(callback: types.CallbackQuery):
@@ -539,7 +561,6 @@ async def nav_view(callback: types.CallbackQuery):
         VIEW_OFFSET_DAYS += step
     await callback.answer()
     await send_or_edit_main_message()
-    await send_main_keyboard(callback.message)
 
 # --- УПРАВЛЕНИЕ ---
 @dp.callback_query(F.data == "manage_list")
@@ -559,20 +580,17 @@ async def show_manage(callback: types.CallbackQuery):
     await callback.answer()
     msg = await bot.send_message(ADMIN_ID, "Выберите задачу для управления:", reply_markup=kb.as_markup(), parse_mode=ParseMode.HTML)
     add_to_delete_list(msg)
-    await send_main_keyboard(callback.message)
 
 @dp.callback_query(F.data == "close_manage")
 async def close_manage(callback: types.CallbackQuery):
     await callback.message.delete()
     await callback.answer()
-    await send_main_keyboard()
 
 @dp.callback_query(F.data.startswith("sel_event_"))
 async def select_event_manage(callback: types.CallbackQuery):
     uid = callback.data.split("_", maxsplit=2)[2]
     await callback.message.edit_text("Выберите действие:", reply_markup=get_manage_action_keyboard(uid))
     await callback.answer()
-    await send_main_keyboard(callback.message)
 
 @dp.callback_query(F.data.startswith("done_"))
 async def mark_done(callback: types.CallbackQuery):
@@ -581,7 +599,6 @@ async def mark_done(callback: types.CallbackQuery):
         msg = await callback.message.edit_text("✅ Удалено.")
         add_to_delete_list(msg)
         await send_or_edit_main_message()
-        await send_main_keyboard(callback.message)
     else:
         await callback.answer("Ошибка удаления", show_alert=True)
 
@@ -677,7 +694,6 @@ async def sel_min(callback: types.CallbackQuery, state: FSMContext):
                 )
                 add_to_delete_list(msg)
                 await send_or_edit_main_message()
-                await send_main_keyboard(callback.message)
         elif st == EditNoteState.waiting_for_datetime.state:
             data = await state.get_data()
             uid = data.get("original_uid")
@@ -693,7 +709,6 @@ async def sel_min(callback: types.CallbackQuery, state: FSMContext):
                     )
                     add_to_delete_list(msg)
                     await send_or_edit_main_message()
-                    await send_main_keyboard(callback.message)
                 else:
                     await callback.answer("Не удалось удалить старое событие", show_alert=True)
                     return
@@ -724,7 +739,6 @@ async def cancel_dt(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.delete()
     except:
         pass
-    await send_main_keyboard()
     await callback.answer()
 
 # --- ДОБАВЛЕНИЕ ЗАМЕТОК ---
@@ -743,7 +757,6 @@ async def note_text(message: types.Message, state: FSMContext):
         parse_mode=ParseMode.HTML,
         reply_markup=get_time_options_kb()
     )
-    await send_main_keyboard(message)
 
 @dp.callback_query(AddNoteState.waiting_for_time, F.data.startswith("time_"))
 async def quick_time(callback: types.CallbackQuery, state: FSMContext):
@@ -775,7 +788,6 @@ async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.delete()
     except:
         pass
-    await send_main_keyboard()
     await callback.answer()
 
 # --- ОБРАБОТКА НОВОГО ТЕКСТА ---
@@ -859,7 +871,6 @@ async def done_notify(callback: types.CallbackQuery):
         add_to_delete_list(msg)
         active_notifications.pop(uid, None)
         await send_or_edit_main_message()
-        await send_main_keyboard(callback.message)
     else:
         await callback.answer("Ошибка", show_alert=True)
 
@@ -873,7 +884,6 @@ async def settings(message: types.Message):
         parse_mode=ParseMode.HTML,
         reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES)
     )
-    await send_main_keyboard(message)
 
 @dp.callback_query(F.data.startswith("set_"))
 async def set_int(callback: types.CallbackQuery):
@@ -881,7 +891,6 @@ async def set_int(callback: types.CallbackQuery):
     CHECK_INTERVAL_MINUTES = int(callback.data.split("_")[1])
     await callback.message.edit_text(f"✅ Установлено: {CHECK_INTERVAL_MINUTES} мин")
     await callback.answer()
-    await send_main_keyboard(callback.message)
 
 # ==========================================
 # ФОНОВЫЕ ЗАДАЧИ
@@ -914,9 +923,7 @@ async def notification_loop():
                                 parse_mode=ParseMode.HTML
                             )
                             active_notifications[ev['uid']] = {'msg_id': msg.message_id, 'time': now}
-                            # 🔧 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: после отправки уведомления
-                            # (которое не имеет Reply-клавиатуры) ВОССТАНАВЛИВАЕМ её!
-                            await send_main_keyboard()
+                            # НЕ вызываем send_main_keyboard() - она должна быть только у главного сообщения
                         except Exception as e:
                             logger.error(f"Notify error: {e}")
         except Exception as e:
