@@ -20,7 +20,7 @@ import gc
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.10.9"
+BOT_VERSION = "1.10.10"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -166,61 +166,54 @@ def escape_html(text):
     return re.sub(r'[<>]', '', str(text))
 
 async def delete_temp_messages():
+    """Фоновая очистка временных сообщений"""
     while True:
-        await asyncio.sleep(300)  # Проверка каждые 5 минут
-        if TEMP_MESSAGES:
-            logger.info(f"Очистка временных сообщений. Всего: {len(TEMP_MESSAGES)}")
-            for msg_id in TEMP_MESSAGES[:]:
-                try:
-                    await bot.delete_message(ADMIN_ID, msg_id)
-                    logger.debug(f"Удалено сообщение {msg_id}")
-                except Exception as e:
-                    logger.debug(f"Не удалось удалить сообщение {msg_id}: {e}")
-                finally:
-                    if msg_id in TEMP_MESSAGES:
-                        TEMP_MESSAGES.remove(msg_id)
+        await asyncio.sleep(60)  # Проверка каждую минуту
+        now = datetime.now()
+        to_remove = []
+        for msg_data in TEMP_MESSAGES[:]:
+            if isinstance(msg_data, dict):
+                msg_id = msg_data.get('id')
+                delete_time = msg_data.get('delete_time')
+                if delete_time and now >= delete_time:
+                    try:
+                        await bot.delete_message(ADMIN_ID, msg_id)
+                        logger.debug(f"Удалено сообщение {msg_id}")
+                        to_remove.append(msg_data)
+                    except Exception as e:
+                        logger.debug(f"Не удалось удалить сообщение {msg_id}: {e}")
+                        to_remove.append(msg_data)
+        for item in to_remove:
+            if item in TEMP_MESSAGES:
+                TEMP_MESSAGES.remove(item)
 
-def add_to_delete_list(message_obj):
+def add_to_delete_list(message_obj, delay_seconds=300):
+    """Добавить сообщение в список на удаление через delay_seconds"""
     if message_obj and hasattr(message_obj, 'message_id'):
-        if message_obj.message_id not in TEMP_MESSAGES:
-            TEMP_MESSAGES.append(message_obj.message_id)
-            # Запланировать удаление через 5 минут
-            asyncio.create_task(delete_message_after_delay(message_obj.message_id, 300))
-
-async def delete_message_after_delay(message_id, delay):
-    await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(ADMIN_ID, message_id)
-        if message_id in TEMP_MESSAGES:
-            TEMP_MESSAGES.remove(message_id)
-    except Exception as e:
-        logger.debug(f"Не удалось удалить сообщение {message_id}: {e}")
+        msg_id = message_obj.message_id
+        # Проверяем, нет ли уже такого сообщения в списке
+        for item in TEMP_MESSAGES:
+            if isinstance(item, dict) and item.get('id') == msg_id:
+                return
+        delete_time = datetime.now() + timedelta(seconds=delay_seconds)
+        TEMP_MESSAGES.append({
+            'id': msg_id,
+            'delete_time': delete_time
+        })
+        logger.debug(f"Сообщение {msg_id} будет удалено в {delete_time.strftime('%H:%M:%S')}")
 
 async def send_main_keyboard(message=None):
     """
     Отправляет Reply-клавиатуру ТОЛЬКО если есть активное сообщение для ответа
     """
     try:
-        kb = get_main_keyboard()
         if message:
+            kb = get_main_keyboard()
             await message.answer("📋", reply_markup=kb)
             logger.debug("Reply-клавиатура отправлена как ответ на сообщение")
         else:
             # НЕ отправляем новое сообщение без контекста!
-            # Только если есть MAIN_MESSAGE_ID, обновляем его клавиатуру
-            if MAIN_MESSAGE_ID:
-                try:
-                    # Получаем текущее сообщение
-                    current_msg = await bot.edit_message_reply_markup(
-                        chat_id=ADMIN_ID,
-                        message_id=MAIN_MESSAGE_ID,
-                        reply_markup=None  # Убираем инлайн-клавиатуру, но не трогаем Reply
-                    )
-                    logger.debug("Reply-клавиатура восстановлена (обновление главного сообщения)")
-                except Exception as e:
-                    logger.debug(f"Не удалось обновить главное сообщение: {e}")
-            else:
-                logger.debug("Нет контекста для отправки клавиатуры - пропускаем")
+            logger.debug("Нет контекста для отправки клавиатуры - пропускаем")
     except Exception as e:
         logger.error(f"Ошибка отправки клавиатуры: {e}")
 
@@ -233,7 +226,7 @@ def get_calendar_keyboard(year=None, month=None):
     month = month or now.month
     builder = InlineKeyboardBuilder()
     months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-              "Июль", "Август", "Сентябрь", "Окторябрь", "Ноябрь", "Декабрь"]
+              "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
     builder.row(InlineKeyboardButton(text=f"{months[month-1]} {year}", callback_data="ignore"))
     prev_m, prev_y = (month-1 if month > 1 else 12), (year if month > 1 else year-1)
     next_m, next_y = (month+1 if month < 12 else 1), (year if month < 12 else year+1)
@@ -896,7 +889,7 @@ async def set_int(callback: types.CallbackQuery):
 # ФОНОВЫЕ ЗАДАЧИ
 # ==========================================
 async def notification_loop():
-    """Цикл уведомлений с восстановлением клавиатуры"""
+    """Цикл уведомлений"""
     while True:
         try:
             await asyncio.sleep(60)
@@ -922,8 +915,9 @@ async def notification_loop():
                                 reply_markup=kb,
                                 parse_mode=ParseMode.HTML
                             )
+                            # Добавляем уведомление в список на удаление через 5 минут
+                            add_to_delete_list(msg, 300)
                             active_notifications[ev['uid']] = {'msg_id': msg.message_id, 'time': now}
-                            # НЕ вызываем send_main_keyboard() - она должна быть только у главного сообщения
                         except Exception as e:
                             logger.error(f"Notify error: {e}")
         except Exception as e:
