@@ -20,7 +20,7 @@ import gc
 # ==========================================
 # НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================================
-BOT_VERSION = "1.10.10"
+BOT_VERSION = "1.10.11"
 load_dotenv()
 
 def get_env(key, default=None):
@@ -202,6 +202,16 @@ def add_to_delete_list(message_obj, delay_seconds=300):
         })
         logger.debug(f"Сообщение {msg_id} будет удалено в {delete_time.strftime('%H:%M:%S')}")
 
+async def delete_message_by_id(message_id):
+    """Удалить сообщение по ID"""
+    try:
+        await bot.delete_message(ADMIN_ID, message_id)
+        logger.debug(f"Удалено сообщение {message_id}")
+        return True
+    except Exception as e:
+        logger.debug(f"Не удалось удалить сообщение {message_id}: {e}")
+        return False
+
 async def send_main_keyboard(message=None):
     """
     Отправляет Reply-клавиатуру ТОЛЬКО если есть активное сообщение для ответа
@@ -209,7 +219,9 @@ async def send_main_keyboard(message=None):
     try:
         if message:
             kb = get_main_keyboard()
-            await message.answer("📋", reply_markup=kb)
+            msg = await message.answer("📋", reply_markup=kb)
+            # Добавляем сообщение с клавиатурой в список на удаление через 5 минут
+            add_to_delete_list(msg, 300)
             logger.debug("Reply-клавиатура отправлена как ответ на сообщение")
         else:
             # НЕ отправляем новое сообщение без контекста!
@@ -510,11 +522,15 @@ async def send_or_edit_main_message(message=None):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
+    # Удаляем команду /start
+    await delete_message_by_id(message.message_id)
     await send_or_edit_main_message(message)
 
 @dp.message(F.text == "🔄 Обновить")
 async def refresh_command(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
+    # Удаляем сообщение пользователя
+    await delete_message_by_id(message.message_id)
     global VIEW_MODE, VIEW_OFFSET_DAYS
     VIEW_MODE = "short"
     VIEW_OFFSET_DAYS = 0
@@ -737,19 +753,27 @@ async def cancel_dt(callback: types.CallbackQuery, state: FSMContext):
 # --- ДОБАВЛЕНИЕ ЗАМЕТОК ---
 @dp.message(F.text == "➕ Добавить заметку")
 async def add_note(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя
+    await delete_message_by_id(message.message_id)
     await state.clear()
     await state.set_state(AddNoteState.waiting_for_text)
-    await message.answer("✍️ Текст заметки:", reply_markup=get_main_keyboard())
+    msg = await message.answer("✍️ Текст заметки:", reply_markup=get_main_keyboard())
+    # Добавляем сообщение бота в список на удаление через 5 минут
+    add_to_delete_list(msg, 300)
 
 @dp.message(AddNoteState.waiting_for_text)
 async def note_text(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя с текстом заметки
+    await delete_message_by_id(message.message_id)
     await state.update_data(note_text=message.text)
     await state.set_state(AddNoteState.waiting_for_time)
-    await message.answer(
+    msg = await message.answer(
         f"📝 <b>{escape_html(message.text)}</b>\n⏰ Когда?",
         parse_mode=ParseMode.HTML,
         reply_markup=get_time_options_kb()
     )
+    # Добавляем сообщение бота в список на удаление через 5 минут
+    add_to_delete_list(msg, 300)
 
 @dp.callback_query(AddNoteState.waiting_for_time, F.data.startswith("time_"))
 async def quick_time(callback: types.CallbackQuery, state: FSMContext):
@@ -757,8 +781,13 @@ async def quick_time(callback: types.CallbackQuery, state: FSMContext):
     dt = datetime.fromtimestamp(ts, tz=pytz.timezone('Europe/Moscow'))
     data = await state.get_data()
     if create_event_in_yandex(data.get("note_text", ""), dt):
+        # Удаляем предыдущее сообщение с кнопками
+        try:
+            await callback.message.delete()
+        except:
+            pass
         msg = await callback.message.answer("✅ Добавлено!", reply_markup=get_main_keyboard())
-        add_to_delete_list(msg)
+        add_to_delete_list(msg, 300)
         await send_or_edit_main_message()
         await state.clear()
         await callback.answer()
@@ -786,6 +815,8 @@ async def cancel_add(callback: types.CallbackQuery, state: FSMContext):
 # --- ОБРАБОТКА НОВОГО ТЕКСТА ---
 @dp.message(EditNoteState.waiting_for_new_text)
 async def save_new_text(message: types.Message, state: FSMContext):
+    # Удаляем сообщение пользователя с новым текстом
+    await delete_message_by_id(message.message_id)
     new_text = message.text
     data = await state.get_data()
     uid = data.get("original_uid")
@@ -800,12 +831,14 @@ async def save_new_text(message: types.Message, state: FSMContext):
                 parse_mode=ParseMode.HTML,
                 reply_markup=get_main_keyboard()
             )
-            add_to_delete_list(msg)
+            add_to_delete_list(msg, 300)
             await send_or_edit_main_message()
         else:
-            await message.answer("❌ Ошибка удаления старого события.", reply_markup=get_main_keyboard())
+            msg = await message.answer("❌ Ошибка удаления старого события.", reply_markup=get_main_keyboard())
+            add_to_delete_list(msg, 300)
     else:
-        await message.answer("❌ Ошибка: данные события потеряны.", reply_markup=get_main_keyboard())
+        msg = await message.answer("❌ Ошибка: данные события потеряны.", reply_markup=get_main_keyboard())
+        add_to_delete_list(msg, 300)
     await state.clear()
 
 # --- УВЕДОМЛЕНИЯ ---
@@ -861,7 +894,7 @@ async def done_notify(callback: types.CallbackQuery):
     uid = callback.data.split("_", maxsplit=2)[2]
     if delete_event(uid):
         msg = await callback.message.edit_text("✅ Выполнено.")
-        add_to_delete_list(msg)
+        add_to_delete_list(msg, 300)
         active_notifications.pop(uid, None)
         await send_or_edit_main_message()
     else:
@@ -871,18 +904,22 @@ async def done_notify(callback: types.CallbackQuery):
 @dp.message(F.text == "⚙️ Настройки")
 async def settings(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
-    await message.answer(
+    # Удаляем сообщение пользователя
+    await delete_message_by_id(message.message_id)
+    msg = await message.answer(
         f"⏱ <b>Интервал проверки:</b> {CHECK_INTERVAL_MINUTES} мин\n\n"
         "Выберите новый интервал (в минутах):",
         parse_mode=ParseMode.HTML,
         reply_markup=get_settings_kb(CHECK_INTERVAL_MINUTES)
     )
+    add_to_delete_list(msg, 300)
 
 @dp.callback_query(F.data.startswith("set_"))
 async def set_int(callback: types.CallbackQuery):
     global CHECK_INTERVAL_MINUTES
     CHECK_INTERVAL_MINUTES = int(callback.data.split("_")[1])
-    await callback.message.edit_text(f"✅ Установлено: {CHECK_INTERVAL_MINUTES} мин")
+    msg = await callback.message.edit_text(f"✅ Установлено: {CHECK_INTERVAL_MINUTES} мин")
+    add_to_delete_list(msg, 300)
     await callback.answer()
 
 # ==========================================
